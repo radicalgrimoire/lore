@@ -18,8 +18,12 @@ Git's
 # Tools and products referenced by name:
 Excalidraw
 markdownlint
+mockall
 napi-rs
 npm
+pytest
+thiserror
+uv
 
 # Lore-specific or revision-control jargon:
 [Nn]exus
@@ -29,6 +33,7 @@ Perforce-isms
 # English words missing from Vale's bundled Hunspell dictionary:
 allowlist
 args
+async
 auditability
 autolink
 backlinks
@@ -40,6 +45,7 @@ backlinks
 deduplicated
 diffable
 enum
+enums
 [Ee]rrored
 [Ff]rontmatter
 hostnames

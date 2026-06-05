@@ -417,7 +417,7 @@ See [`docs/developing/decisions/adr-template.md`](../../decisions/adr-template.m
 
 ### Definition
 
-A Code-Standard doc is a language- or area-scoped rule list that governs how Lore source is written. Each rule is an imperative statement with rationale and a worked good/bad code example. The reader is a contributor about to write or review code in that area; the page exists to give them the conventions in a form they can apply directly.
+A Code-Standard doc is a language- or area-scoped set of conventions governing how Lore source is written. It pairs imperative rules with rationale, code examples, and reference tables — the log levels, error variants, macros to call, and which crate follows which pattern. The reader is a contributor about to write or review code in that area; the page exists to give them the conventions in a form they can apply directly.
 
 ### When to use it
 
@@ -433,74 +433,71 @@ A Code-Standard doc is a language- or area-scoped rule list that governs how Lor
 
 ### Required structure
 
-1. H1 page title (language + area — for example, `Rust error handling`).
-2. **Scope** — one or two short paragraphs naming the languages, the area of the codebase, and any opt-out exceptions.
-3. **Rules** — body sections, one per rule. Each rule subsection contains:
-   - **Rule** — an imperative one-liner. For example: *"Wrap library errors with `lore-error::Context` at every crate boundary."*
-   - **Why** (one short paragraph: the reason this rule exists).
-   - **Good** (a fenced code block showing the conforming pattern).
-   - **Bad** (a fenced code block showing the non-conforming pattern, with a one-line comment indicating why it fails).
-4. **See also** — links to related Code-Standards, relevant Internals docs, and any ADRs that constrain the area.
+A Code-Standard page opens with an H1 — the language and area — and a one-sentence lede naming what it covers. The body is a sequence of thematic rule sections; add the optional sections below when they fit the area.
+
+1. H1 page title — the language and area (for example, "Lore error handling standards").
+2. One-sentence lede — what the page covers.
+3. **Overview** (optional) — the high-level model the rules sit on: the layers, systems, or test types involved, as a short list or table.
+4. **Rule sections** — one H2 per concern, numbered (`## 1. Defining error types`) or named (`## Task cancellation`). Each section states its rules in the imperative, gives the rationale, and shows the pattern with a fenced code example. Use a good/bad pair where the contrast clarifies, and a table for any enumeration (log levels, error variants, methods, config fields).
+5. **Crate-specific patterns** (optional) — where the rules vary by crate, a section grouping crates by the pattern they follow.
+6. **Best practices** (optional) — a numbered recap of the load-bearing rules.
+7. **Key files** or **See also** (optional) — the source files that define the surface, and links to related Code-Standards, Internals docs, or ADRs.
 
 ### Voice and length
 
-- Imperative mood for the rule statement itself. Indicative mood for the *Why* paragraph.
-- Active voice. Use **we** for project recommendations, **you** when addressing the reader directly in rationale.
-- Code samples must compile (or at least syntax-check) and must be minimal — one rule per sample. Don't bundle multiple rules into one example.
-- Length: as long as the area requires. A focused area might have three rules and run 200 words; a broad area might have twenty rules and run several thousand. Quality is *every rule has a Why and a working example*, not word count.
+- Imperative mood for rule statements; indicative mood for rationale and overview prose.
+- Active voice. Use **we** for project recommendations, **you** when addressing the reader directly.
+- Code examples reflect real Lore identifiers — crate names, macros, types — so a reader can map them straight onto the source. Keep each example minimal and focused on the rule it illustrates.
+- Tables for enumerations: log levels, error variants, per-crate patterns, config fields.
+- Length: as long as the area requires. A narrow area might run 200 words; a broad one several thousand. Quality is that every rule has a rationale and a concrete example, not word count.
 
 ### Template
 
 ````markdown
-# <Language> <area>
+# Lore <area> standards
 
-## Scope
+<One sentence: what this page covers.>
 
-<One or two paragraphs: which crates, modules, or files this standard
-applies to; any documented exceptions.>
+## Overview
 
-## Rules
+<The high-level model the rules sit on — the layers, systems, or test
+types involved. A short list or table.>
 
-### <Rule 1: imperative one-liner>
+## 1. <First rule section>
 
-**Why.** <One short paragraph: the reason this rule exists. Cite an
-incident, a maintenance cost, or an ADR if there is one.>
-
-**Good.**
+<Imperative rule statement and the rationale behind it.>
 
 ```<lang>
 <minimal example showing the conforming pattern>
 ```
 
-**Bad.**
+## 2. <Second rule section>
+
+<Rule and rationale. Show a good/bad pair where the contrast clarifies:>
 
 ```<lang>
-<minimal example showing the non-conforming pattern>
-// fails because <one line>
+// DON'T DO THIS
+<non-conforming pattern>
+
+// DO THIS
+<conforming pattern>
 ```
 
-### <Rule 2: imperative one-liner>
+## Crate-specific patterns
 
-**Why.** <One paragraph.>
+### <Pattern name>
 
-**Good.**
+- **<crate>**, **<crate>**
 
-```<lang>
-<example>
-```
+## Best practices
 
-**Bad.**
+1. **<Imperative recap of a load-bearing rule>** — <short gloss>.
 
-```<lang>
-<example>
-// fails because <one line>
-```
+## Key files
 
-## See also
-
-- [<Related Code-Standard>](<page>.md)
-- [<Internals page that motivates a rule>](../internals/<page>.md)
-- [<constraining decision>](../decisions/NNNNN-<slug>.md)
+| File | Purpose |
+| --- | --- |
+| `<crate>/src/<file>.rs` | <what it defines> |
 ````
 
 ## Landing pages (structural, not a content type)
@@ -600,7 +597,7 @@ The entry-writing rules — alphabetical order, headword formatting, sense disam
 - All References use the same H2 sequence: Synopsis, lede, Options, Examples, Exit codes (where applicable), See also.
 - All Internals docs use the same H2 sequence: lede, body sections per concept, Source pointers, See also.
 - All ADRs use the same H2 sequence: Context and Problem Statement, Decision Drivers, Considered Options, Decision Outcome (with nested Consequences), Pros and Cons of the Options (optional), More Information (optional). `status` and `date` are header fields declared above the H1, not H2s.
-- All Code-Standards use the same H2 sequence: Scope, Rules, See also.
+- All Code-Standards open with a lede and a sequence of thematic rule sections (numbered or named), adding Overview, Crate-specific patterns, Best practices, and Key files or See also sections as the area warrants.
 - All Landings use the same H2 sequence as appropriate to the folder: lede, Where to start (optional), per-type sections, Key concepts (optional), Where to go next (optional), Related areas (optional).
 - Explanations are content-shaped; pages within the same shape (long-form rationale, system / model, primer) stay parallel within that shape.
 - Why: parallel structure across pages of the same type means readers know exactly where to look without re-orienting per page.

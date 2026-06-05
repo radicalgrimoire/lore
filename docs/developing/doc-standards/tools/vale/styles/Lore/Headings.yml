@@ -8,6 +8,7 @@ indicators:
   - ':'
 exceptions:
   - ADR
+  - anyhow
   - Azure
   - CLI
   - Code
@@ -16,6 +17,7 @@ exceptions:
   - Diátaxis
   - Docker
   - Emmet
+  - EventError
   - Git
   - How-To
   - I
@@ -28,8 +30,10 @@ exceptions:
   - Mermaid
   - MkDocs
   - MongoDB
+  - pytest
   - REPL
   - Studio
+  - thiserror
   - TypeScript
   - URLs
   - Visual

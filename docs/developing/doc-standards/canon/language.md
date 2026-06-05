@@ -27,7 +27,7 @@ Passive voice is acceptable when the actor is unknown, the actor is irrelevant, 
 | Glossary entry | Indicative, third person |
 | Internals | Indicative throughout. Descriptive, not instructional. |
 | ADR | Past tense for Context and Problem Statement; present for Consequences and any rules the decision codifies. |
-| Code-Standard | Imperative for rule statements; indicative for *Why* rationale. |
+| Code-Standard | Imperative for rule statements; indicative for rationale. |
 
 Never use the subjunctive mood. `Should you wish to publish your branch` becomes `Run lore push to publish your branch`.
 
