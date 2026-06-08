@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -40,9 +41,18 @@ type BranchListStream =
 /// `include_deleted = true`. The optional `creator` filter is an exact
 /// byte-for-byte case-sensitive match on `Branch.creator`.
 ///
-/// Iterates `BranchMetadata` keys directly so deleted branches
-/// (whose name → id mapping is erased on delete) are still
-/// enumerable: the metadata blob preserves the branch id.
+/// Live branches are enumerated from the name → id (`BranchId`) keys —
+/// the same source of truth the local client and legacy handler use.
+/// This matters for repositories whose branches have a name → id mapping
+/// but no `BranchMetadata` key in the typed list index (legacy or
+/// partially-provisioned repos): such branches are still point-loadable
+/// by id, so they appear in the live listing here but would be missed by
+/// a `BranchMetadata` scan.
+///
+/// Deleted branches are only surfaced when `include_deleted = true`, via
+/// a supplementary `BranchMetadata` scan: the metadata blob preserves the
+/// branch id even after the name → id mapping is erased on delete, and
+/// any id already seen in the live pass is skipped.
 #[tracing::instrument(name = "BranchList::v1::handle", skip_all)]
 pub async fn handler(
     request: Request<BranchListRequest>,
@@ -84,37 +94,41 @@ async fn stream_branches(
         "Listing branches",
     );
 
-    let metadata_stream = match repository
+    let mut emitted: u64 = 0;
+    let mut live_ids: HashSet<BranchId> = HashSet::new();
+
+    let id_stream = match repository
         .read_mutable_store()
-        .list(repository.id, KeyType::BranchMetadata)
+        .list(repository.id, KeyType::BranchId)
         .await
     {
         Ok(stream) => stream,
         Err(err) => {
-            warn!(?err, "Failed to list branch metadata keys");
+            warn!(?err, "Failed to list branch id keys");
             let _ = tx.send(Err(Status::internal(err.to_string()))).await;
             return;
         }
     };
-    let mut entries = UnboundedReceiverStream::new(metadata_stream.channel());
-    let mut emitted: u64 = 0;
+    let mut ids = UnboundedReceiverStream::new(id_stream.channel());
 
-    while let Some((_key, metadata_hash)) = entries.next().await {
-        let metadata = match branch::load_metadata(repository.clone(), metadata_hash).await {
-            Ok(metadata) => metadata,
+    while let Some((_key, id)) = ids.next().await {
+        let branch_id: BranchId = id.to_context();
+        live_ids.insert(branch_id);
+
+        let metadata_hash = match branch::metadata_hash(repository.clone(), branch_id).await {
+            Ok(hash) => hash,
             Err(err) => {
-                info!(?err, "Skipping entry: metadata load failed");
+                info!({BRANCH_ID} = %branch_id, ?err, "Skipping branch: metadata hash load failed");
                 continue;
             }
         };
-
-        // The branch id is persisted as a binary field in the metadata
-        // blob; that's how deleted branches stay enumerable after
-        // their name → id mapping is cleared.
-        let Ok(id_bytes) = metadata.get_binary(branch::ID) else {
-            continue;
+        let metadata = match branch::load_metadata(repository.clone(), metadata_hash).await {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                info!({BRANCH_ID} = %branch_id, ?err, "Skipping branch: metadata load failed");
+                continue;
+            }
         };
-        let branch_id: BranchId = id_bytes.into();
 
         if let Some(ref required) = creator_filter {
             let creator = branch::creator(&metadata).unwrap_or_default();
@@ -123,50 +137,121 @@ async fn stream_branches(
             }
         }
 
-        let deleted = match branch::name(&metadata) {
-            Ok(name) if !name.is_empty() => {
-                !branch::load_name_to_id_local(repository.clone(), name)
-                    .await
-                    .is_ok_and(|id| id == branch_id)
-            }
-            _ => false,
-        };
-
-        if deleted && !include_deleted {
-            continue;
-        }
-
-        let response_branch = match build_branch(
-            repository.clone(),
+        if !emit_branch(
+            &repository,
             branch_id,
             &metadata,
             metadata_hash,
-            deleted,
+            false,
+            &tx,
+            &mut emitted,
         )
         .await
         {
-            Ok(branch) => branch,
-            Err(status) => {
-                info!({BRANCH_ID} = %branch_id, ?status, "Skipping branch: response build failed");
-                continue;
-            }
-        };
-
-        if tx
-            .send(Ok(BranchListResponse {
-                branch: Some(response_branch),
-            }))
-            .await
-            .is_err()
-        {
-            // Client dropped the stream; stop producing.
-            debug!(emitted, "BranchList receiver dropped");
             return;
         }
-        emitted += 1;
+    }
+
+    if include_deleted {
+        let metadata_stream = match repository
+            .read_mutable_store()
+            .list(repository.id, KeyType::BranchMetadata)
+            .await
+        {
+            Ok(stream) => stream,
+            Err(err) => {
+                warn!(?err, "Failed to list branch metadata keys");
+                let _ = tx.send(Err(Status::internal(err.to_string()))).await;
+                return;
+            }
+        };
+        let mut entries = UnboundedReceiverStream::new(metadata_stream.channel());
+
+        while let Some((_key, metadata_hash)) = entries.next().await {
+            let metadata = match branch::load_metadata(repository.clone(), metadata_hash).await {
+                Ok(metadata) => metadata,
+                Err(err) => {
+                    info!(?err, "Skipping entry: metadata load failed");
+                    continue;
+                }
+            };
+
+            let Ok(id_bytes) = metadata.get_binary(branch::ID) else {
+                continue;
+            };
+            let branch_id: BranchId = id_bytes.into();
+
+            if live_ids.contains(&branch_id) {
+                continue;
+            }
+
+            if let Some(ref required) = creator_filter {
+                let creator = branch::creator(&metadata).unwrap_or_default();
+                if creator != required.as_str() {
+                    continue;
+                }
+            }
+
+            if !emit_branch(
+                &repository,
+                branch_id,
+                &metadata,
+                metadata_hash,
+                true,
+                &tx,
+                &mut emitted,
+            )
+            .await
+            {
+                return;
+            }
+        }
     }
 
     debug!(emitted, "BranchList complete");
+}
+
+/// Build and send one branch record. Returns `false` if the receiver has
+/// been dropped (caller should stop producing); a per-branch build
+/// failure is logged and skipped, returning `true`.
+async fn emit_branch(
+    repository: &Arc<RepositoryContext>,
+    branch_id: BranchId,
+    metadata: &lore_revision::metadata::Metadata,
+    metadata_hash: lore_base::types::Hash,
+    deleted: bool,
+    tx: &mpsc::Sender<Result<BranchListResponse, Status>>,
+    emitted: &mut u64,
+) -> bool {
+    let response_branch = match build_branch(
+        repository.clone(),
+        branch_id,
+        metadata,
+        metadata_hash,
+        deleted,
+    )
+    .await
+    {
+        Ok(branch) => branch,
+        Err(status) => {
+            info!({BRANCH_ID} = %branch_id, ?status, "Skipping branch: response build failed");
+            return true;
+        }
+    };
+
+    if tx
+        .send(Ok(BranchListResponse {
+            branch: Some(response_branch),
+        }))
+        .await
+        .is_err()
+    {
+        // Client dropped the stream; stop producing.
+        debug!(emitted = *emitted, "BranchList receiver dropped");
+        return false;
+    }
+    *emitted += 1;
+    true
 }
 
 #[cfg(test)]
