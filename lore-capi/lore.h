@@ -9,7 +9,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-#define LORE_INTERFACE_VERSION "0.8.2-nightly"
+#define LORE_INTERFACE_VERSION "0.8.3-nightly"
 
 typedef enum lore_log_level_t {
   LORE_LOG_LEVEL_NONE = 0,
