@@ -1,4 +1,4 @@
-# The Lore Revision Control System
+# The Lore Version Control System
 
 > **Status:** Draft
 
@@ -48,26 +48,26 @@ terminology the rest of the document depends on.
 
 #### 1.1 What Lore is
 
-Lore is a centralized revision control system designed to scale along every axis - number of files,
+Lore is a centralized version control system designed to scale along every axis - number of files,
 size of files, depth of history, number of branches, number of concurrent users, and number of
 repositories sharing a backend - without privileging any particular kind of content. All data is
 treated as opaque byte streams; text and binary data flow through the same primitives.
 
 Structurally, Lore is two systems: a *storage subsystem* - a partition-based, content-addressed
 store that deduplicates all content while enforcing strict per-partition access boundaries, usable
-entirely on its own through its own public API - and a *revision control subsystem* that builds
+entirely on its own through its own public API - and a *version control subsystem* that builds
 revisions, branches, merges, and staging out of storage primitives. Version control is one consumer
 of the storage API, not a layer with privileged access to it.
 
 The storage subsystem is built from two stores. Every piece of content is stored once in an
 immutable, content-addressed data store keyed by BLAKE3 hashes. Mutable state, like branch pointers
-and other small bookkeeping, lives in a separate, smaller key-value store. The revision control
+and other small bookkeeping, lives in a separate, smaller key-value store. The version control
 subsystem uses both: a repository is a Merkle tree of files and directories whose nodes and content
 live in the immutable store, while branch pointers and name lookups live in the mutable store.
 
 Files larger than a threshold are split into chunks, content-defined via FastCDC or fixed-size
 depending on file type, so that a single edit inside a multi-gigabyte file re-uploads only the
-changed chunks and any byte range can be read without materialising the whole file. Clients hold
+changed chunks and any byte range can be read without materializing the whole file. Clients hold
 only the data they actively use; the rest is fetched lazily from the remote - a deployment of one or
 more server processes with optional cache and replica tiers - where strict per-repository access
 boundaries (*partitions*) make the system safe to run as a multi-tenant service. A canonical
@@ -120,9 +120,9 @@ it first becomes load-bearing.
   instances on a machine. Multiple instances over the same shared store share fragment storage
   and cached content but maintain independent per-instance state.
 - **Storage subsystem.** The combination of the immutable content-addressed store and the mutable
-  key-value store, exposed as a first-class public API. Independent of, and used by, the revision
+  key-value store, exposed as a first-class public API. Independent of, and used by, the version
   control subsystem.
-- **Revision control subsystem.** Revisions, branches, merges, staging, sync, push, diff, query -
+- **Version control subsystem.** Revisions, branches, merges, staging, sync, push, diff, query -
   the version control layer built on top of the storage subsystem and exposed through its own public
   API.
 - **Hash.** A 32-byte BLAKE3 hash of a content payload. Lore's address function throughout.
@@ -154,7 +154,7 @@ it first becomes load-bearing.
 - **Dirty.** A flag on a tree node indicating that the file at that path differs from the committed
   revision. Orthogonal to *stage*: a file can be dirty, staged, or both.
 - **Staged anchor.** A per-instance pointer in the local mutable store to the state tree that
-  records the working copy's divergence from the committed revision. The state tree itself is
+  records the instance's divergence from the committed revision. The state tree itself is
   content-addressed in the immutable store and persists both dirty and staged flags; neither the
   anchor nor the tree is ever transmitted to the remote.
 - **Link.** A reference from one repository to a specific subset and revision of another, mounted at
@@ -168,7 +168,7 @@ it first becomes load-bearing.
 
 ### 2. Motivation: Why a New VCS?
 
-Lore exists because no widely deployed revision control system combines the properties demanded by
+Lore exists because no widely deployed version control system combines the properties demanded by
 the largest active development workloads: arbitrary content type, multi-axis scale, multi-tenant
 safety, a public versioned specification, and a permissive open-source license. The motivation is
 not that prior systems are bad - they are mature and excellent at what they were designed for - but
@@ -180,7 +180,7 @@ The motivating workloads share three properties.
 
 They are *content-agnostic*. A typical repository holds source code, build inputs, configuration,
 prebuilt artifacts, large data files, generated content, and arbitrary binary blobs. No single
-content shape dominates, and no useful tool can specialise to one shape and treat the rest as a
+content shape dominates, and no useful tool can specialize to one shape and treat the rest as a
 degraded case.
 
 They are *large on every axis*. File counts in the millions, individual files in the terabyte range,
@@ -268,7 +268,7 @@ first-class treatment as text.
 control, and conflict resolution. Normal client operations (staging, committing, branching,
 switching, diffing) never require a round-trip.
 
-**Sparse by construction.** A working copy materialises only the subset the user has asked for;
+**Sparse by construction.** An instance materializes only the subset the user has asked for;
 clients fetch only the fragments they need, on demand. The cost of an operation tracks the working
 set, not the repository.
 
@@ -282,7 +282,7 @@ pointer. Tampering and corruption are detectable.
 
 **API-first.** The C library and its public header are Lore's primary artifact. Both subsystems are
 exposed through it as first-class APIs: the storage subsystem (the immutable content-addressed store
-and the mutable key-value store) and the revision control subsystem (revisions, branches, staging,
+and the mutable key-value store) and the version control subsystem (revisions, branches, staging,
 sync, push, diff, merge, query) built on top. The CLI, language bindings, and the server are thin
 layers over the same API; nothing is reachable only through a particular CLI flag or binding.
 
@@ -293,7 +293,7 @@ cross-tenant content leakage, even when tenants know or can guess each other's c
 meaningful if the system stays performant at the scale it is being run at: cold-cache latency,
 hot-path throughput, and memory footprint are design constraints from day one. Operations on a
 multi-million-file repository must stay interactive; operations on a multi-gigabyte file must stream
-rather than materialise; data structures are chosen for cache locality, zero-copy deserialization,
+rather than materialize; data structures are chosen for cache locality, zero-copy deserialization,
 and constant-time indexing in preference to flexible-but-slow alternatives. The performance
 discipline runs through the document rather than living in any one section: zero-copy node layout
 in §10, fragment-time-not-stage-time hashing in §15, and stateless reads with edge tiering in §21.
@@ -314,7 +314,7 @@ use, modification, embedding, or independent reimplementation.
 
 #### 3.2 Explicit non-goals
 
-**Peer-to-peer decentralisation.** Lore is centralized by design. Two clients communicate through
+**Peer-to-peer decentralization.** Lore is centralized by design. Two clients communicate through
 the remote, not directly.
 
 **Adversarial-server threat model.** Clients hash-validate every fragment they receive, so content
@@ -327,10 +327,10 @@ adversarial about its own pointers or permissions.
 ### 4. Conceptual Model
 
 Before the architecture, the mental models the rest of the document leans on: how Lore splits into
-storage and revision control subsystems, the two stores inside the storage subsystem, content
+storage and version control subsystems, the two stores inside the storage subsystem, content
 addressing, the revision graph, the Merkle tree, and where mutability lives.
 
-#### 4.1 Two subsystems: storage and revision control
+#### 4.1 Two subsystems: storage and version control
 
 Lore is structured as two independently usable subsystems.
 
@@ -339,12 +339,12 @@ store, with its own public API. Operations include adding fragments, looking up 
 address, advancing mutable pointers atomically, and listing entries; the storage subsystem knows
 nothing about revisions, branches, or files.
 
-The *revision control subsystem* (revisions, branches, merges, staging, sync, push, diff, query) is
+The *version control subsystem* (revisions, branches, merges, staging, sync, push, diff, query) is
 implemented on top of the storage subsystem and exposes its own public API.
 
 The separation is not an implementation detail. An application that needs only the storage
 primitives - to deduplicate large data sets, to address content cryptographically, or to ship binary
-blobs through a multi-tenant service - can use Lore as a storage system and ignore revision control
+blobs through a multi-tenant service - can use Lore as a storage system and ignore version control
 entirely. An application that wants version control gets it built on the same primitives, with the
 same scaling, performance, and isolation properties.
 
@@ -361,7 +361,7 @@ one-to-one. Entries can be added or obliterated, never modified in place: there 
 operation, because changing the bytes would just produce a different entry at a different address.
 
 The *mutable store* holds pointers and names. The latest revision of each branch, the mapping from a
-branch name to its identifier, the catalogue of repositories in a deployment: anything that needs to
+branch name to its identifier, the catalog of repositories in a deployment: anything that needs to
 be updated rather than appended to. This store is small in volume, but it is where consistency,
 serialization, and contention live.
 
@@ -405,7 +405,7 @@ size.
 
 A purely content-addressed system has no notion of "current." A revision is just a hash; without
 something pointing at it, the revision is unreachable the moment it is created. Branch latest
-pointers, name lookups, deployment catalogues - these are inherently mutable, and no amount of
+pointers, name lookups, deployment catalogs - these are inherently mutable, and no amount of
 content addressing removes the need for them.
 
 Lore's response is to keep the mutable surface as small as possible and concentrate it in the
@@ -435,7 +435,7 @@ it is a peer that implements the server end of the remote services for both subs
 |  Public API                     |   |  (protocol termination, auth,   |
 |  (C header + language bindings) |   |   policy, admin, replication)   |
 +---------------------------------+   +---------------------------------+
-|  Revision control subsystem     |   |  Revision control subsystem     |
+|  Version control subsystem      |   |  Version control subsystem      |
 +---------------------------------+   +---------------------------------+
 |  Storage subsystem              |   |  Storage subsystem              |
 +---------------------------------+   +---------------------------------+
@@ -444,7 +444,7 @@ it is a peer that implements the server end of the remote services for both subs
             +---------------------------------------+
 ```
 
-The two subsystems - storage and revision control - are the same on both sides. On the client side,
+The two subsystems - storage and version control - are the same on both sides. On the client side,
 the *public API* is Lore's primary external artifact: the C header is the canonical interface, and
 language bindings (Rust, Python, JavaScript, etc.) are equivalent surfaces over the same operations
 - two sides of the same coin. The CLI, IDE integrations, and any other application using Lore from
@@ -467,38 +467,40 @@ storage subsystem does not constrain the choice.
 
 The immutable store is a content-addressed map from `(partition, address)` to bytes. Its public API
 is a small set of operations: write a fragment, read a fragment by address, query whether a fragment
-exists in a given partition, obliterate. Fragments are independent of one another; reading fragment
-X never requires reading or even knowing about fragment Y. The store's scaling shape is therefore
-highly parallel: read paths are stateless, lookups are sharded by hash, and a fragment can live in
-any backing storage that supports hash keyed blob storage.
+exists in a given partition, copy a fragment between partitions, obliterate. Fragments are
+independent of one another; reading fragment X never requires reading or even knowing about
+fragment Y. The store's scaling shape is therefore highly parallel: read paths are stateless,
+lookups are sharded by hash, and a fragment can live in any backing storage that supports hash
+keyed blob storage.
 
 #### 5.3 The mutable key-value store
 
 The mutable store holds the small set of pointers and names that cannot be content-addressed -
-latest pointers, name-to-ID mappings, repository catalogue entries. Its API is intentionally narrow:
-`load`, `store`, `cas`, `list`. The store is small in volume but large in consequence: it is the only
-place in the architecture where two clients pushing to the same branch must serialise against each
-other. Backend implementations differ mostly in how they implement the `cas` (compare-and-swap)
-primitive (a conditional swap on a single key, transactional row update, etc.); the choice of backend is largely
-a question of how the deployment wants to handle consistency and failover at this point.
+latest pointers, name-to-ID mappings, repository catalog entries. Its API is intentionally narrow:
+`load`, `store`, `cas`, `list`. The store is small in volume but large in consequence: it is the
+only place in the architecture where two clients pushing to the same branch must serialize against
+each other. Backend implementations differ mostly in how they implement the `cas` (compare-and-swap)
+primitive (a conditional swap on a single key, transactional row update, etc.); the choice of
+backend is largely a question of how the deployment wants to handle consistency and failover at
+this point.
 
-#### 5.4 The revision control subsystem
+#### 5.4 The version control subsystem
 
-The revision control subsystem implements revisions, branches, merges, staging, and sync as
+The version control subsystem implements revisions, branches, merges, staging, and sync as
 compositions of storage operations. To commit, the subsystem writes a sequence of fragments to the
-immutable store and then issues a single conditional update on the latest pointer in the mutable
+immutable store and then issues a single conditional put on the latest pointer in the mutable
 store. To diff, it walks the two trees and fetches only the fragments along the differing paths. To
-switch a working copy, it walks the difference between the current materialised tree and the target
+switch an instance, it walks the difference between the current materialized tree and the target
 tree and fetches the fragments needed to make the difference visible on disk. The pattern recurs:
-revision control operations reduce to compositions of storage primitives.
+version control operations reduce to compositions of storage primitives.
 
 #### 5.5 Client and server: where the wire sits
 
 A client speaks to the remote through the storage protocol; the remote terminates the protocol and
-processes the request against its own storage and revision control stack.
+processes the request against its own storage and version control stack.
 
 A client holds working state on disk, staged intent, a fragment cache, and a small local mutable
-store containing the branches it has materialised. Most everyday operations - diffing, switching to
+store containing the branches it has materialized. Most everyday operations - diffing, switching to
 a cached revision, listing locally known branches - happen without contacting a remote.
 
 The remote holds the durable canonical state for the partitions it serves, authenticates and
@@ -512,7 +514,7 @@ A *link* is a reference from one repository to a specific revision of another, m
 the parent's tree. The link is recorded in the parent's revision and travels with it: every clone of
 the parent sees the same links. Architecturally, a link is just a tree node with a flag and a target
 address; functionally, traversing into a link transparently switches to the linked repository's
-storage and revision control state.
+storage and version control state.
 
 The architectural consequence that matters most is access control. A *partition* is Lore's access
 boundary; inside a single partition, Lore deliberately does not have per-path ACLs - every byte in a
@@ -528,7 +530,7 @@ independently versioned, independently deduplicated, and independently governed;
 only thing asserting that they are presented together at a given path.
 
 The same mechanism handles vendoring, multi-team ownership boundaries inside a monorepo, and tightly
-versioned dependency graphs. The recurring pattern is composition at the revision control layer with
+versioned dependency graphs. The recurring pattern is composition at the version control layer with
 isolation at the storage and access control layer.
 
 #### 5.7 Layers: local overlays
@@ -538,9 +540,10 @@ locally rather than stored in the parent's revision. A layer is configured on a 
 not travel with a clone; two machines on the same revision can have different layer configurations.
 
 Architecturally, layers and links solve overlapping problems with different semantics. A link is a
-versioned dependency every consumer of the parent sees; a layer is a local working-copy decoration
-that attaches content without changing what gets committed. The choice between them is a question of
-where a piece of composition belongs - in the revision (link) or on the workstation (layer).
+versioned dependency every consumer of the parent sees; a layer is a local decoration of the
+instance that attaches content without changing what gets committed. The choice between them is a
+question of where a piece of composition belongs - in the revision (link) or on the workstation
+(layer).
 
 ### 6. API-First Design
 
@@ -549,7 +552,7 @@ the discipline it imposes.
 
 #### 6.1 The API is the primary artifact
 
-The C header is the canonical interface to Lore. It exposes both subsystems - storage and revision
+The C header is the canonical interface to Lore. It exposes both subsystems - storage and version
 control - through a flat C ABI. Language bindings (Rust, Python, JavaScript, etc) wrap the same
 operations, with the same semantics, in the idiom of each language. The C header and the bindings
 are two sides of the same coin: bindings do not extend the API, and the C header does not constrain
@@ -566,7 +569,7 @@ The storage subsystem exposes content-addressing operations: read a fragment by 
 fragment, query whether a fragment exists in a partition, obliterate. It also exposes the mutable
 store: `load`, `store`, `cas`, `list`.
 
-The revision control subsystem exposes the operations that turn that storage into version control:
+The version control subsystem exposes the operations that turn that storage into version control:
 open a repository, stage and commit changes, create branches, merge, rebase, cherry-pick, diff,
 query history, sync with a remote, manage links. None of these is reachable only through the CLI;
 every one is a function call on the C header.
@@ -596,7 +599,7 @@ revision involved. An application opens a store handle and operates on content d
 
 Operations are batched: a single call carries many items and reports a per-item outcome, so a
 caller can submit thousands of fragments at once and learn exactly which succeeded and which
-failed without serialising on a single result.
+failed without serializing on a single result.
 
 Two properties make this standalone surface worth exposing.
 
@@ -613,7 +616,7 @@ It is *completely independent of version control*. The storage API knows nothing
 trees, branches, staging, or merges - it deals only in partitions, addresses, fragments, and
 bytes. An application that needs content-addressed, deduplicated, access-controlled blob storage
 - a build cache, an asset pipeline, a backup target, a multi-tenant artifact service - can use
-Lore purely as a storage system and never touch the revision control subsystem. The revision
+Lore purely as a storage system and never touch the version control subsystem. The version
 control subsystem is then one such consumer of the storage API among many, not a privileged
 layer with private access to it.
 
@@ -736,11 +739,11 @@ that travels with the address.
 The motivating use is file identity. When a file is committed, then renamed or moved, then
 modified, the file's bytes change but its identity does not. Lore tracks this with a stable
 per-file ID assigned at file creation; that ID is the context for every fragment that belongs to
-the file. Revision-control bookkeeping uses the (hash, context) pair to track moves, copies, and
+the file. Version-control bookkeeping uses the (hash, context) pair to track moves, copies, and
 obliteration scopes without breaking the underlying dedup.
 
 The context is generic: any 16-byte tag chosen by the caller of the storage subsystem. The
-revision control subsystem uses it primarily for file identity, but the storage subsystem itself
+version control subsystem uses it primarily for file identity, but the storage subsystem itself
 doesn't care what it means.
 
 #### 7.5 The address: hash plus context
@@ -751,8 +754,8 @@ stored, looked up, transferred, and obliterated.
 
 Two fragments with the same address are the same fragment. Two fragments with the same hash but
 different contexts are distinct: they share a payload (deduplicated under the hood) but track
-different identities, with different revision-control histories and different obliteration
-scopes. This is what lets revision control track file identity across moves and copies, and
+different identities, with different version-control histories and different obliteration
+scopes. This is what lets version control track file identity across moves and copies, and
 obliterate one file's content without disturbing another's, even when the two share bytes.
 
 #### 7.6 Local packfiles vs wire-format fragments
@@ -760,7 +763,7 @@ obliterate one file's content without disturbing another's, even when the two sh
 The on-disk format and the on-wire format are not the same shape, by design.
 
 On disk, fragments are stored in *packfiles* - large append-only files, each holding many
-fragments back-to-back, with an index from address to offset. Packfiles amortise per-file syscall
+fragments back-to-back, with an index from address to offset. Packfiles amortize per-file syscall
 and metadata costs across many fragments, which matters because a single revision can reference
 millions of small fragments. The index is mmappable and supports random lookup in constant time.
 
@@ -768,15 +771,15 @@ On the wire, fragments travel individually. Each one carries a small header with
 and compression marker, followed by its payload. There is no notion of a packfile in the
 protocol.
 
-The split exists because the two contexts have different optimisation goals. On disk, the goal
-is locality and amortised I/O: many fragments per file, mmappable indexes, append-only writes.
+The split exists because the two contexts have different optimization goals. On disk, the goal
+is locality and amortized I/O: many fragments per file, mmappable indexes, append-only writes.
 On the wire, the goal is independence, parallelism, and resumability. Independent fragments can
 be transferred in any order, in parallel across multiple connections; the server handles them out
-of order and returns responses as soon as each fragment is ready, without serialising on a
+of order and returns responses as soon as each fragment is ready, without serializing on a
 packfile boundary or maintaining ordering state. A transfer that fails halfway through leaves the
 already-delivered fragments intact and lets the client resume by transferring only the remaining
 ones. Treating disk and wire as one format would either force the disk to be fragment-at-a-time
-(poor I/O behaviour) or the wire to be packfile-at-a-time (no per-fragment parallelism, no
+(poor I/O behavior) or the wire to be packfile-at-a-time (no per-fragment parallelism, no
 fragment-level dedup query before transfer, no resumable streaming).
 
 The on-disk format is one possible format - implementations are free to choose another. The wire
@@ -813,7 +816,7 @@ Lore supports two chunking strategies.
 is placed wherever the hash matches a magic pattern, subject to minimum and maximum chunk sizes.
 Boundaries are determined by content, not offset: inserting bytes at the beginning of a file
 shifts subsequent boundaries by the same amount, so a small edit in a large file produces chunks
-identical to the unmodified file except in the immediate neighbourhood of the change.
+identical to the unmodified file except in the immediate neighborhood of the change.
 
 *Fixed-size chunking*. Boundaries are placed at fixed offsets regardless of content. Splitting
 is trivial (no rolling hash, no scanning), and the address of any byte range is computable from
@@ -890,7 +893,7 @@ reads possible.
 
 Fragment references in a list are kept strictly ordered by offset, so the list is indexable: a
 binary search can find the fragment covering any given offset in O(log n) time without
-materialising the file (the current implementation is linear but can be improved to take
+materializing the file (the current implementation is linear but can be improved to take
 advantage of this). Reading a byte range fetches only the fragments that overlap the range -
 typically a small fraction of the file - and those fragments can be fetched in parallel and
 processed out of order, since each is independent of the others. Sparse reads scale with the
@@ -904,7 +907,7 @@ the stored payload. The address is the hash of the *uncompressed* fragment conte
 or replacing the compression algorithm does not change the address. Dedup is preserved across
 compression choices.
 
-This separation is deliberate. Compression is a storage and transfer optimisation; addressing is
+This separation is deliberate. Compression is a storage and transfer optimization; addressing is
 identity. Conflating them would mean that two clients compressing the same content differently
 would produce different addresses, breaking dedup. Keeping them separate means a client can
 choose the compression that suits its CPU and bandwidth budget without affecting the
@@ -915,7 +918,7 @@ content-addressed model.
 The immutable store handles everything that's content-addressable; the mutable store handles
 everything that isn't. This section unpacks the latter: what lives there and why, how the local
 and remote stores diverge and reconverge, why branch identity is decoupled from branch name, and
-how a single conditional-put primitive gives Lore its atomic state transitions.
+how a single compare-and-swap primitive (`cas`, §9.4) gives Lore its atomic state transitions.
 
 #### 9.1 What lives in the mutable store and why
 
@@ -966,7 +969,7 @@ they all share one logical mutable store. Within a deployment, branch state does
 between instances.
 
 What does diverge is the client's mutable store and the remote's, whenever the client is doing
-local work that has not yet been synchronised; and two separate remotes (different deployments
+local work that has not yet been synchronized; and two separate remotes (different deployments
 mirroring or replicating each other), whenever they have not yet exchanged their latest state.
 
 This divergence is what makes offline operation possible. A developer working without network
@@ -1008,7 +1011,7 @@ The same primitive applies to every mutable entry, not just latest pointers. Upd
 branch's metadata is the same shape: the writer constructs a new metadata blob, uploads it to
 the immutable store (where it gets a new hash), and issues a `cas` on the branch's
 metadata pointer to refer to the new blob's hash. Renaming a branch, advancing repository
-metadata, restoring an archived name, registering a repository in the catalogue - all reduce to
+metadata, restoring an archived name, registering a repository in the catalog - all reduce to
 "write the new immutable blob (if any), then `cas` the relevant key in the mutable
 store." The protocol exposes the `load`, `store`, and `cas` operations directly; clients and
 servers coordinate every mutable-state change through the same contract.
@@ -1045,8 +1048,8 @@ things. The fields are:
 - Hash signatures of the parent revision states - one for an ordinary revision, two for a
   merge.
 - The hash of the serialized Merkle tree (the full file and directory structure).
-- The hash of the serialized metadata (commit message, author, timestamps, additional key-value
-  metadata).
+- The hash of the serialized metadata (revision commit message, author, timestamps, additional
+  key-value metadata).
 - The hash of the serialized link list (for repositories that mount linked repositories).
 - A repository ID for the second parent in cross-repository merges.
 - A few reserved fields for forward compatibility.
@@ -1061,7 +1064,7 @@ tree, the metadata, or the links is on-demand from there.
 
 The Merkle tree is not stored as a recursive serialized structure. It is stored as a sequence
 of *node blocks*, each holding a fixed number of fixed-size *node* records. A node is 96 bytes;
-a node block holds 512 nodes plus a 128-byte block header, totalling 49280 bytes - small enough
+a node block holds 512 nodes plus a 128-byte block header, totaling 49280 bytes - small enough
 to be a single fragment.
 
 A node carries the data needed to describe one file or one directory entry: flags, file mode,
@@ -1078,7 +1081,7 @@ small and uniform regardless of file-name length.
 
 Fixed-size everywhere is the design driver. A node block can be mmapped from disk straight into
 memory and used without parsing or copying; node-to-node navigation is a 32-bit index lookup;
-serialised size is identical to in-memory size. Zero-copy deserialization is the goal, and
+serialized size is identical to in-memory size. Zero-copy deserialization is the goal, and
 every field width is set to make it work.
 
 #### 10.3 Block sharing across revisions
@@ -1093,8 +1096,9 @@ union: mostly old block hashes plus a few new ones. A revision's storage cost is
 the number of blocks it modified, not to the total size of the tree.
 
 The same sharing applies to the auxiliary block streams the tree references alongside the
-node blocks - per-file metadata blocks, the per-revision change log - all of which are stored
-as content-addressed fragments and shared across revisions wherever unchanged.
+node blocks - per-file metadata blocks, the per-revision change log (the record of which paths the
+revision changed) - all of which are stored as content-addressed fragments and shared across
+revisions wherever unchanged.
 
 #### 10.4 Chain integrity via parent hashes
 
@@ -1114,7 +1118,7 @@ fragments.
 A *branch* is a name in the mutable store that resolves to a current latest-revision hash. There
 is no separate "branch object" in the immutable store. Creating a branch from another branch's
 revision is a mutable-store insertion: new branch ID, new name-to-ID mapping, latest pointer
-initialised to the branch-point revision. No new revisions are written by the branch operation
+initialized to the branch-point revision. No new revisions are written by the branch operation
 itself.
 
 A *merge* is a revision with two parents instead of one. Both parent state hashes are recorded
@@ -1160,10 +1164,10 @@ data model supports each of them, but some are still on the roadmap.
 
 Metadata in Lore is a typed key-value store attached to entities in the system - files,
 revisions, branches, and repositories. It is the primary extension point for both built-in
-system data (commit messages, timestamps, branch categories) and arbitrary application-defined
-data. This section explains where metadata lives, how immutable revision-attached metadata
-differs from mutable branch- and repository-attached metadata, the format, and how Lore divides
-the key space between built-in and application use.
+system data (revision commit messages, timestamps, branch categories) and arbitrary
+application-defined data. This section explains where metadata lives, how immutable
+revision-attached metadata differs from mutable branch- and repository-attached metadata, the
+format, and how Lore divides the key space between built-in and application use.
 
 #### 11.1 Where metadata lives: immutable vs mutable attachment
 
@@ -1225,7 +1229,7 @@ A concrete example threads several of these together. A revision is committed an
 records its built-in keys (`message`, `timestamp`, `committed-by`). A code review service then
 attaches its own application keys to the same revision - say, `review-id` (string) referring
 back to a review record, `review-status` (string) tracking approval state, and `signed-off-by`
-(string list) of approvers. A CI service later attaches `build-id` (string), `build-status`
+(string) listing approvers. A CI service later attaches `build-id` (string), `build-status`
 (string), and `artifact-address` (address) pointing at a fragment containing the build output.
 Each of these keys is on the same revision metadata blob; each is typed; none of them
 interferes with the others; and none of them required Lore itself to know that code review
@@ -1234,8 +1238,8 @@ the keys it understands, and ignores the rest.
 
 ### 12. Sparseness and Partial Working Copies
 
-Lore is built for repositories where the full tree is far too big to materialise on every
-clone. Sparse working copies and lazy data fetching are not power-user features bolted on the
+Lore is built for repositories where the full tree is far too big to materialize on every
+clone. Sparse instances and lazy data fetching are not power-user features bolted on the
 side; they are the default operating mode of the system. This section explains how Lore
 filters what gets to disk, what gets staged, what gets fetched, and how the local cache makes
 the whole thing efficient.
@@ -1245,26 +1249,26 @@ the whole thing efficient.
 A repository in Lore can hold millions of files and terabytes of content. No contributor ever
 needs all of it on their machine: a frontend developer doesn't need iOS native code; a CI
 runner building one component doesn't need the others; an artist editing textures doesn't need
-the engine source. The working copy should hold what the user is working on, not what every
+the engine source. The instance should hold what the user is working on, not what every
 team and tool in the repository is working on.
 
-The architecture follows from this. Materialisation cost should track the working subset;
+The architecture follows from this. Materialization cost should track the working subset;
 fetch cost should track what hasn't already been seen; storage cost should track what's
 actually been touched. Operations on a small part of the tree should run fast regardless of
 how big the rest of the tree is. Sparseness is therefore the substrate, not a feature: the
-working-copy machinery is built so that doing less work is the natural case.
+materialization machinery is built so that doing less work is the natural case.
 
 #### 12.2 View files: inbound filtering
 
 A *view file* (`.lore/view`) is an inbound filter declaring which paths in the repository the
-user wants on disk. Paths outside the view are not materialised when a revision is synced,
+user wants on disk. Paths outside the view are not materialized when a revision is synced,
 switched, or restored; they exist in the repository's tree, but no bytes for them are written
 to the working directory.
 
 The view is local to a client. It is not part of the committed revision and does not travel
-with a clone. Two clients on the same revision can hold different views, materialising
+with a clone. Two clients on the same revision can hold different views, materializing
 different subsets of the same tree. A change to the view triggers the storage subsystem to
-materialise (or de-materialise) paths to bring the working copy into agreement.
+materialize (or de-materialize) paths to bring the instance into agreement.
 
 Views shape what the local cache is asked to hold, what the remote is asked to send, and what
 filesystem-level tools (search, indexing, build systems) see. They are useful well beyond the
@@ -1306,7 +1310,7 @@ the view only.
 
 #### 12.5 Lazy fetch
 
-Sparse working copies are only useful if fetching is lazy as well. Lore's storage subsystem
+Sparse instances are only useful if fetching is lazy as well. Lore's storage subsystem
 fetches fragments on demand: when a revision is loaded, only the parts of the tree the view
 asks for are walked, and only the fragments backing those parts are pulled from the remote.
 The rest of the revision exists in the immutable store on the remote (and possibly in edge
@@ -1327,7 +1331,7 @@ deployment decision, not a client concern.
 
 A client's local store doubles as a fragment cache. Fragments fetched on demand stay locally
 once they are read, so subsequent reads of the same fragment do not contact the remote. The
-cache is the working copy's footprint plus whatever was loaded along the way to producing it.
+cache is the instance's footprint plus whatever was loaded along the way to producing it.
 
 The cache is sized by the user: an LRU policy evicts the least-recently-used fragments when
 the configured budget is exceeded. A developer iterating on the same area of the repository
@@ -1337,12 +1341,12 @@ is set per workstation according to the disk space the user is willing to spend.
 
 Multiple repositories or clones on the same machine can share a single local store. Fragment
 addresses are content-derived, so two clones that happen to share content also share the
-cached bytes; the working copies are separate, but the underlying fragment store is one.
+cached bytes; the instances are separate, but the underlying fragment store is one.
 
 ### 13. Binary-First by Design
 
-Lore treats every file as opaque bytes on the hot path. Text-aware behaviour - line-oriented
-diff, line-ending normalisation, encoding inference, syntax-aware merge - exists in tools that
+Lore treats every file as opaque bytes on the hot path. Text-aware behavior - line-oriented
+diff, line-ending normalization, encoding inference, syntax-aware merge - exists in tools that
 sit above the storage subsystem, not inside it. This section explains what binary-first means
 concretely, how text features layer on top, what it implies for diff/merge/review tooling, and
 how file-level locking handles content that cannot be merged at all.
@@ -1359,7 +1363,7 @@ Binary-first is a discipline about what the storage and transport paths *don't* 
   treated identically, as byte sequences.
 - No clean/smudge filters in the data path. There is no on-write transformation that rewrites
   file content during commit, and no on-read transformation that rewrites file content when
-  the working copy is materialised. Bytes go in unchanged; bytes come out unchanged.
+  the instance is materialized. Bytes go in unchanged; bytes come out unchanged.
 - No 7-bit assumptions. Hashing, chunking, transfer, and storage all operate on full 8-bit
   bytes. There is no special handling of NUL, no encoding of "control" characters, no
   expectation that any byte value carries semantic meaning to the storage path.
@@ -1372,7 +1376,7 @@ anything other than bytes.
 
 #### 13.2 Text handling layered on top
 
-Text-aware behaviour is not absent from Lore; it is just not in the storage subsystem. Tools
+Text-aware behavior is not absent from Lore; it is just not in the storage subsystem. Tools
 that know about text operate on the bytes that come out of the storage subsystem and produce
 their results. A diff tool reads the bytes of two files and renders a line-oriented diff; a
 merge tool reads the bytes of three files (base, ours, theirs) and produces a merged result.
@@ -1385,29 +1389,29 @@ text-as-such happens above.
 
 #### 13.3 Implications for diff, merge, and review tooling
 
-Binary-first means the *storage subsystem* knows nothing about text. The *revision control
+Binary-first means the *storage subsystem* knows nothing about text. The *version control
 subsystem* above it ships built-in implementations of the common text-handling operations -
 text diff, three-way text merge, line-oriented conflict resolution - so that ordinary
 "two contributors edited the same file" workflows work out of the box. These implementations
 are top-level features, not part of the storage layer, and applications are free to replace
 them with their own.
 
-- *Text diff and merge*. The revision control subsystem ships a line-oriented text diff and
+- *Text diff and merge*. The version control subsystem ships a line-oriented text diff and
   a standard three-way merge implementation, used by default for text-shaped content.
   Applications that want different semantics - word-level diff, semantic merge,
   language-aware tooling - can plug in their own without touching anything below.
 - *Binary diff and merge*. There is no universal answer. A texture-file diff is meaningful as
   an image, not as a hex dump; a 3D model merge requires a tool that understands the model's
   topology; a database snapshot diff is a different operation again. Lore makes the bytes
-  available; specialised tools do the rest.
+  available; specialized tools do the rest.
 - *Review surfaces*. Code review systems built on top of Lore can render each file with the
   viewer appropriate to its type - source as a syntax-highlighted line diff, an image as
   side-by-side rendering, a binary as a structured viewer. The renderer chooses per file;
   Lore neither helps nor hinders.
 
-The principle: storage stores raw bytes; revision control provides default semantics for the
+The principle: storage stores raw bytes; version control provides default semantics for the
 common cases; applications are free to replace those defaults when they need different
-behaviour.
+behavior.
 
 #### 13.4 Locks for unmergeable content
 
@@ -1469,14 +1473,14 @@ and the local fragment cache, with no round-trip to the remote.
 A Lore client holds enough state to operate independently of the remote for ordinary editing
 work:
 
-- *The working tree.* Files materialised on disk according to the view file.
+- *The working tree.* Files materialized on disk according to the view file.
 - *Staged intent.* The set of file changes the user has marked for inclusion in the next
   revision. Staging is recorded as intent in the local mutable store; it does not produce
   fragments.
 - *Revisions in flight.* Revisions a developer has committed locally but not yet pushed.
   These exist in the local immutable store and are addressed by hash; the local mutable
   store's branch latest pointer references them.
-- *Branch state.* For each branch the client has ever materialised, a name-to-ID mapping and
+- *Branch state.* For each branch the client has ever materialized, a name-to-ID mapping and
   a latest pointer in the local mutable store. The client can switch between any of these
   without contacting the remote.
 - *A fragment cache.* Bytes for fragments that have been fetched at any point. Subsequent
@@ -1557,7 +1561,7 @@ latest, `parent_other` set to the incoming revision - and advances the latest po
 that merge revision. This succeeds when the parallel changes don't touch the same content.
 If the server-side merge encounters a conflict, the push fails with a signal back to the
 client that the user should sync and merge locally. Server-side fast-forward merge is an
-optimisation that lets a successful concurrent push complete in one round trip; it is not
+optimization that lets a successful concurrent push complete in one round trip; it is not
 a substitute for client-side reconciliation when there is a real conflict.
 
 ### 15. State Detection and Staging
@@ -1612,11 +1616,11 @@ of each marked path rather than the size of the tree. The same flag lets "is any
 dirty under this subtree?" be answered with one bit check rather than a recursive
 scan.
 
-Both dirty and staged state are persisted in the local *staged anchor* - a
-per-instance pointer in the mutable store to the state tree that records the working
-copy's divergence from the committed revision. Reusing one anchor avoids a second
-serialization cycle on every status call and lets dirty and staged live as flags on
-the same nodes rather than as independent data structures that have to be reconciled.
+Both dirty and staged state are persisted in the local *staged anchor* - a per-instance pointer in
+the mutable store to the state tree (content-addressed in the immutable store) that records the
+instance's divergence from the committed revision. Reusing one anchor avoids a second
+serialization cycle on every status call and lets dirty and staged live as flags on the same nodes
+rather than as independent data structures that have to be reconciled.
 
 Dirty state is strictly local. It is never serialized into a revision, never
 transmitted to the remote, and never visible to other clients. It describes one
@@ -1693,8 +1697,8 @@ build systems that decide whether to rebuild - read from the same staged anchor.
 
 This pattern is what makes large-repository workflows tractable. Status without an
 explicit scan is constant-time in the size of the dirty set, not in the size of the
-working tree. A VFS provider presenting a sparse working copy can keep the dirty set
-accurate without ever materialising a file just to hash it. A watcher delivering
+working tree. A VFS provider presenting a sparse instance can keep the dirty set
+accurate without ever materializing a file just to hash it. A watcher delivering
 hundreds of change events per second produces only flag updates on the staged anchor.
 The full scan, which would otherwise dominate status latency on a multi-million-file
 tree, becomes a recovery mechanism for when an integration has missed events rather
@@ -1769,7 +1773,7 @@ dirty mark is similarly cheap.
 ### 16. Fault Tolerance and Atomicity
 
 Every operation in Lore that touches state is structured as a long resumable-partial phase
-followed by a short atomic finalisation. Expensive work - fragment writes, network
+followed by a short atomic finalization. Expensive work - fragment writes, network
 transfers - can fail and be retried without consequence; the visible state transition is a
 single conditional put on the mutable store.
 
@@ -1778,7 +1782,7 @@ single conditional put on the mutable store.
 - *Resumable partial.* The operation is a sequence of independent steps; partial completion
   is a valid intermediate state. If interrupted, work already done is not lost - a retry
   picks up from where it left off. Examples: pushing fragments to a remote, syncing a
-  working tree, fetching fragments on demand, materialising a view.
+  working tree, fetching fragments on demand, materializing a view.
 - *Fully atomic.* The operation either completes in full or leaves the repository in its
   prior state, with no observable intermediate. Examples: advancing a branch's latest
   pointer, obliterating a fragment, the local mutable-store update at the end of a commit.
@@ -1807,15 +1811,15 @@ concurrent writers and atomic transitions.
 The server's atomicity guarantee depends on validating every push end-to-end before
 advancing the latest pointer: graph integrity (the revision's immediate parents resolve),
 partition membership (every referenced fragment is present in the session's partition), and
-revision-state consistency (all tree fragments resolve). If validation fails, the fragments may already be in the
-immutable store but the latest pointer is not advanced; the new revision is not visible to
-anyone.
+revision-state consistency (all tree fragments resolve). If validation fails, the fragments may
+already be in the immutable store but the latest pointer is not advanced; the new revision is not
+visible to anyone.
 
 Clients depend on this. Hash validation of fetched fragments is end-to-end and free (the
 content address proves the bytes), but graph-level validation is what the server has
 already done. This is the trust boundary in §3.2: clients hash-validate content, and trust
 the server to have validated graph structure. A misbehaving server could in principle
-present a malformed graph; the defence is that the server rejects malformed pushes, so
+present a malformed graph; the defense is that the server rejects malformed pushes, so
 clients fetching from a correctly-operating server never see one.
 
 #### 16.4 What can go wrong and what each failure looks like
@@ -1843,7 +1847,7 @@ changed." There is no in-between state to clean up.
 
 Lore is designed so that multiple unrelated repositories can share a single backend
 deployment safely. The threat is mutually distrustful tenants on shared storage; the
-defence is a layered access model rooted in partitions. This section explains the threat,
+defense is a layered access model rooted in partitions. This section explains the threat,
 the partition boundary and how it's enforced, the authentication/authorization mechanics,
 the "knows the hash" attack and the ownership-proof protocol, server-side validation, and
 the side-channel discipline that keeps the protocol from leaking what the access model
@@ -1915,7 +1919,7 @@ match and content addressing would happily serve the bytes regardless of who ori
 put them there.
 
 This is the *knows the hash* attack. Hash discovery is not hypothetical: hashes show up in
-logs, build artefacts, error messages, shared dependencies; an adversary doesn't need to
+logs, build artifacts, error messages, shared dependencies; an adversary doesn't need to
 brute-force them. A multi-tenant system that ignored this attack would leak content the
 moment any tenant learned a hash from another.
 
@@ -1924,32 +1928,32 @@ partitions storing the same bytes share the underlying storage, but the access c
 partition-scoped: a session bound to partition A cannot fetch a fragment by hash unless
 that fragment is registered in partition A.
 
-#### 17.6 PUT requires bytes; COPY is the cross-partition shortcut
+#### 17.6 Put requires bytes; Copy is the cross-partition shortcut
 
-Two operations register a fragment in a partition: PUT and COPY.
+Two operations register a fragment in a partition: Put and Copy.
 
-*PUT* always requires the bytes. The client sends the address it wants to register and the
-payload; the server stores the payload (or recognises that it already has the bytes
+*Put* always requires the bytes. The client sends the address it wants to register and the
+payload; the server stores the payload (or recognizes that it already has the bytes
 internally) and registers the address in the client's partition. Whether the same hash
 exists elsewhere in the storage layer is irrelevant to the protocol - the payload must
-accompany the PUT. This is the defence against the knows-the-hash attack: hash knowledge
+accompany the Put. This is the defense against the knows-the-hash attack: hash knowledge
 alone is never sufficient to register a fragment.
 
-*COPY* is the cross-partition shortcut. If the session has access to both partition X and
+*Copy* is the cross-partition shortcut. If the session has access to both partition X and
 partition Y, and a fragment is registered in X, the session can ask the server to copy
 the registration into Y without re-transmitting the bytes. The server validates both
 authorizations and that the hash exists in the source partition, then registers it in the
 destination partition. The client never re-uploads the payload.
 
 The split is economical on the network - bytes traverse the wire only when needed - but
-strict on access: COPY requires authorization on both ends, so it cannot reach into a
+strict on access: Copy requires authorization on both ends, so it cannot reach into a
 partition the session does not already have.
 
 #### 17.7 Context as identity, not authorization
 
 A context (§7.4) is a 16-byte tag carried alongside a content hash for tracking identity
 within a partition - file ID for move and copy, obliteration scope, similar
-revision-control bookkeeping. Context is *not* an access boundary. Two fragments with
+version-control bookkeeping. Context is *not* an access boundary. Two fragments with
 identical hashes but different contexts are distinct entries that share storage; they do
 not constitute different access scopes. Authorization is exclusively at the partition
 level; context is metadata above it.
@@ -1985,7 +1989,7 @@ and returns one of four values:
 - `Unknown` - state could not be determined for transient reasons.
 
 There is no cross-partition signal in the query: a session asking about a hash in
-partition A learns only what is in A. A client that wants to know whether to PUT or COPY
+partition A learns only what is in A. A client that wants to know whether to Put or Copy
 across two of its own partitions queries each separately.
 
 Timing is part of the contract. Lookups return in roughly constant time regardless of whether
@@ -2072,7 +2076,7 @@ There are scenarios where data must actually leave the store, not just become un
 through some branch:
 
 - *Legal hold release.* Data was retained under a hold; the hold has expired; the
-  organisation is required to destroy the bytes.
+  organization is required to destroy the bytes.
 - *Secrets accidentally committed.* A credential was checked in. Rotating the credential
   is the immediate fix; getting the old credential out of the repository is the follow-up.
 - *Bulk data cleanup.* A retired project's large binaries no longer need to occupy
@@ -2169,7 +2173,7 @@ a typed "obliterated" response.
 
 To a downstream consumer this looks like a present-but-unreadable fragment. A diff that
 crosses obliterated content shows "this content was obliterated" rather than producing
-bogus output. A sync that needs the bytes for materialisation cannot complete and reports
+bogus output. A sync that needs the bytes for materialization cannot complete and reports
 the failure cleanly. A clone of a revision whose content has been obliterated still walks
 the tree but stops at the obliterated fragments.
 
@@ -2187,7 +2191,7 @@ related things:
   hash can no longer be re-derived even though it is still recorded in revisions.
 - *Un-leak data already cloned by a tenant.* Once a fragment has left the deployment - in
   a clone, a backup, an export - obliteration on the deployment cannot reach those copies.
-  Defence against leakage is upstream of obliteration, in access control and in policies
+  Defense against leakage is upstream of obliteration, in access control and in policies
   against extraction.
 - *Forget the fact that a revision existed.* The revision state is itself a fragment with
   its own hash. Obliterating its content fragments removes the bytes; the revision's hash
@@ -2197,7 +2201,7 @@ related things:
   the hash is derived from bytes that are no longer recoverable.
 
 For the cases obliteration does not cover, the system relies on access control (§17),
-secrets-rotation hygiene (out of scope for the storage layer), and defence in depth
+secrets-rotation hygiene (out of scope for the storage layer), and defense in depth
 around the entire pipeline.
 
 ### 20. Replaceable Backends
@@ -2226,9 +2230,9 @@ Lore ships with:
 - *AWS S3 store.* For server deployments that want object-storage durability. Each
   fragment maps to an S3 object addressed by hash; the store handles batching, retry,
   and consistency on top of S3.
-- *Replica wrappers.* Compose an immutable store with one or more peer replicas reached
-  over the network, replicating both reads and writes. Reads at one peer pull warm
-  fragments from neighbouring peers when the local copy misses; writes at one peer
+- *Replica wrappers (`ReplicatedStore`).* Compose an immutable store with one or more peer replicas
+  reached over the network, replicating both reads and writes. Reads at one peer pull warm
+  fragments from neighboring peers when the local copy misses; writes at one peer
   propagate to the others, so a fragment just put on peer A is immediately available at
   peer B without going back to the durable upstream store. The pattern increases
   hot-fragment hit rate across the fleet and avoids the latency cost of fetching newly
@@ -2280,14 +2284,14 @@ implementing the two traits. The rest of Lore does not change.
 A Lore deployment scales horizontally on the read path, replicates aggressively at the
 edge, and concentrates the consistency-sensitive work into the mutable store's
 conditional-put primitive. This section walks the scaling axes, why most of the workload
-parallelises trivially, where the bottleneck is, how tiering and replication absorb
+parallelizes trivially, where the bottleneck is, how tiering and replication absorb
 load, and how the deployment signals back-pressure when it cannot.
 
 #### 21.1 Scaling axes
 
 A deployment scales on several independent axes simultaneously:
 
-- *Tenants per deployment.* How many distinct organisations or projects share one
+- *Tenants per deployment.* How many distinct organizations or projects share one
   backend.
 - *Repositories per tenant.* How many partitions one tenant occupies.
 - *Branches per repository.* How many concurrent lines of work live in each partition.
@@ -2323,14 +2327,14 @@ contend.
 
 #### 21.3 The mutable store as the consistency hot spot
 
-Where reads and fragment writes parallelise, mutable-store operations cannot. The
-conditional-put primitive (§9.4) is the only true serialisation point in the
+Where reads and fragment writes parallelize, mutable-store operations cannot. The
+conditional-put primitive (§9.4) is the only true serialization point in the
 architecture: when two clients both push to the same branch, the mutable store decides
 which one wins. That decision is per-key, not per-deployment - two pushes to different
 branches do not contend; two pushes to different repositories contend even less.
 
 Per-branch contention is the natural granularity. A repository with many branches
-parallelises across them; a single branch with many simultaneous pushers is the worst
+parallelizes across them; a single branch with many simultaneous pushers is the worst
 case. In practice the worst case is rare - branches typically have a single primary
 contributor at any moment - but the system handles the contended case correctly:
 failed conditional puts surface as conflicts (§14.5), which clients reconcile via
@@ -2366,7 +2370,7 @@ or cold; tiering is a deployment decision, not a protocol feature.
 
 Within a region, multiple peer servers replicate fragments and mutable-store state to
 each other (§20.1, §20.2). A fragment put on one peer propagates to the others, so
-neighbouring servers can answer reads for newly-written content without round-tripping
+neighboring servers can answer reads for newly-written content without round-tripping
 to the durable upstream. Mutable-store state replicates similarly, with conditional-put
 semantics preserved across peers.
 
@@ -2424,12 +2428,12 @@ The recurring problems:
   submodules and treat them specially, or they do not and produce wrong results. The
   set of tools that handle submodules correctly is always smaller than the set of
   tools the user actually needs.
-- *Half-presence.* Submodules can be in odd states - uninitialised, detached, in a
+- *Half-presence.* Submodules can be in odd states - uninitialized, detached, in a
   different revision than the pin. Each state is a special case.
 
 Lore's links target the same use case but commit to a different model. They are
 intrinsic to the parent revision rather than bolted on; they participate in normal
-revision-control operations as transparent boundaries; and the access-control story
+version-control operations as transparent boundaries; and the access-control story
 (§5.6) is designed in rather than overlaid.
 
 #### 22.2 Subset selection, path remapping, and transparent traversal
@@ -2444,8 +2448,8 @@ the parent. A linked repository's `lib/widgets` directory can appear as
 `vendor/widgets` in the parent; the mount is a subtree of the linked content remapped
 to a different location in the parent's tree.
 
-When the revision control subsystem walks a path that crosses a link node, it switches
-context to the linked repository's state, deserialises that state, applies the
+When the version control subsystem walks a path that crosses a link node, it switches
+context to the linked repository's state, deserializes that state, applies the
 source-path offset to translate the parent-relative path into a linked-repository path,
 and continues resolution there. The user sees a single seamless tree; the storage
 subsystem handles the boundary and the remapping invisibly. A path like
@@ -2454,9 +2458,9 @@ remaps to `lib/widgets/button.rs` inside the linked repository, and resolves to 
 file there.
 
 Sparse views compose with links naturally. The user's view file (§12.2) applies to the
-final remapped path in the parent's tree: a view that materialises only
+final remapped path in the parent's tree: a view that materializes only
 `parent/vendor/widgets/...` pulls in just that subtree of the linked repository,
-without materialising the rest. Tools that are not link-aware do not need to be: the
+without materializing the rest. Tools that are not link-aware do not need to be: the
 seamless tree, the view, and the link boundary all interact through the same
 path-resolution machinery. Writes through the link path (staging, committing) work the
 same way at any depth.
@@ -2527,7 +2531,7 @@ repository's content onto another at a path, applied locally rather than stored 
 parent's revision. This section unpacks the parts §5.7 didn't reach: what overlay
 problems layers solve, how the local configuration stores subset-and-path information
 the same way a link encodes it in a tree node, how layers decide which revision of the
-source repository to materialise, and how staging, commit, and per-layer revision
+source repository to materialize, and how staging, commit, and per-layer revision
 messages work when several layers move together.
 
 #### 23.1 The overlay problem
@@ -2541,7 +2545,7 @@ build machine. None of these uses should appear in the parent's history; all of 
 want the path-resolution machinery that links provide for committed dependencies.
 
 Layers are this overlay model. They are configured per machine, applied at
-materialisation time, and absent from every revision the parent ever commits. Two
+materialization time, and absent from every revision the parent ever commits. Two
 machines on the same parent revision can hold completely different layer
 configurations, and neither of them changes what gets committed - that is the contract
 distinguishing layers (§5.7) from links (§22).
@@ -2554,7 +2558,7 @@ the same shape as a link (§22.2). A layer records:
 - The *target path* in the parent's tree, where the layer appears.
 - The *source repository* identifier.
 - The *source path* inside the layer repository, where the mounted subtree starts.
-- A *current revision* of the layer repository (the revision actually materialised).
+- A *current revision* of the layer repository (the revision actually materialized).
 - A *staged revision* (the layer's revision in the parent's staging context).
 - An optional *metadata key* (see §23.3).
 
@@ -2566,19 +2570,19 @@ user's filters apply to the final remapped path in the parent's working tree.
 
 The difference is where the configuration lives. A link's target is encoded in the
 parent's tree node and travels with the revision. A layer's configuration lives in a
-local file under the parent's working directory; it is read at materialisation time
+local file under the parent's working directory; it is read at materialization time
 and ignored by everything that walks the committed tree.
 
 #### 23.3 Metadata-keyed revision matching and branch auto-follow
 
-A layer must decide which revision of its source repository to materialise at any
+A layer must decide which revision of its source repository to materialize at any
 given moment. Two mechanisms cover this.
 
 *Metadata-keyed matching.* When a layer is configured with a metadata key, the system
 looks up the layer-repository revision whose metadata at that key matches the parent's
 current revision metadata at the same key. A typical example: the parent records a
 build identifier or release tag in its revision metadata; the layer repository
-records the same value on the matching revisions; the layer materialises whichever
+records the same value on the matching revisions; the layer materializes whichever
 layer-repo revision corresponds to the parent's current build. The matching is a
 metadata-value search across recent layer revisions, not a branch lookup, and works
 across arbitrary correspondences the metadata captures.
@@ -2591,7 +2595,7 @@ branch level. This keeps multi-team workflows coherent: when the parent team sta
 new release branch, every machine that uses the project's standard layer set picks up
 matching branches in each layer without manual reconfiguration.
 
-#### 23.4 Per-layer staging, commit, and revision messages
+#### 23.4 Per-layer staging, commit, and revision commit messages
 
 Layers participate in staging and commit operations alongside the parent. By default,
 `stage` and `commit` cascade through the parent and any layers that have changes in
@@ -2602,11 +2606,11 @@ the staged paths. Three operations narrow the scope to a single layer:
   and conflict resolution; the same path can be staged in either the parent or a
   layer depending on which side the change actually belongs to.
 - *Layer-scoped commit.* `commit --layer <path>` commits staged changes in one layer
-  independently, advancing that layer's pin in the local layer configuration without
+  independently, advancing that layer's current revision in the local layer configuration without
   touching the parent or any other layers. The parent itself is not committed; the
-  parent's next commit will see the new layer pin in its staged context.
-- *Per-layer revision messages.* When committing across multiple layers, each layer
-  can carry its own commit message - either via an interactive prompt or the
+  parent's next commit will see the layer's new revision in its staged context.
+- *Per-layer revision commit messages.* When committing across multiple layers, each layer
+  can carry its own revision commit message - either via an interactive prompt or the
   `--layer-message <path> <message>` form. A single high-level commit produces a
   parent revision and one revision per affected layer, each with its own message.
 
@@ -2617,8 +2621,8 @@ forcing the parent or other layers to come along.
 #### 23.5 Access control
 
 A layer's source repository is its own repository, with its own partition and its own
-access control (§17). Materialising a layer goes through normal authorization on the
-source partition; a user without the necessary permissions cannot materialise the
+access control (§17). Materializing a layer goes through normal authorization on the
+source partition; a user without the necessary permissions cannot materialize the
 layer's content even though the layer configuration sits in their local working
 directory. Different machines configured with the same layer can hold it under
 different access identities - one user with read access, another with read-write.
@@ -2649,12 +2653,13 @@ An *instance* is a working directory with its own state. Each instance has a uni
 a UUIDv7 stored in `.lore/instance` at the working directory's root. The instance ID is what
 distinguishes one instance's state from another when several instances share a store.
 
-Per-instance state lives in the mutable store under instance-keyed entries:
+Per-instance state lives in the local mutable store under instance-keyed entries:
 
-- The instance's *current revision anchor* - which revision is materialised in this working
+- The instance's *current revision anchor* - which revision is materialized in this working
   directory.
 - The instance's *current branch* - which branch this working directory is operating on.
-- The instance's *staged anchor* - the snapshot the user has staged for the next commit.
+- The instance's *staged anchor* - a pointer to the state tree recording the instance's dirty
+  and staged divergence from the committed revision.
 - The instance's *metadata blob* - the path on disk, creation time, and other information for
   diagnostics and stale-instance detection.
 
@@ -2742,7 +2747,7 @@ proof as background.
 - *Refs vs mutable store.* Git keeps branch heads in a `refs/` directory under a
   loose convention. Lore keeps branch latest pointers in a typed mutable store with
   conditional-put atomicity (§9). Two clients pushing the same branch in Lore have a
-  precise serialisation point.
+  precise serialization point.
 - *API-first vs CLI-first ecosystem.* Git was built CLI-first; integrations either
   parse CLI output (which is unstable across versions) or depend on libgit2 - a
   separate project that re-implements Git's core as a permissively-licensed C
@@ -2786,7 +2791,7 @@ Perforce's role seriously and rebuilds the substrate underneath.
 - *Server as source of truth.* The model where canonical state lives at the server
   rather than at every clone is Perforce's contribution to the design space.
 - *File-level locking for unmergeable content.* Lore's locking model (§13.4)
-  recognises that some content cannot be merged automatically - the same insight
+  recognizes that some content cannot be merged automatically - the same insight
   Perforce has had for decades.
 - *Per-path access control.* Perforce's protections table is a per-path ACL. Lore
   arrives at the same outcome via a different mechanism - directories that need their
@@ -2908,7 +2913,7 @@ as the user actually touches content, and reaches a steady state proportional to
 set the fork has exercised - not to the size of the source repository.
 
 Access control is preserved by gating read-through on the session's authorization for both
-partitions, the same way COPY works today (§17.6); the source partition's content does not
+partitions, the same way Copy works today (§17.6); the source partition's content does not
 leak just because the fork exists. Open questions remain on how source-partition obliteration
 interacts with fork content that has not yet been read through, on quota accounting (does the
 fork accumulate quota on registrations created by read-through, or only on writes the fork
@@ -2926,7 +2931,7 @@ The interaction problem is that even when a lock is held globally, the *result* 
 modification made while the lock was held - lives only on the branch where it was committed.
 A user on branch A acquires a global lock, edits the asset, commits, and releases. The release
 is fine; the asset is globally unlocked. A user on branch B then acquires a global lock, edits
-the asset, commits, and releases. Both locks were correctly serialised in time, and neither
+the asset, commits, and releases. Both locks were correctly serialized in time, and neither
 user violated the locking contract, but the modifications happened in parallel branches that
 have not yet been merged. When branch A eventually merges into branch B's line, the changes
 collide. Locks alone are not enough: locking is temporal (who is editing now), but the result
@@ -2940,7 +2945,7 @@ If no, the lock acquisition is either refused (forcing the requestor to sync fir
 qualified as branch-scoped, allowing parallel locks on disjoint branches but surfacing the
 conflict explicitly when those branches merge.
 
-Policy-driven acquisition layers on top of the branch-aware mechanics: lock behaviour can vary
+Policy-driven acquisition layers on top of the branch-aware mechanics: lock behavior can vary
 by configured policy - auto-locking files matching a pattern (binary asset directories), lease
 expiry to release stale locks, approval workflows for sensitive content, audit trails of who
 held what when. A locked file that moves through merge, rebase, or cherry-pick has to follow
@@ -2959,7 +2964,7 @@ at once, each committable independently. A given file can be in at most one stag
 no ambiguity about which stage owns the change - but two stages with disjoint file sets
 coexist over the same working tree without interference. The pattern is the one Perforce calls
 a *changelist*: a developer can have a bug fix and a feature in flight simultaneously, each
-with its own set of staged paths and its own commit message, and ship them as separate
+with its own set of staged paths and its own revision commit message, and ship them as separate
 revisions in either order.
 
 The use cases the model fits include a bug fix that should ship quickly while a feature is
@@ -2969,7 +2974,7 @@ half-finished work in the working directory. The data model already supports it 
 is a list of paths in the local mutable store, and a commit reads a specific stage's path
 list. What is missing is the API surface and the tooling: naming stages, switching the current
 stage, listing stages, surfacing the right stage in `status`, and integrating with the rest of
-the revision-control workflow.
+the version-control workflow.
 
 #### 26.4 Hash-based server sharding
 
@@ -2992,7 +2997,7 @@ single shard becomes a hot spot for content the way a single-fleet deployment ca
 
 Open questions remain on where the routing layer lives - transparent to clients with the edge
 tier doing the routing, or visible in the protocol so clients can talk directly to shards;
-on rebalancing behaviour when a shard is added or removed (which fragments re-route, and how
+on rebalancing behavior when a shard is added or removed (which fragments re-route, and how
 is in-flight traffic migrated); and on cross-shard operations such as a push that references
 fragments touching multiple shards. The mutable store does not shard the same way - latest
 pointer advances are partition-scoped, not hash-scoped - so the sharding strategy for the
