@@ -61,7 +61,7 @@ extern "C" {
 
 //! Define RPMALLOC_HEAP_STATISTICS to non-zero to enable first class heap statistics gathering.
 #ifndef RPMALLOC_HEAP_STATISTICS
-#define RPMALLOC_HEAP_STATISTICS 1
+#define RPMALLOC_HEAP_STATISTICS 0
 #endif
 
 //! Flag to rpaligned_realloc to not preserve content in reallocation

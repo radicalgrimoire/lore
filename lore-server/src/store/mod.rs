@@ -22,7 +22,6 @@ pub use configuration::empty_plugin_config;
 pub use configuration::has_plugin_config;
 pub use configuration::resolve_plugin_config;
 pub use configuration::resolve_plugin_config_with_fallback;
-use lore_base::allocator::rpmalloc_global_stats;
 #[cfg(test)]
 use lore_revision::runtime::execution_context;
 use lore_storage::ImmutableStore;
@@ -54,8 +53,6 @@ struct StoreInstruments {
     instrument_provider: StoreInstrumentProvider,
     fragment_count: Gauge<u64>,
     used_bytes: Gauge<u64>,
-    allocated_bytes: Gauge<u64>,
-    committed_bytes: Gauge<u64>,
     available: Gauge<u64>,
 }
 
@@ -73,8 +70,6 @@ static STORE_INSTRUMENTS: OnceLock<StoreInstruments> = OnceLock::new();
 
 static METRICS_FRAGMENT_COUNT_METRIC_NAME: &str = "fragment-count";
 static METRICS_USED_BYTES_METRIC_NAME: &str = "used-bytes";
-static METRICS_ALLOCATED_BYTES_METRIC_NAME: &str = "allocated-bytes";
-static METRICS_COMMITTED_BYTES_METRIC_NAME: &str = "committed-bytes";
 static METRICS_AVAILABLE_METRIC_NAME: &str = "available";
 
 impl Default for StoreInstruments {
@@ -82,16 +77,12 @@ impl Default for StoreInstruments {
         let instrument_provider = StoreInstrumentProvider::default();
         let fragment_count = instrument_provider.gauge(METRICS_FRAGMENT_COUNT_METRIC_NAME);
         let used_bytes = instrument_provider.gauge(METRICS_USED_BYTES_METRIC_NAME);
-        let allocated_bytes = instrument_provider.gauge(METRICS_ALLOCATED_BYTES_METRIC_NAME);
-        let committed_bytes = instrument_provider.gauge(METRICS_COMMITTED_BYTES_METRIC_NAME);
         let available = instrument_provider.gauge(METRICS_AVAILABLE_METRIC_NAME);
 
         Self {
             instrument_provider,
             fragment_count,
             used_bytes,
-            allocated_bytes,
-            committed_bytes,
             available,
         }
     }
@@ -107,35 +98,15 @@ pub async fn memory_stats_reporter(store: Weak<dyn ImmutableStore>, interval: Op
         let stats = lore_base::allocator::memory_stats();
 
         info!(
-            "Server local store memory stats: {} fragments, {} used bytes, {} allocated bytes, {} committed bytes",
+            "Server local store memory stats: {} fragments, {} growvec bytes",
             fragment_count.unwrap_or_default(),
-            stats.used_bytes,
-            stats.allocated_bytes,
-            stats.committed_bytes
+            stats.used_bytes
         );
 
         instruments
             .fragment_count
             .record(fragment_count.unwrap_or_default() as u64, &[]);
         instruments.used_bytes.record(stats.used_bytes as u64, &[]);
-        instruments
-            .allocated_bytes
-            .record(stats.allocated_bytes as u64, &[]);
-        instruments
-            .committed_bytes
-            .record(stats.committed_bytes as u64, &[]);
-
-        let stats = rpmalloc_global_stats();
-        info!(
-            "rpmalloc global stats: {} mapped, {} peak mapped, {} active, {} peak active, {} total committed, {} total decommitted, {} heaps",
-            stats.mapped,
-            stats.mapped_peak,
-            stats.active,
-            stats.active_peak,
-            stats.committed,
-            stats.decommitted,
-            stats.heap_count
-        );
     }
 }
 
