@@ -15,7 +15,7 @@ cd lore-proto
 
 2. Login to artifactory:
 ```
-npm login --registry=https://artifacts.ol.epicgames.net/artifactory/api/npm/npm-internal/ --auth-type=web
+npm login --registry=<REGISTRY_URL> --auth-type=web
 ```
 ...and follow the instructions and login in the browser.
 

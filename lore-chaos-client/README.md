@@ -4,7 +4,7 @@ The client is still an early draft so the readme is basic and to the point becau
 
 ```
 // Create a fresh copy of an empty repo for the client to use before every command
-urc clone urc.internal.epicgames.net/matthew.hoffman/ChaosPlayground
+lore clone <repository url>/<repository>
 
 // Run a sequence of commands on the repo
 lore-chaos-client chaos -r ".\ChaosPlayground" -i 1000 --seed 1000 --offline
@@ -26,7 +26,7 @@ lore-chaos-client parallel -r ".\ChaosPlayground" --runners 16 --time-limit-mins
 Ensure you have a fresh Lore repo. I keep one empty to be able to freshly clone each time.
 
 ```
-urc clone urc.internal.epicgames.net/matthew.hoffman/ChaosPlayground
+lore clone <repository url>/<repository>
 ```
 
 ## Running

@@ -4,8 +4,5 @@
     "description": "Proto files package",
     "files": [
         "proto/*"
-    ],
-    "publishConfig": {
-        "registry": "https://artifacts.ol.epicgames.net/artifactory/api/npm/npm-internal/"
-    }
+    ]
 }

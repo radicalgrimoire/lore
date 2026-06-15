@@ -199,7 +199,7 @@ Reply payload
 
 # gRPC
 
-gRPC proto definitions are available in https://github.ol.epicgames.net/ucs/urc/tree/main/urc-proto/proto
+gRPC proto definitions are available in the `lore-proto` crate.
 
 In general the gRPC protos match the QUIC protocol command and reply definitions as seen above.
 
