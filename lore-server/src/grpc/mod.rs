@@ -22,11 +22,12 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
-mod replication_server;
+mod grpc_internal_server;
 mod replication_service;
 pub mod tower;
 
 pub use admin_service::LoreAdminService;
+pub use grpc_internal_server::GrpcInternalServerBuilder;
 use lore_base::types::Context;
 use lore_revision::lore::RepositoryId;
 use lore_revision::metadata::MetadataError;
@@ -36,7 +37,6 @@ use lore_revision::state::StateError;
 use lore_transport::grpc::CORRELATION_ID_HEADER;
 use lore_transport::grpc::PARTITION_ID_KEY;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
-pub use replication_server::GrpcReplicationServerBuilder;
 pub use repository::LoreRepositoryV1Service;
 pub use revision::LoreRevisionV1Service;
 pub use revision_service::LoreRevisionService;

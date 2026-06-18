@@ -127,10 +127,10 @@ def generate_server_config(request, tmp_path_factory, ports: dict):
             "RUST_LOG": rust_log,
             "RUST_BACKTRACE": "1",
             "LORE__SERVER__QUIC__PORT": str(ports["quic"]),
-            # QUIC internal runs by default on the same port as Replication (using UDP instead of TCP)
-            "LORE__SERVER__QUIC_INTERNAL__PORT": str(ports["replication"]),
+            # QUIC internal runs on the same port as gRPC internal (UDP vs TCP)
+            "LORE__SERVER__QUIC_INTERNAL__PORT": str(ports["internal"]),
             "LORE__SERVER__GRPC__PORT": str(ports["grpc"]),
-            "LORE__SERVER__REPLICATION__PORT": str(ports["replication"]),
+            "LORE__SERVER__GRPC_INTERNAL__PORT": str(ports["internal"]),
             "LORE__SERVER__HTTP__PORT": str(ports["http"]),
             "LORE_ENV": "gha",
         }
@@ -154,7 +154,7 @@ def launch_lore_server(server_root, server_env, executable_path):
         "LORE__SERVER__GRPC__PORT",
         "LORE__SERVER__QUIC__PORT",
         "LORE__SERVER__QUIC_INTERNAL__PORT",
-        "LORE__SERVER__REPLICATION__PORT",
+        "LORE__SERVER__GRPC_INTERNAL__PORT",
     ):
         _check_port_free(
             "127.0.0.1", server_env[port_key], label=f"{server_name} ({port_key})"
