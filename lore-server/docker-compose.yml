@@ -1,13 +1,9 @@
 services:
   lore-server:
-    build:
-      # The Dockerfile expects the repository root as build context because it
-      # needs the Cargo workspace files and sibling crates.
-      context: ..
-      dockerfile: lore-server/Dockerfile
-    image: lore-server-local
+    image: ghcr.io/radicalgrimoire/lore/lore:0.8.3.3
     ports:
-      - "41337:41337"
+      - "41337:41337/tcp"
+      - "41337:41337/udp"
       - "41339:41339"
     volumes:
       - lore-data:/data
