@@ -19,7 +19,6 @@ jobs:
   # See also https://docs.docker.com/docker-hub/builds/
   # TAG_SUFFIX="nightly-$(date +'%Y%m%d')"
   push:
-    if: false
     uses: ./.github/workflows/publish.yml
     needs: [test]
     secrets: inherit

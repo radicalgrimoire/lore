@@ -1,5 +1,9 @@
 name: publish
 
+permissions:
+  contents: read
+  packages: write
+
 env:
   TAG_LATEST: latest
   TAG_NIGHTLY: nightly
