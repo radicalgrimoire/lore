@@ -1,0 +1,25 @@
+name: build-develop
+
+on:
+  # schedule:
+    # JST 朝9時 = UTC 0時（JST = UTC + 9時間）
+    # - cron: '0 0 * * *'
+  
+  workflow_dispatch: {}
+
+jobs:
+  # Run tests.
+  # See also https://docs.docker.com/docker-hub/builds/automated-testing/
+  # if: github.event_name == 'push' || github.event_name == 'pull_request'
+  test:
+    uses: ./.github/workflows/test.yml
+    secrets: inherit
+
+  # Push image to GitHub Packages.
+  # See also https://docs.docker.com/docker-hub/builds/
+  # TAG_SUFFIX="nightly-$(date +'%Y%m%d')"
+  push:
+    if: false
+    uses: ./.github/workflows/publish.yml
+    needs: [test]
+    secrets: inherit

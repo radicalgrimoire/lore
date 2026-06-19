@@ -1,0 +1,21 @@
+services:
+  lore-server:
+    build:
+      # The Dockerfile expects the repository root as build context because it
+      # needs the Cargo workspace files and sibling crates.
+      context: ..
+      dockerfile: lore-server/Dockerfile
+    image: lore-server-local
+    ports:
+      - "41337:41337"
+      - "41339:41339"
+    volumes:
+      - lore-data:/data
+    environment:
+      LORE_CONFIG_PATH: /etc/lore/config
+      LORE_ENV: docker
+      RUST_LOG: info
+    restart: unless-stopped
+
+volumes:
+  lore-data:

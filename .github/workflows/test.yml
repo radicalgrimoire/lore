@@ -1,0 +1,32 @@
+name: test
+
+on:
+  workflow_call:
+    inputs:
+      docker_files_name:
+        required: false
+        default: 'lore-server/Dockerfile'
+        type: string
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -f ${{ inputs.docker_files_name }} -t ${{ secrets.IMAGE_NAME }} .
+
+      - name: Smoke test image
+        run: docker run --rm ${{ secrets.IMAGE_NAME }} --help
+
+      - name: Save Docker image as artifact
+        run: docker save ${{ secrets.IMAGE_NAME }} > ${{ secrets.IMAGE_NAME }}.tar
+
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image-${{ secrets.IMAGE_NAME }}
+          path: ${{ secrets.IMAGE_NAME }}.tar
+          retention-days: 1
