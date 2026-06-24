@@ -609,7 +609,18 @@ pub fn handle_repository_status(globals: LoreGlobalArgs, args: &RepositoryStatus
             .with_defaults(),
     ));
 
+    let repo_root = std::path::absolute(globals.repository_path())
+        .unwrap_or_else(|_| std::path::PathBuf::from(globals.repository_path()));
+
     let result = runtime().block_on(repository::status(globals, args, callback)) as u8;
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| repo_root.clone());
+    let display_path = |path: &str, node_type| {
+        path_typed(
+            &util::relativize_for_display(&repo_root, &cwd, path),
+            node_type,
+        )
+    };
 
     let files_staged = staged.lock();
     if !files_staged.is_empty() {
@@ -627,8 +638,8 @@ pub fn handle_repository_status(globals: LoreGlobalArgs, args: &RepositoryStatus
                     color_code,
                     file.action_as_string_short(),
                     anstyle::Reset,
-                    path_typed(file.from_path.as_str(), file.r#type),
-                    path_typed(file.path.as_str(), file.r#type),
+                    display_path(file.from_path.as_str(), file.r#type),
+                    display_path(file.path.as_str(), file.r#type),
                     file.merged_as_string_short(),
                 );
             } else {
@@ -637,7 +648,7 @@ pub fn handle_repository_status(globals: LoreGlobalArgs, args: &RepositoryStatus
                     color_code,
                     file.action_as_string_short(),
                     anstyle::Reset,
-                    path_typed(file.path.as_str(), file.r#type),
+                    display_path(file.path.as_str(), file.r#type),
                     file.merged_as_string_short(),
                 );
             }
@@ -658,7 +669,7 @@ pub fn handle_repository_status(globals: LoreGlobalArgs, args: &RepositoryStatus
                 FileActionStyle::from_action_bg(file.action),
                 file.action_as_string_short(),
                 anstyle::Reset,
-                path_typed(file.path.as_str(), file.r#type),
+                display_path(file.path.as_str(), file.r#type),
                 FileActionStyle::CONFLICT,
                 file.merged_as_string_short(),
                 file.conflict_as_string_short(),
@@ -692,8 +703,8 @@ pub fn handle_repository_status(globals: LoreGlobalArgs, args: &RepositoryStatus
                     color_code,
                     file.action_as_string_short(),
                     anstyle::Reset,
-                    path_typed(file.from_path.as_str(), file.r#type),
-                    path_typed(file.path.as_str(), file.r#type),
+                    display_path(file.from_path.as_str(), file.r#type),
+                    display_path(file.path.as_str(), file.r#type),
                 );
             } else {
                 println!(
@@ -701,7 +712,7 @@ pub fn handle_repository_status(globals: LoreGlobalArgs, args: &RepositoryStatus
                     color_code,
                     file.action_as_string_short(),
                     anstyle::Reset,
-                    path_typed(file.path.as_str(), file.r#type),
+                    display_path(file.path.as_str(), file.r#type),
                 );
             }
         }
@@ -726,7 +737,7 @@ pub fn handle_repository_status(globals: LoreGlobalArgs, args: &RepositoryStatus
                 FileActionStyle::from_action(file.action),
                 file.action_as_string_short(),
                 anstyle::Reset,
-                path_typed(file.path.as_str(), file.r#type)
+                display_path(file.path.as_str(), file.r#type)
             );
         }
     }

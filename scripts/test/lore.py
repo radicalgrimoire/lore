@@ -205,6 +205,7 @@ class Lore:
         urc_args: list[str] | None = None,
         use_os_dir: bool = False,
         path: str | None = None,
+        cwd: str | None = None,
         check: bool = True,
         level: str | None = None,
         debug: bool = False,
@@ -262,6 +263,17 @@ class Lore:
         )
         command_string = " ".join(command_args)
         logger.info("Executing Lore command: %s", command_string)
+        # Run from the repository root so commands behave like a real user
+        # invoking lore inside the working tree. This matters for output that
+        # is rendered relative to the current directory (e.g. `lore status`
+        # paths). When `use_os_dir` is set the test deliberately controls the
+        # cwd (e.g. via monkeypatch.chdir) to exercise repository discovery, so
+        # leave the inherited cwd untouched in that case.
+        run_cwd = cwd
+        if run_cwd is None and not use_os_dir:
+            target_dir = path if path is not None else self.path
+            if target_dir and os.path.isdir(target_dir):
+                run_cwd = target_dir
         attempt = 0
         max_attempts = 3
         while True:
@@ -279,6 +291,7 @@ class Lore:
                     text=True,
                     check=check,
                     env=env,
+                    cwd=run_cwd,
                 )
                 logger.info(output.stdout + output.stderr)
                 return output.stdout + output.stderr
@@ -2423,6 +2436,7 @@ class Lore:
 
 class GlobalOptionsParseable(TypedDict, total=False):
     path: str
+    cwd: str
     use_os_dir: bool
     check: bool
     level: str
@@ -2444,6 +2458,7 @@ class GlobalOptionsParseable(TypedDict, total=False):
 
 class GlobalOptions(TypedDict, total=False):
     path: str
+    cwd: str
     use_os_dir: bool
     check: bool
     level: str
