@@ -44,9 +44,18 @@ async fn connect_client(
     >,
     ProtocolError,
 > {
-    let endpoint = grpc_endpoint(auth_url);
-    let endpoint = tonic::transport::Endpoint::new(endpoint)
+    let endpoint_url = grpc_endpoint(auth_url);
+    let mut endpoint = tonic::transport::Endpoint::new(endpoint_url.clone())
         .map_err(|e| ProtocolError::internal(format!("invalid auth endpoint: {e}")))?;
+    if endpoint_url.starts_with("https://") {
+        endpoint = endpoint
+            .tls_config(
+                tonic::transport::ClientTlsConfig::new()
+                    .assume_http2(true)
+                    .with_native_roots(),
+            )
+            .map_err(|e| ProtocolError::internal(format!("configuring auth TLS: {e}")))?;
+    }
     // Connect from a net-runtime task so the channel's driver tasks are
     // bound to the net runtime.
     let channel = lore_base::lore_spawn_net!(async move { endpoint.connect().await })
