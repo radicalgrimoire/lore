@@ -1,0 +1,22 @@
+services:
+  lore-server:
+    build:
+      context: ..
+      dockerfile: lore-server/Dockerfile.local
+    image: lore-local:latest
+    ports:
+      - "41337:41337/tcp"
+      - "41337:41337/udp"
+      - "41339:41339/tcp"
+    volumes:
+      - lore-data:/lore-data
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:41339/health_check"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+volumes:
+  lore-data:
+    name: lore-local-data

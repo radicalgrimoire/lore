@@ -1,0 +1,55 @@
+FROM rust:slim-trixie AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libprotobuf-dev \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY . .
+
+# build.rs otherwise invokes the lore CLI before this image has built it.
+ENV LORE_BUILD_VERSION_NAME=0
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build/target \
+    cargo build --release --bin lore --bin loreserver && \
+    install -m 0755 /build/target/release/lore /build/lore && \
+    install -m 0755 /build/target/release/loreserver /build/loreserver
+
+FROM debian:trixie-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/* && \
+    groupadd --system lore && \
+    useradd --system --gid lore --home-dir /home/lore --create-home --shell /usr/sbin/nologin lore && \
+    install -d --owner lore --group lore --mode 0750 /lore-data
+
+COPY --from=builder /build/lore /usr/local/bin/lore
+COPY --from=builder /build/loreserver /usr/local/bin/loreserver
+COPY --from=builder /build/lore-server/config/default.toml /etc/lore/config/default.toml
+
+RUN cat <<'EOF' > /etc/lore/config/local.toml
+[immutable_store.local]
+path = "/lore-data"
+
+[mutable_store.local]
+path = "/lore-data"
+EOF
+
+ENV HOME=/home/lore
+ENV LORE_CONFIG_PATH=/etc/lore/config
+ENV LORE_ENV=local
+ENV RUST_LOG=info
+
+VOLUME ["/lore-data"]
+
+# gRPC (TCP) and QUIC (UDP): 41337; HTTP: 41339.
+EXPOSE 41337/tcp 41337/udp 41339/tcp
+
+USER lore:lore
+ENTRYPOINT ["loreserver"]
