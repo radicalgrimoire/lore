@@ -10,7 +10,6 @@ use std::sync::Arc;
 use lore_base::error::InvalidArguments;
 use lore_error_set::prelude::*;
 
-use crate::error::LoreResultExt;
 use crate::errors::InvalidPath;
 use crate::repository::RepositoryContext;
 
@@ -49,18 +48,17 @@ pub fn make_absolute_from(
 ) -> Result<PathBuf, PathError> {
     let path = path.as_ref();
     let cleanpath = clean(path.to_owned());
-    let pathbuf = PathBuf::from_str(cleanpath.as_str()).emit_map_err(InvalidPath {
-        path: path.to_string(),
-    })?;
+    // `PathBuf: FromStr` has `Err = Infallible`, so the old error arm here was
+    // unreachable. Construct it directly rather than mapping an error that
+    // cannot occur.
+    let pathbuf = PathBuf::from(cleanpath.as_str());
     if pathbuf.is_absolute() {
         return Ok(pathbuf);
     }
     match base {
         Some(base) => Ok(base.join(pathbuf)),
         None => Ok(std::env::current_dir()
-            .emit_map_err(PathError::internal(
-                "failed to get current working directory",
-            ))?
+            .internal("getting the current working directory")?
             .join(pathbuf)),
     }
 }
@@ -231,6 +229,12 @@ fn reduce_parent_segments(path: &mut String) {
     }
 
     *path = reduced;
+}
+
+/// Checks if the path contains any ".." segments. For example "..", "subdir/.." matches.
+/// A legitimate file name starting with dots does not match, e.g. "..hidden.txt"
+fn contains_directory_step_up(path: &str) -> bool {
+    path.contains("..") && path.split('/').any(|component| component == "..")
 }
 
 /// `path` in the form the repository names paths in: forward separators, none of
@@ -798,10 +802,17 @@ impl RepositoryPath {
         repository: &Arc<RepositoryContext>,
         relative_path: RelativePath,
     ) -> Result<Self, InvalidArguments> {
-        Ok(Self {
-            absolute: relative_path.to_absolute_path(repository.require_path()?),
-            relative: relative_path,
-        })
+        Ok(Self::from_relative_and_root(
+            repository.require_path()?,
+            relative_path,
+        ))
+    }
+
+    pub fn from_relative_and_root(root: &Path, relative: RelativePath) -> Self {
+        Self {
+            absolute: relative.to_absolute_path(root),
+            relative,
+        }
     }
 
     pub fn relative(&self) -> &RelativePath {
@@ -810,6 +821,30 @@ impl RepositoryPath {
 
     pub fn absolute(&self) -> &Path {
         self.absolute.as_path()
+    }
+
+    pub fn get_child(&self, child: &str) -> Self {
+        RepositoryPath {
+            relative: self.relative.clone().push_into_buf(child).freeze(),
+            absolute: self.absolute.join(child),
+        }
+    }
+
+    pub fn get_parent(&self) -> Option<Self> {
+        let mut relative_parent = self.relative.clone();
+        relative_parent.pop();
+        if relative_parent == self.relative {
+            return None;
+        }
+        let mut absolute_parent = self.absolute.clone();
+        if absolute_parent.pop() {
+            Some(RepositoryPath {
+                relative: relative_parent,
+                absolute: absolute_parent,
+            })
+        } else {
+            None
+        }
     }
 }
 
@@ -986,14 +1021,14 @@ impl RelativePathBuf {
     }
 
     /// Construct from an initial path string.
-    /// Validates that the path is not absolute and cleans it.
+    /// Validates that the path is not absolute, holds no step up, and cleans it.
     ///
     /// Only a path carrying a separator it does not keep is rewritten. Trimming
     /// and the canonical separator are what nearly every path already holds, and
     /// establishing that costs no string of its own.
     pub fn new_from_initial_path(name: impl AsRef<str>) -> Result<RelativePathBuf, PathError> {
         let name = name.as_ref();
-        if name.starts_with("..") || (name.len() >= 2 && name.as_bytes()[1] == b':') {
+        if name.len() >= 2 && name.as_bytes()[1] == b':' {
             return Err(InvalidPath {
                 path: name.to_string(),
             }
@@ -1008,6 +1043,12 @@ impl RelativePathBuf {
             Cow::Borrowed(name)
         };
         let name = name.trim_start_matches("./");
+        if contains_directory_step_up(name) {
+            return Err(InvalidPath {
+                path: name.to_string(),
+            }
+            .into());
+        }
         let mut initial_path = RelativePathBuf::with_capacity(name.len());
         if name != "." && !name.is_empty() {
             initial_path.push(name);
@@ -1500,5 +1541,40 @@ mod tests {
             // new_from_user_path lowercases both sides before comparing.
             assert!(is_path_inside_repository(Path::new("/A/B"), "/a/b/x.txt",));
         }
+    }
+
+    #[test]
+    fn repository_path_parent() {
+        let nested_children = RepositoryPath::from_relative_and_root(
+            Path::new("/a/b/c"),
+            RelativePath::new_from_initial_path("d/e").unwrap(),
+        );
+        let nested_children_parent = nested_children
+            .get_parent()
+            .expect("Parent should be constructable");
+        assert_eq!(nested_children_parent.absolute(), PathBuf::from("/a/b/c/d"));
+        assert_eq!(
+            *nested_children_parent.relative(),
+            RelativePath::new_from_initial_path("d").unwrap()
+        );
+
+        let single_child = RepositoryPath::from_relative_and_root(
+            Path::new("/a/b/c"),
+            RelativePath::new_from_initial_path("d").unwrap(),
+        );
+        let single_child_parent = single_child
+            .get_parent()
+            .expect("Parent should be constructable");
+        assert_eq!(single_child_parent.absolute(), PathBuf::from("/a/b/c"));
+        assert_eq!(
+            *single_child_parent.relative(),
+            RelativePath::new_from_initial_path("").unwrap()
+        );
+
+        let no_children = RepositoryPath::from_relative_and_root(
+            Path::new("/a/b/c"),
+            RelativePath::new_from_initial_path("").unwrap(),
+        );
+        assert!(no_children.get_parent().is_none());
     }
 }

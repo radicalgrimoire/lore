@@ -1,12 +1,14 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use tokio::task::JoinSet;
 
+use crate::MAX_CONCURRENT_TREE_TASKS;
 use crate::event;
 use crate::filter::FilterMode;
 use crate::hash::hash_string;
@@ -42,18 +44,6 @@ use crate::util::path::RelativePath;
 use crate::util::path::RelativePathBuf;
 use crate::util::path::path_depth;
 use crate::util::path::shared_component_depth;
-
-/// Shared ancestors created at once within one depth level. Each is a path
-/// resolution and a node lookup, so this only has to be deep enough to keep the
-/// syscall pool fed; a level can hold a hundred thousand directories and their
-/// task state is not free.
-const MAX_PRECREATE_TASKS: usize = 1000;
-
-/// Targets resolved at once. A targets file can name a million paths, and
-/// spawning one task each before any of them runs costs the task state for all
-/// of them up front. Above the block permits the resolutions contend for, so the
-/// permits and not this bound are what limit concurrent block loads.
-const MAX_RESOLVE_TASKS: usize = 1000;
 
 /// The node of each shared ancestor already created, borrowed from the list they
 /// are created from.
@@ -276,6 +266,7 @@ async fn stage_into_single_layer(
             None, // No link tracking in layer staging
             None, // Layers don't have nested layer mounts (no overlap)
             None, // Prefixes are resolved against the repository root, not a layer
+            None, // Node ids here index the layer's own state
         )
     );
 
@@ -335,7 +326,7 @@ pub async fn stage(
             let layer_state = layer
                 .deserialize_current_and_staged(repository.clone())
                 .await
-                .internal("Failed to deserialize layer state")?;
+                .forward::<StageError>("Failed to deserialize layer state")?;
 
             layers.push((layer, layer_state));
         }
@@ -352,6 +343,7 @@ pub async fn stage(
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(500));
     let stats = Arc::new(StageStats::default());
     let link_tracker = LinkTracker::new();
+    let discards: Arc<Mutex<Vec<crate::node::NodeID>>> = Arc::new(Mutex::new(Vec::new()));
 
     // Every layer mount is staged by its own task, never the parent walk, so
     // masking every layer subtree on every main-repo walk is correct: an entry
@@ -454,6 +446,7 @@ pub async fn stage(
                     Some(link_tracker),
                     global_mask,
                     base.prefixes,
+                    None, // Pre-create stages no children, so it reaches no boundary
                 )
                 .await;
                 (index, result)
@@ -462,7 +455,7 @@ pub async fn stage(
             while let Some(joined) = level_tasks.try_join_next() {
                 collect_precreate(joined, level, &mut ancestor_nodes, &mut precreate_failure);
             }
-            while level_tasks.len() >= MAX_PRECREATE_TASKS
+            while level_tasks.len() >= MAX_CONCURRENT_TREE_TASKS
                 && let Some(joined) = level_tasks.join_next().await
             {
                 collect_precreate(joined, level, &mut ancestor_nodes, &mut precreate_failure);
@@ -483,13 +476,6 @@ pub async fn stage(
     // with an atomic CAS prepend. Layer jobs run against their own separate states.
     let mut failure = None;
     let mut tasks: JoinSet<Result<crate::node::NodeLink, StageError>> = JoinSet::new();
-
-    /// Targets walked at once. Each in-flight target is a walk in progress
-    /// holding around 8 KiB, and a targets file can name a million paths, so
-    /// spawning one per target before any of them runs costs gigabytes of task
-    /// state before any work happens. This still offers the syscall pool the walk
-    /// waits on far more work than it has threads.
-    const MAX_TASKS: usize = 1000;
 
     for target in antichain {
         let base = walk_base(
@@ -515,11 +501,12 @@ pub async fn stage(
                 Some(link_tracker.clone()),
                 global_mask.clone(),
                 base.prefixes,
+                Some(discards.clone()),
             )
         );
         if let Err(err) = lore_limit_drain_tasks!(
             tasks,
-            MAX_TASKS,
+            MAX_CONCURRENT_TREE_TASKS,
             StageError::internal("Failed to join task")
         ) {
             failure = failure.or(Some(err));
@@ -555,7 +542,7 @@ pub async fn stage(
             }
             if let Err(err) = lore_limit_drain_tasks!(
                 tasks,
-                MAX_TASKS,
+                MAX_CONCURRENT_TREE_TASKS,
                 StageError::internal("Failed to join task")
             ) {
                 failure = failure.or(Some(err));
@@ -587,6 +574,15 @@ pub async fn stage(
         return Err(err);
     }
 
+    let queued = discards
+        .lock()
+        .map(|mut queued| std::mem::take(&mut *queued))
+        .unwrap_or_default();
+    let discarded = !queued.is_empty();
+    state::apply_pending_discards(state.clone(), repository.clone(), queued)
+        .await
+        .forward::<StageError>("Failed to discard nested repository entries")?;
+
     let layer_staged: Vec<_> = staged_layers
         .into_iter()
         .map(|layer_index| (&layers[layer_index].0, &layers[layer_index].1))
@@ -596,7 +592,9 @@ pub async fn stage(
     let total_count = count.total_count;
     event::LoreEvent::FileStageEnd(LoreFileStageEndEventData { count }).send();
 
-    if total_count == 0 {
+    // A discard stages nothing and so raises no count, but it does mutate the
+    // tree, and the mutation is only kept if the state is serialized below.
+    if total_count == 0 && !discarded {
         return Ok(state.revision());
     }
 
@@ -690,7 +688,7 @@ pub async fn stage(
                 signature,
             )
             .await
-            .internal("Failed to serialize new layer state")?;
+            .forward::<StageError>("Failed to serialize new layer state")?;
         }
 
         lore_debug!(
@@ -730,7 +728,7 @@ struct RoutedTargets {
 /// well. A path disjoint from every layer only resolves.
 ///
 /// Resolving one is a tree lookup per component with no shared state, so the
-/// whole list resolves at once, bounded by [`MAX_RESOLVE_TASKS`]. Routing stays
+/// whole list resolves at once, bounded by [`MAX_CONCURRENT_TREE_TASKS`]. Routing stays
 /// in the loop instead: it is string work against the layer mounts, and it
 /// appends to lists a task would need a lock to reach. The resolved paths need
 /// no order, since the caller collapses them into a sorted antichain, and their
@@ -785,7 +783,7 @@ async fn route_and_resolve_targets(
         while let Some(joined) = resolve_tasks.try_join_next() {
             collect_resolved(joined, &mut routed.current_repository_paths, &mut failure);
         }
-        while resolve_tasks.len() >= MAX_RESOLVE_TASKS
+        while resolve_tasks.len() >= MAX_CONCURRENT_TREE_TASKS
             && let Some(joined) = resolve_tasks.join_next().await
         {
             collect_resolved(joined, &mut routed.current_repository_paths, &mut failure);
@@ -1187,6 +1185,7 @@ pub async fn stage_move(
         None, // TODO(vri): UCS-18009 - Implement stage move for linked changes
         None,
         None, // No prefix map for a path resolved on its own
+        None, // A move stages the parent alone, so it reaches no boundary
     ))
     .await?;
 

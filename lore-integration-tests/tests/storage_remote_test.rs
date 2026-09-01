@@ -231,10 +231,6 @@ mod storage_remote_tests {
             self.inner.clone().compact_resume_at().await
         }
 
-        async fn compact_stop(self: Arc<Self>) {
-            self.inner.clone().compact_stop().await;
-        }
-
         fn max_query_batch(&self) -> Option<usize> {
             None
         }
@@ -332,7 +328,7 @@ mod storage_remote_tests {
                     None,
                     None,
                     Duration::from_secs(30),
-                    None,
+                    Default::default(),
                     Default::default(),
                     None,
                 )
@@ -361,7 +357,6 @@ mod storage_remote_tests {
             ImmutableStoreCreateOptions::none(),
             false,
             ImmutableStoreSettings {
-                allow_partial_fragment: false,
                 protect_local_fragment: false,
                 implicit_durable_stored: true,
                 ..Default::default()
@@ -424,7 +419,6 @@ mod storage_remote_tests {
             ImmutableStoreCreateOptions::none(),
             false,
             ImmutableStoreSettings {
-                allow_partial_fragment: false,
                 protect_local_fragment: false,
                 implicit_durable_stored: true,
                 ..Default::default()
@@ -480,7 +474,6 @@ mod storage_remote_tests {
             ImmutableStoreCreateOptions::none(),
             false,
             ImmutableStoreSettings {
-                allow_partial_fragment: false,
                 protect_local_fragment: false,
                 implicit_durable_stored: true,
                 ..Default::default()
@@ -2518,8 +2511,9 @@ mod storage_remote_tests {
                     )
                     .await;
                     assert_eq!(
-                        status, 1,
-                        "per-call local=1 && remote=1 must reject with status=1",
+                        status,
+                        lore_base::error::InvalidArguments::FFI_CODE,
+                        "per-call local=1 && remote=1 must reject with InvalidArguments",
                     );
 
                     close_handle(handle_id).await;
@@ -2725,7 +2719,11 @@ mod storage_remote_tests {
                         None,
                     )
                     .await;
-                    assert_eq!(status, 1, "upload on bound-offline handle must reject");
+                    assert_eq!(
+                        status,
+                        lore_base::error::InvalidArguments::FFI_CODE,
+                        "upload on bound-offline handle must reject"
+                    );
 
                     close_handle(handle_id).await;
                 }
@@ -3443,7 +3441,11 @@ mod storage_remote_tests {
                         callback,
                     )
                     .await;
-                    assert_eq!(status, 1, "remote list must fail the call");
+                    assert_eq!(
+                        status,
+                        lore_base::error::InvalidArguments::FFI_CODE,
+                        "remote list must fail the call"
+                    );
                     assert_eq!(
                         *entries.lock().unwrap(),
                         0,
@@ -5316,10 +5318,6 @@ mod storage_remote_tests {
 
         async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {
             self.inner.clone().compact_resume_at().await
-        }
-
-        async fn compact_stop(self: Arc<Self>) {
-            self.inner.clone().compact_stop().await;
         }
 
         fn max_query_batch(&self) -> Option<usize> {

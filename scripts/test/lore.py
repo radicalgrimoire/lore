@@ -147,6 +147,11 @@ def verify_signatures(revision_list: list[RevisionInfo], expected_count):
     )
 
 
+def _inherit_metadata_args(keys: list[str] | None) -> list[str]:
+    """Repeat --inherit-metadata once per key, as the flag takes one key each."""
+    return [arg for key in keys or [] for arg in ("--inherit-metadata", key)]
+
+
 class Lore:
     def __init__(
         self,
@@ -237,6 +242,8 @@ class Lore:
         search_nearest: bool = False,
         no_gc: bool = False,
         non_interactive: bool = False,
+        stats: int | None = None,
+        event_interval: int | None = None,
     ):
         if urc_args is None:
             urc_args = []
@@ -271,6 +278,12 @@ class Lore:
             + (["--search-nearest"] if search_nearest else [])
             + (["--no-gc"] if no_gc else [])
             + (["--non-interactive"] if non_interactive else [])
+            + ([f"--stats={stats}"] if stats is not None else [])
+            + (
+                ["--event-interval", str(event_interval)]
+                if event_interval is not None
+                else []
+            )
             + urc_args
         )
         command_string = " ".join(command_args)
@@ -553,12 +566,16 @@ class Lore:
         self,
         name: str | None = None,
         repo_id: str | None = None,
+        message: str | None = None,
+        inherit_metadata: list[str] | None = None,
         **kwargs: Unpack[GlobalOptions],
     ):
         return self.run(
             ["branch", "merge"]
             + ([name] if name else [])
-            + (["--id", repo_id] if repo_id else []),
+            + (["--id", repo_id] if repo_id else [])
+            + (["--message", message] if message else [])
+            + _inherit_metadata_args(inherit_metadata),
             **kwargs,
         )
 
@@ -583,6 +600,7 @@ class Lore:
         repo_id: str | None = None,
         link: str | None = None,
         ignore_links: bool = False,
+        inherit_metadata: list[str] | None = None,
         **kwargs: Unpack[GlobalOptions],
     ):
         return self.run(
@@ -595,7 +613,8 @@ class Lore:
             ]
             + (["--id", repo_id] if repo_id else [])
             + (["--link", link] if link else [])
-            + (["--ignore-links"] if ignore_links else []),
+            + (["--ignore-links"] if ignore_links else [])
+            + _inherit_metadata_args(inherit_metadata),
             **kwargs,
         )
 
@@ -1025,13 +1044,15 @@ class Lore:
         revision: str | None = None,
         message: str | None = None,
         no_commit: bool = False,
+        inherit_metadata: list[str] | None = None,
         **kwargs: Unpack[GlobalOptions],
     ):
         return self.run(
             ["revision", "cherry-pick"]
             + ([revision] if revision else [])
             + (["--message", message] if message else [])
-            + (["--no-commit"] if no_commit else []),
+            + (["--no-commit"] if no_commit else [])
+            + _inherit_metadata_args(inherit_metadata),
             **kwargs,
         )
 
@@ -2066,7 +2087,6 @@ class Lore:
     def commit(
         self,
         message: str | None = None,
-        stats: bool = False,
         link: str | None = None,
         link_messages: dict[str, str] | None = None,
         layer: str | None = None,
@@ -2086,7 +2106,6 @@ class Lore:
                 layer_args.extend(["--layer-message", path, msg])
         return self.run(
             ["commit", message if message else ""]
-            + (["--stats"] if stats else [])
             + (["--link", link] if link else [])
             + link_args
             + (["--layer", layer] if layer else [])

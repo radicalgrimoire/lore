@@ -5,12 +5,13 @@
 //! This module defines the two-trait architecture that separates operation context creation
 //! (freeze for SWFS) from actual file operations (work against frozen snapshot).
 
+use std::fs::Metadata;
 use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use lore_base::error::InvalidArguments;
-use lore_base::types::Address;
+use lore_base::types::Fragment;
 use lore_error_set::error_set;
 use tokio::sync::RwLock;
 
@@ -23,6 +24,8 @@ use crate::node::Node;
 use crate::node::NodeID;
 use crate::repository::RepositoryContext;
 use crate::state::FilesystemDiffStats;
+use crate::state::NodeComparison;
+use crate::state::RecordedModifiedTimes;
 use crate::state::State;
 use crate::util::path::RelativePath;
 use crate::util::path::RepositoryPath;
@@ -55,12 +58,25 @@ pub struct FileInfo {
     pub mtime: u64,
 }
 
+impl FileInfo {
+    pub fn from_metadata(metadata: Metadata) -> Self {
+        let (mtime, size) = crate::util::fs::file_mtime_and_size(&metadata);
+        let executable = crate::util::fs::file_is_executable(&metadata);
+        FileInfo {
+            exists: true,
+            is_file: metadata.is_file(),
+            is_dir: metadata.is_dir(),
+            executable,
+            size,
+            mtime,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FileDifferenceFromNode {
     /// Whether the file content differs from the node.
     pub modified: bool,
-    /// Hash of the file if computed during the modification check.
-    pub hash: Hash,
 }
 
 /// Result of checking whether a file differs from a node.
@@ -194,18 +210,21 @@ pub trait InstanceOperation: Send + Sync {
         node_hint: Option<&Node>,
     ) -> impl Future<Output = Result<Hash, FsError>> + Send;
 
-    /// Compare if an address matches what's on disk.
+    /// How the file at `path` compares to the content `node` addresses.
     ///
-    /// # Arguments
-    /// * `known_disk_file_size` - The size of the file on disk, which should have been accessed by
-    ///   the caller.
-    fn file_compare(
+    /// Takes the node to compare against rather than deriving it from a change, so a caller
+    /// holding both sides of a change can ask about either. Compares content rather than
+    /// consulting a recorded modification time, which speaks only for the current revision's
+    /// node and so cannot answer for the other side of a change. A file that cannot be read
+    /// is reported as such rather than as either answer, so a caller does not act on a
+    /// comparison that never happened.
+    fn compare_file_to_node(
         &self,
         repository: Arc<RepositoryContext>,
-        address: Address,
-        path: FilesystemPath<'_>,
-        known_disk_file_size: u64,
-    ) -> impl Future<Output = Result<bool, FsError>> + Send;
+        node: &Node,
+        path: &RelativePath,
+        file_size: u64,
+    ) -> impl Future<Output = Result<NodeComparison, FsError>> + Send;
 
     /// Make a file executable (Unix) or set executable bit equivalent.
     ///
@@ -213,6 +232,7 @@ pub trait InstanceOperation: Send + Sync {
     fn make_executable(
         &self,
         path: FilesystemPath<'_>,
+        executable: bool,
     ) -> impl Future<Output = Result<(), FsError>> + Send;
 
     /// Create a directory if it doesn't exist (mkdir -p behavior).
@@ -250,7 +270,7 @@ pub trait InstanceOperation: Send + Sync {
         repository: Arc<RepositoryContext>,
         node: &Node,
         path: FilesystemPath<'_>,
-    ) -> impl Future<Output = Result<(), FsError>> + Send;
+    ) -> impl Future<Output = Result<(Fragment, Option<FileInfo>), FsError>> + Send;
 
     /// Copy the contents of `source_path` to `destination_path`, with the destination being a
     /// scratch file that is not expected to be part of the repository even if it's in its path.
@@ -305,6 +325,7 @@ type AssociatedOperation = (Arc<RepositoryContext>, Arc<InstanceOperationImpl>);
 pub struct InstanceOperationImpl {
     dispatch: StaticDispatchInstanceOperation,
     associated_operations: RwLock<Option<Vec<AssociatedOperation>>>,
+    modified_times: RecordedModifiedTimes,
 }
 
 impl InstanceOperationImpl {
@@ -312,7 +333,25 @@ impl InstanceOperationImpl {
         Self {
             dispatch,
             associated_operations: RwLock::new(Some(Vec::new())),
+            modified_times: RecordedModifiedTimes::default(),
         }
+    }
+
+    /// Collects that `path` holds the content of the node written there, for a caller that
+    /// knows which revision the operation leaves current.
+    pub fn record_modified_time(
+        &self,
+        repository: &RepositoryContext,
+        path: &RelativePath,
+        mtime: u64,
+    ) {
+        self.modified_times.record(repository, path, mtime);
+    }
+
+    /// Takes the times collected so far. Times left behind are dropped with the operation,
+    /// which is what an operation that does not know its resulting revision wants.
+    pub fn take_modified_times(&self) -> RecordedModifiedTimes {
+        self.modified_times.take()
     }
 
     pub async fn associated_operation(
@@ -429,28 +468,34 @@ impl InstanceOperation for InstanceOperationImpl {
         }
     }
 
-    async fn file_compare(
+    async fn compare_file_to_node(
         &self,
         repository: Arc<RepositoryContext>,
-        address: Address,
-        path: FilesystemPath<'_>,
-        known_disk_file_size: u64,
-    ) -> Result<bool, FsError> {
+        node: &Node,
+        path: &RelativePath,
+        file_size: u64,
+    ) -> Result<NodeComparison, FsError> {
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
             StaticDispatchInstanceOperation::Os(this) => {
-                this.file_compare(repository, address, path, known_disk_file_size)
+                this.compare_file_to_node(repository, node, path, file_size)
                     .await
             }
         }
     }
 
-    async fn make_executable(&self, path: FilesystemPath<'_>) -> Result<(), FsError> {
+    async fn make_executable(
+        &self,
+        path: FilesystemPath<'_>,
+        executable: bool,
+    ) -> Result<(), FsError> {
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
-            StaticDispatchInstanceOperation::Os(this) => this.make_executable(path).await,
+            StaticDispatchInstanceOperation::Os(this) => {
+                this.make_executable(path, executable).await
+            }
         }
     }
 
@@ -503,7 +548,7 @@ impl InstanceOperation for InstanceOperationImpl {
         repository: Arc<RepositoryContext>,
         node: &Node,
         path: FilesystemPath<'_>,
-    ) -> Result<(), FsError> {
+    ) -> Result<(Fragment, Option<FileInfo>), FsError> {
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
@@ -566,8 +611,7 @@ pub mod tests {
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use lore_base::types::Address;
-    use lore_base::types::Hash;
+    use lore_base::types::Fragment;
     use parking_lot::Mutex;
 
     use crate::change::NodeChange;
@@ -580,6 +624,7 @@ pub mod tests {
     use crate::fs::filesystem_provider::InstanceOperation;
     use crate::fs::filesystem_provider::InstanceOperationImpl;
     use crate::fs::filesystem_provider::StaticDispatchInstanceOperation;
+    use crate::lore::Hash;
     use crate::merge::MergeTextMode;
     use crate::node::Node;
     use crate::node::NodeID;
@@ -587,6 +632,7 @@ pub mod tests {
     use crate::repository::test_helpers::RepositoryContextCreationArgsExt;
     use crate::repository::test_helpers::default_repository_creation_args;
     use crate::state::FilesystemDiffStats;
+    use crate::state::NodeComparison;
     use crate::state::State;
     use crate::util::path::RelativePath;
 
@@ -662,17 +708,21 @@ pub mod tests {
             panic!("Test operation unimplemented except finalize")
         }
 
-        async fn file_compare(
+        async fn compare_file_to_node(
             &self,
             _repository: Arc<RepositoryContext>,
-            _address: Address,
-            _path: FilesystemPath<'_>,
-            _known_disk_file_size: u64,
-        ) -> Result<bool, FsError> {
+            _node: &Node,
+            _path: &RelativePath,
+            _file_size: u64,
+        ) -> Result<NodeComparison, FsError> {
             panic!("Test operation unimplemented except finalize")
         }
 
-        async fn make_executable(&self, _path: FilesystemPath<'_>) -> Result<(), FsError> {
+        async fn make_executable(
+            &self,
+            _path: FilesystemPath<'_>,
+            _executable: bool,
+        ) -> Result<(), FsError> {
             panic!("Test operation unimplemented except finalize")
         }
 
@@ -705,7 +755,7 @@ pub mod tests {
             _repository: Arc<RepositoryContext>,
             _node: &Node,
             _path: FilesystemPath<'_>,
-        ) -> Result<(), FsError> {
+        ) -> Result<(Fragment, Option<FileInfo>), FsError> {
             panic!("Test operation unimplemented except finalize")
         }
 
