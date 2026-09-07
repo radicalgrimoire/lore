@@ -61,7 +61,7 @@ config = { version = "0.15.15", features = ["toml"], default-features = false }
 ctor = "0.2"
 crossbeam = "0.8.4"
 dashmap = "6.1.0"
-diffy = "0.4.2"
+diffy = "0.5.2"
 directories = "6.0.0"
 enum_dispatch = "0.3.13"
 tracing-appender = "0.2.3"
@@ -211,3 +211,6 @@ debug-assertions = false
 
 [patch.crates-io]
 quinn-proto = { path = "vendor/quinn-proto" }
+# Fixes a `**` backtracking defect that made the filter silently under-exclude;
+# see vendor/glob-match/Cargo.toml.
+glob-match = { path = "vendor/glob-match" }

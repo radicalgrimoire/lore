@@ -1256,6 +1256,7 @@ mod single_file_compare_result_tests {
             to: make_change_state(repository, to_context),
             path: RelativePath::new_from_initial_path(path).unwrap_or_default(),
             from_path: None,
+            observed: None,
         }
     }
 
@@ -1784,9 +1785,14 @@ mod is_file_modified_chunking_compat {
                 "a buffer hash cannot equal a fragment list hash"
             );
             assert_eq!(
-                immutable::file_matches(repository.clone(), path.as_path(), address, Some(size))
-                    .await
-                    .expect("Failed to compare small file"),
+                immutable::file_matches(
+                    repository.clone(),
+                    address,
+                    Some(size),
+                    &lore_storage::ContentHashMemo::new(path.as_path()),
+                )
+                .await
+                .expect("Failed to compare small file"),
                 lore_storage::FileMatch::Match,
                 "the stored list holds this content whatever the buffer hash says"
             );
@@ -1809,9 +1815,14 @@ mod is_file_modified_chunking_compat {
             std::fs::write(&path, &modified).expect("Failed to write small file");
 
             assert_eq!(
-                immutable::file_matches(repository.clone(), path.as_path(), address, Some(size))
-                    .await
-                    .expect("Failed to compare small file"),
+                immutable::file_matches(
+                    repository.clone(),
+                    address,
+                    Some(size),
+                    &lore_storage::ContentHashMemo::new(path.as_path()),
+                )
+                .await
+                .expect("Failed to compare small file"),
                 lore_storage::FileMatch::Differs,
             );
         })
@@ -1847,9 +1858,14 @@ mod is_file_modified_chunking_compat {
             ));
 
             assert_eq!(
-                immutable::file_matches(empty, path.as_path(), address, Some(size))
-                    .await
-                    .expect("Failed to compare large file"),
+                immutable::file_matches(
+                    empty,
+                    address,
+                    Some(size),
+                    &lore_storage::ContentHashMemo::new(path.as_path()),
+                )
+                .await
+                .expect("Failed to compare large file"),
                 lore_storage::FileMatch::Match,
                 "the current chunking reproduces the address it was stored under"
             );
@@ -1872,9 +1888,14 @@ mod is_file_modified_chunking_compat {
             std::fs::write(&path, &modified).expect("Failed to write large file");
 
             assert_eq!(
-                immutable::file_matches(repository.clone(), path.as_path(), address, Some(size))
-                    .await
-                    .expect("Failed to compare large file"),
+                immutable::file_matches(
+                    repository.clone(),
+                    address,
+                    Some(size),
+                    &lore_storage::ContentHashMemo::new(path.as_path()),
+                )
+                .await
+                .expect("Failed to compare large file"),
                 lore_storage::FileMatch::Differs,
             );
         })
@@ -1911,6 +1932,7 @@ mod is_file_modified_chunking_compat {
                 file_size,
                 &RelativePath::new_from_initial_path("large.bin").unwrap(),
                 true,
+                None,
             )
             .await
             .expect("file_modification failed")
@@ -1946,7 +1968,15 @@ mod is_file_modified_chunking_compat {
 
             let (mtime, size) = lore_revision::util::fs::file_mtime_and_size(&metadata);
             let modified =
-                file_modification(repository.clone(), &node, mtime, size, &relative_path, true)
+                file_modification(
+                    repository.clone(),
+                    &node,
+                    mtime,
+                    size,
+                    &relative_path,
+                    true,
+                    None,
+                )
                     .await
                     .expect("file_modification failed")
             .is_modified();
@@ -1983,7 +2013,15 @@ mod is_file_modified_chunking_compat {
 
             let (mtime, size) = lore_revision::util::fs::file_mtime_and_size(&metadata);
             let modified =
-                file_modification(repository.clone(), &node, mtime, size, &relative_path, true)
+                file_modification(
+                    repository.clone(),
+                    &node,
+                    mtime,
+                    size,
+                    &relative_path,
+                    true,
+                    None,
+                )
                     .await
                     .expect("file_modification failed")
             .is_modified();

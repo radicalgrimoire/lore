@@ -484,6 +484,7 @@ pub enum RevisionCommands {
 struct RevisionEntryDelta {
     action: String,
     path: String,
+    from_path: String,
     merged: String,
     metadata: Option<Vec<LoreMetadataEventData>>,
 }
@@ -784,14 +785,26 @@ pub fn handle_revision_info(globals: LoreGlobalArgs, args: &RevisionInfoArgs) ->
                     Some('D') => FileActionStyle::DELETED,
                     _ => FileActionStyle::MODIFIED,
                 };
-                println!(
-                    "{}{}{} {} {}",
-                    action_style,
-                    delta.action,
-                    anstyle::Reset,
-                    display_path(delta.path.as_str()),
-                    delta.merged
-                );
+                if delta.from_path.is_empty() {
+                    println!(
+                        "{}{}{} {} {}",
+                        action_style,
+                        delta.action,
+                        anstyle::Reset,
+                        display_path(delta.path.as_str()),
+                        delta.merged
+                    );
+                } else {
+                    println!(
+                        "{}{}{} {} -> {} {}",
+                        action_style,
+                        delta.action,
+                        anstyle::Reset,
+                        display_path(delta.from_path.as_str()),
+                        display_path(delta.path.as_str()),
+                        delta.merged
+                    );
+                }
                 if let Some(metadata) = delta.metadata.as_ref() {
                     for metadata in metadata.iter() {
                         print_metadata(metadata, Some(&auth_data), None);
@@ -1378,9 +1391,20 @@ fn revision_info_display(revision: &LoreRevisionSyncRevisionEventData) -> String
     )
 }
 
+fn print_sync_remote_warning(remote_available: u8, remote_authorized: u8) {
+    if remote_available != 0 && remote_authorized == 0 {
+        println!(
+            "{}Remote reachable but could not read remote revision (not authorized or unavailable), synchronizing against local history only{}",
+            LogStyles::WARNING,
+            anstyle::Reset,
+        );
+    }
+}
+
 pub fn handle_sync_event(event: &LoreEvent, progress_bar: &ProgressBar, debug: bool) {
     match event {
         LoreEvent::RevisionSyncTarget(data) if data.source_revision == data.target_revision => {
+            print_sync_remote_warning(data.remote_available, data.remote_authorized);
             if data.is_latest != 0 {
                 println!(
                     "Already on branch {} latest revision {} -> {}",
@@ -1394,6 +1418,7 @@ pub fn handle_sync_event(event: &LoreEvent, progress_bar: &ProgressBar, debug: b
             }
         }
         LoreEvent::RevisionSyncTarget(data) => {
+            print_sync_remote_warning(data.remote_available, data.remote_authorized);
             if !data.remote.is_empty() {
                 println!("Sync from remote {}", data.remote);
             }
@@ -1565,13 +1590,24 @@ pub fn handle_revision_diff(globals: LoreGlobalArgs, args: &RevisionDiffArgs) ->
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::RevisionDiffFile(data) => {
-                println!(
-                    "{}{}{} {}",
-                    FileActionStyle::from_action(data.action),
-                    data.action_as_string_short(),
-                    anstyle::Reset,
-                    display_path(data.path.as_str())
-                );
+                if data.from_path.is_empty() {
+                    println!(
+                        "{}{}{} {}",
+                        FileActionStyle::from_action(data.action),
+                        data.action_as_string_short(),
+                        anstyle::Reset,
+                        display_path(data.path.as_str())
+                    );
+                } else {
+                    println!(
+                        "{}{}{} {} -> {}",
+                        FileActionStyle::from_action(data.action),
+                        data.action_as_string_short(),
+                        anstyle::Reset,
+                        display_path(data.from_path.as_str()),
+                        display_path(data.path.as_str())
+                    );
+                }
             }
             LoreEvent::Complete(_) => {}
             LoreEvent::Maintenance(data) => {
@@ -2503,6 +2539,7 @@ fn store_info_delta_data(
         let delta = RevisionEntryDelta {
             action: data.action_as_string_short().to_string(),
             path: data.path.to_string(),
+            from_path: data.from_path.to_string(),
             merged: data.merged_as_string_short().to_string(),
             metadata: None,
         };

@@ -14,9 +14,8 @@ use lore_base::types::Fragment;
 use lore_base::types::Hash;
 use lore_error_set::prelude::*;
 
-use super::filesystem_provider::FileDifferenceFromNode;
 use super::filesystem_provider::FileInfo;
-use super::filesystem_provider::FileModifiedCheck;
+use super::filesystem_provider::FilesystemDiffContext;
 use super::filesystem_provider::FilesystemPath;
 use super::filesystem_provider::FilesystemProvider;
 use super::filesystem_provider::FsError;
@@ -24,39 +23,33 @@ use super::filesystem_provider::InstanceOperation;
 use super::filesystem_provider::InstanceOperationImpl;
 use super::filesystem_provider::StaticDispatchInstanceOperation;
 use crate::change::NodeChange;
-use crate::filter::FilterMode;
 use crate::immutable;
-use crate::lore_trace;
 use crate::merge::MergeTextMode;
 use crate::merge::merge3_text_by_path;
 use crate::node::Node;
-use crate::node::NodeID;
-use crate::node::NodeIDExt;
 use crate::repository::RepositoryContext;
 use crate::state::FilesystemDiffStats;
 use crate::state::NodeComparison;
-use crate::state::State;
 use crate::util;
 use crate::util::path::RelativePath;
-use crate::util::path::RepositoryPath;
 
 /// OS-backed filesystem provider.
 pub struct OsFilesystem {
-    repo_path: PathBuf,
+    filesystem_root: PathBuf,
 }
 
 impl OsFilesystem {
     /// Create a new OS-backed filesystem provider.
-    pub fn new(repo_path: impl AsRef<Path>) -> Self {
+    pub fn new(filesystem_root: impl AsRef<Path>) -> Self {
         Self {
-            repo_path: repo_path.as_ref().to_path_buf(),
+            filesystem_root: filesystem_root.as_ref().to_path_buf(),
         }
     }
 
     fn begin_operation(&self) -> Result<Arc<InstanceOperationImpl>, FsError> {
         Ok(Arc::new(InstanceOperationImpl::new(
             StaticDispatchInstanceOperation::Os(OsOperation {
-                repo_path: self.repo_path.clone(),
+                filesystem_root: self.filesystem_root.clone(),
             }),
         )))
     }
@@ -71,114 +64,40 @@ impl FilesystemProvider for OsFilesystem {
 
 /// OS-backed filesystem operation context.
 pub struct OsOperation {
-    repo_path: PathBuf,
+    /// Where the mounted filesystem starts, which every repository in it shares: a link
+    /// or layer context inherits its parent's path, so this is not a repository's root.
+    filesystem_root: PathBuf,
 }
 
 /// All operations delegate to the regular OS file system.
 impl InstanceOperation for OsOperation {
     async fn changes_from_filesystem_to_state(
         &self,
-        repository_from: Arc<RepositoryContext>,
-        state_from: Arc<State>,
-        repository_current: Arc<RepositoryContext>,
-        state_current: Arc<State>,
-        node_path: RelativePath,
-        root_node_from: NodeID,
-        root_node_to: NodeID,
-        filter_mode: FilterMode,
-    ) -> Result<(Vec<NodeChange>, FilesystemDiffStats), FsError> {
-        crate::state::diff_filesystem_subtree(
-            repository_from,
-            state_from,
-            repository_current,
-            state_current,
-            node_path,
-            root_node_from,
-            root_node_to,
-            filter_mode,
-            std::sync::Arc::new(Vec::new()),
-        )
-        .await
-        .forward_any::<FsError>("Failed to diff filesystem")
+        diff: FilesystemDiffContext,
+        changes: &mut Vec<NodeChange>,
+    ) -> Result<FilesystemDiffStats, FsError> {
+        crate::state::diff_os_filesystem(diff, changes)
+            .await
+            .forward_any::<FsError>("Failed to diff filesystem")
     }
 
+    /// A path mid-deletion stats as `PermissionDenied` on Windows rather than
+    /// `NotFound`, so both report a non-existent path.
     async fn file_info(&self, path: FilesystemPath<'_>) -> Result<FileInfo, FsError> {
         match lore_io::IoDriver::global()
             .metadata(path.as_absolute_path())
             .await
         {
-            Ok(metadata) => Ok(FileInfo::from_metadata(metadata)),
+            Ok(metadata) => Ok(FileInfo::from_metadata(&metadata)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(FileInfo::default()),
+            Err(e)
+                if cfg!(target_family = "windows")
+                    && e.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                Ok(FileInfo::default())
+            }
             Err(e) => Err(e.into()),
         }
-    }
-
-    async fn is_file_modified(
-        &self,
-        repository: Arc<RepositoryContext>,
-        node_change: &NodeChange,
-        force_full_check: bool,
-    ) -> Result<FileModifiedCheck, FsError> {
-        let info = self
-            .file_info(FilesystemPath::Repository(&RepositoryPath::from_relative(
-                &repository,
-                node_change.path.clone(),
-            )?))
-            .await?;
-
-        if !info.exists {
-            return Ok(FileModifiedCheck::default());
-        }
-
-        let from_node = if node_change.from.node.is_valid_node_id() {
-            Some(
-                node_change
-                    .from
-                    .get_node()
-                    .await
-                    .forward_any::<FsError>("Failed to find node")?,
-            )
-        } else {
-            None
-        };
-
-        // Only check content modification if both filesystem and node are files
-        let modification = if info.is_file
-            && let Some(from_node) = from_node.as_ref()
-            && from_node.is_file()
-        {
-            lore_trace!(
-                "Path {} type change {}, node size {}, file size {}",
-                node_change.path,
-                info.is_file != from_node.is_file(),
-                from_node.size,
-                info.size
-            );
-            if from_node.is_file() {
-                let modified = crate::state::file_modification(
-                    repository,
-                    from_node,
-                    info.mtime,
-                    info.size,
-                    &node_change.path,
-                    force_full_check,
-                )
-                .await
-                .forward_any::<FsError>("Failed to check file modification")?
-                .is_modified();
-                Some(FileDifferenceFromNode { modified })
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        Ok(FileModifiedCheck {
-            info,
-            from_node,
-            modification,
-        })
     }
 
     async fn file_hash(
@@ -215,8 +134,9 @@ impl InstanceOperation for OsOperation {
         node: &Node,
         path: &RelativePath,
         file_size: u64,
+        content: &lore_storage::ContentHashMemo<'_>,
     ) -> Result<NodeComparison, FsError> {
-        crate::state::file_matches_node(repository, node, file_size, path)
+        crate::state::file_matches_node(repository, node, file_size, path, Some(content))
             .await
             .forward_any::<FsError>("Failed to compare file to node")
     }
@@ -303,7 +223,7 @@ impl InstanceOperation for OsOperation {
         )
         .await
         .forward_any::<FsError>("Failed to read file")?;
-        Ok((fragment, metadata.map(FileInfo::from_metadata)))
+        Ok((fragment, metadata.as_ref().map(FileInfo::from_metadata)))
     }
 
     async fn copy_to_scratch_file(
@@ -325,7 +245,7 @@ impl InstanceOperation for OsOperation {
         result: &RelativePath,
         mode: MergeTextMode<'_>,
     ) -> Result<bool, FsError> {
-        Ok(merge3_text_by_path(&self.repo_path, base, mine, theirs, result, mode).await?)
+        Ok(merge3_text_by_path(&self.filesystem_root, base, mine, theirs, result, mode).await?)
     }
 
     async fn infer_is_diffable(&self, path: FilesystemPath<'_>) -> Result<bool, FsError> {
