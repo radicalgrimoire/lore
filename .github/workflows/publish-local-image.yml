@@ -1,0 +1,89 @@
+# SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+# SPDX-License-Identifier: MIT
+
+name: Publish local Lore image
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: publish-local-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # Check out the source used to build the image
+      packages: write # Push the image to GitHub Container Registry
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Set image name
+        id: image
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          echo "name=ghcr.io/${OWNER,,}/lore-local" >> "$GITHUB_OUTPUT"
+
+      - name: Build local Lore image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: lore-server/Dockerfile.local
+          load: true
+          push: false
+          tags: ${{ steps.image.outputs.name }}:build-${{ github.run_id }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Verify image contents
+        id: version
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}:build-${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint lore "$IMAGE" --version
+          server_version="$(docker run --rm --entrypoint loreserver "$IMAGE" --version)"
+          version="$(printf '%s\n' "$server_version" | sed -nE 's/^loreserver ([0-9]+\.[0-9]+\.[0-9]+)(-[0-9A-Za-z.-]+)?$/\1/p')"
+          test -n "$version"
+          printf 'loreserver version: %s\n' "$server_version"
+          printf 'image version tag: %s\n' "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          docker run --rm --entrypoint sh "$IMAGE" -c '
+            test "$(id -un)" = lore
+            test "$(id -gn)" = lore
+            test -d /lore-data
+            test -w /lore-data
+          '
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Push image
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          BUILD_IMAGE: ${{ steps.image.outputs.name }}:build-${{ github.run_id }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker tag "$BUILD_IMAGE" "$IMAGE:$VERSION"
+          docker push "$IMAGE:$VERSION"
+          {
+            echo "## Published local Lore image"
+            echo
+            printf '%s\n' "- \`$IMAGE:$VERSION\`"
+          } >> "$GITHUB_STEP_SUMMARY"
