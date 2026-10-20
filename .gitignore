@@ -4,6 +4,7 @@
 *.dSYM
 
 # Local files
+lore.code-workspace
 lore-server/config/local*.toml
 **/.grafana.local.yaml
 
