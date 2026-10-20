@@ -19,6 +19,9 @@ use tracing::Span;
 use tracing::debug;
 
 use crate::auth::jwt::JwtVerifier;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_authorizer::VerifiedToken;
+use crate::authnz::repository_authorizer::VerifiedTokenOwned;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::ConnectionId;
 use crate::protocol::client_identify::ClientIdentify;
@@ -87,8 +90,10 @@ fn quic_error_v4(error: &MessageHandleError) -> QuicServiceError {
     }
 }
 
+#[lore_macro::test_pub]
 pub struct StorageServiceV4 {
     jwt_verifier: Arc<Option<JwtVerifier>>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
@@ -99,6 +104,7 @@ pub struct StorageServiceV4 {
 impl StorageServiceV4 {
     pub fn new(
         jwt_verifier: Arc<Option<JwtVerifier>>,
+        repository_authorizer: Arc<dyn RepositoryAuthorizer>,
         immutable_store: Arc<dyn ImmutableStore>,
         local_store: Arc<dyn ImmutableStore>,
         mutable_store: Arc<dyn MutableStore>,
@@ -106,6 +112,7 @@ impl StorageServiceV4 {
     ) -> Self {
         Self {
             jwt_verifier,
+            repository_authorizer,
             immutable_store,
             local_store,
             mutable_store,
@@ -139,7 +146,7 @@ impl QuicService for StorageServiceV4 {
 
         if opcode == Command::ClientIdentify as u8 {
             return Ok(ParsedStorageRequestV4::ClientIdentify(
-                ClientIdentify::parse(bytes)?,
+                ClientIdentify::parse(bytes, false)?,
             ));
         }
 
@@ -185,6 +192,8 @@ impl QuicService for StorageServiceV4 {
                 auth_token,
             } => {
                 let mut user_id = String::new();
+                let mut grants = None;
+                let mut token = None;
 
                 if let Some(jwt_verifier) = self.jwt_verifier.as_ref() {
                     let token_str = String::from_utf8(auth_token).map_err(|err| {
@@ -202,14 +211,24 @@ impl QuicService for StorageServiceV4 {
                         .await
                         .map_err(|err| MessageHandleError::AuthorizationFailure(err.to_string()))?;
 
-                    crate::auth::jwt::verify_authorization(&authorization, repository)
-                        .map_err(|err| MessageHandleError::AuthorizationFailure(err.to_string()))?;
+                    let verified = VerifiedToken {
+                        raw: &token_str,
+                        claims: &authorization,
+                    };
+                    grants = self
+                        .repository_authorizer
+                        .granted_access(Some(&verified), repository)
+                        .await
+                        .map_err(|status| {
+                            MessageHandleError::AuthorizationFailure(status.message().to_string())
+                        })?;
+                    token = Some(Arc::new(verified.owned()));
 
                     user_id = crate::util::get_user_id_from_token(Some(authorization));
                 }
 
                 let session_map = self.session_map.clone();
-                match session_map.start(repository, correlation_id, user_id) {
+                match session_map.start(repository, correlation_id, user_id, grants, token) {
                     Ok((session_id, correlation_id)) => {
                         debug!(
                             session_id,
@@ -250,6 +269,8 @@ impl QuicService for StorageServiceV4 {
                 let repository = session.repository;
                 let correlation_id = session.correlation_id.clone();
                 let user_id = session.user_id.clone();
+                let token = session.token.clone();
+                let authorized_sources = session.authorized_sources.clone();
                 drop(session);
 
                 // Parse the storage command payload using v4-aware parsers — Copy carries an
@@ -310,6 +331,31 @@ impl QuicService for StorageServiceV4 {
                         .await
                     }
                     crate::quic::storage_service::ParsedStorageRequest::Copy(copy) => {
+                        // The destination was checked at this session's start;
+                        // a cross-partition source is this command's own
+                        // question, asked with this session's token — another
+                        // session's authorization on the connection must not
+                        // vouch for it. A source this session's token already
+                        // cleared is remembered, so a repeated copy from it
+                        // skips the check.
+                        if copy.source_repository != repository
+                            && !authorized_sources.contains(&copy.source_repository)
+                        {
+                            let verified = token.as_deref().map(VerifiedTokenOwned::as_token);
+                            self.repository_authorizer
+                                .check_repository_access(
+                                    verified.as_ref(),
+                                    copy.source_repository,
+                                    None,
+                                )
+                                .await
+                                .map_err(|status| {
+                                    MessageHandleError::AuthorizationFailure(
+                                        status.message().to_string(),
+                                    )
+                                })?;
+                            authorized_sources.insert(copy.source_repository);
+                        }
                         handle_copy(
                             copy.source_repository,
                             copy.source_address,
@@ -317,7 +363,6 @@ impl QuicService for StorageServiceV4 {
                             copy.target_context,
                             correlation_id,
                             user_id,
-                            Some(&session_map),
                             self.immutable_store.clone(),
                         )
                         .await
@@ -488,158 +533,5 @@ impl QuicService for StorageServiceV4 {
                 .as_ref()
                 .map_or(crate::quic::NO_USER_AGENT, |v| v.0.as_ref()),
         )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use bytes::Bytes;
-    use lore_telemetry::user_agent_filter::UserAgentFilter;
-    use lore_transport::quic::QuicServiceError;
-    use lore_transport::quic::command_header::CommandHeader;
-    use rand::random;
-
-    use super::*;
-    use crate::protocol::storage::session::MAX_CONCURRENT_SESSIONS;
-    use crate::quic::QuicService;
-    use crate::store::test_store_create;
-
-    fn make_service(
-        immutable_store: Arc<dyn lore_storage::ImmutableStore>,
-        mutable_store: Arc<dyn lore_storage::MutableStore>,
-    ) -> StorageServiceV4 {
-        StorageServiceV4::new(
-            Arc::new(None),
-            immutable_store.clone(),
-            immutable_store.clone(),
-            mutable_store,
-            Arc::new(UserAgentFilter::default()),
-        )
-    }
-
-    fn make_header(cmd: u8) -> CommandHeader {
-        CommandHeader {
-            cmd,
-            ..CommandHeader::default()
-        }
-    }
-
-    #[tokio::test]
-    async fn parse_client_identify_opcode_returns_variant() {
-        use lore_transport::quic::storage_service::Command;
-        // The stores are unused by parse_request_bytes, so a minimal service suffices.
-        let (immutable_store, mutable_store, _exec) =
-            test_store_create().await.expect("Failed to create stores");
-        let service = make_service(immutable_store, mutable_store);
-
-        let header = make_header(Command::ClientIdentify as u8);
-        let payload = Bytes::from("my-client/1.0");
-
-        let parsed = service
-            .parse_request_bytes(&header, payload)
-            .expect("parsing a ClientIdentify request must succeed");
-
-        assert!(
-            matches!(parsed, ParsedStorageRequestV4::ClientIdentify(_)),
-            "expected ClientIdentify variant, got {parsed:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn parse_client_identify_stores_value() {
-        use lore_transport::quic::storage_service::Command;
-        let (immutable_store, mutable_store, _exec) =
-            test_store_create().await.expect("Failed to create stores");
-        let service = make_service(immutable_store, mutable_store);
-
-        let header = make_header(Command::ClientIdentify as u8);
-        let payload = Bytes::from("my-client/1.0");
-
-        let parsed = service
-            .parse_request_bytes(&header, payload)
-            .expect("parsing a ClientIdentify request must succeed");
-        let ParsedStorageRequestV4::ClientIdentify(ci) = parsed else {
-            panic!("wrong variant");
-        };
-        assert_eq!(ci.user_agent, Some("my-client/1.0".to_string()));
-    }
-
-    #[tokio::test]
-    async fn run_request_handler_client_identify_returns_empty_ok() {
-        let (immutable_store, mutable_store, _exec) =
-            test_store_create().await.expect("Failed to create stores");
-        let service = make_service(immutable_store, mutable_store);
-
-        let ci = crate::protocol::client_identify::ClientIdentify {
-            user_agent: Some("my-client/1.0".to_string()),
-        };
-
-        let response = service
-            .run_request_handler(
-                Arc::new(AttributeMap::default()),
-                ParsedStorageRequestV4::ClientIdentify(ci),
-            )
-            .await
-            .expect("ClientIdentify must be handled successfully");
-
-        assert!(response.is_empty(), "expected empty response vec");
-    }
-
-    /// Fill the session map to capacity then attempt one more `AuthorizeStart`,
-    /// verifying the handler returns `SlowDown` and that `transform_protocol_error`
-    /// classifies it the same way `stream_handler` would.
-    #[tokio::test]
-    async fn authorize_start_returns_slow_down_when_session_limit_reached() {
-        let (immutable_store, mutable_store, _execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        let service = make_service(immutable_store, mutable_store);
-
-        let repo = random::<lore_revision::lore::RepositoryId>();
-
-        // Fill the session map to capacity via the handler (jwt_verifier is None,
-        // so each call goes straight to session_map.start with no I/O).
-        for i in 0..MAX_CONCURRENT_SESSIONS {
-            let result = service
-                .run_request_handler(
-                    AttributeMap::default().into(),
-                    ParsedStorageRequestV4::AuthorizeStart {
-                        repository: repo,
-                        correlation_id: format!("fill-{i}"),
-                        auth_token: vec![],
-                    },
-                )
-                .await;
-            assert!(result.is_ok(), "session {i} should succeed");
-        }
-
-        // One more must hit the limit.
-        let err = service
-            .run_request_handler(
-                AttributeMap::default().into(),
-                ParsedStorageRequestV4::AuthorizeStart {
-                    repository: repo,
-                    correlation_id: "over-limit".into(),
-                    auth_token: vec![],
-                },
-            )
-            .await
-            .expect_err("expected SlowDown when session limit is reached");
-
-        assert!(
-            matches!(err, MessageHandleError::SessionLimitReached),
-            "expected SessionLimitReached, got {err:?}"
-        );
-
-        // Verify stream_handler classification: SlowDown on the wire, not an internal
-        // error, and suppressed from logging (same suppression path as SlowDown).
-        let error_info = service.transform_protocol_error(&err);
-        assert_eq!(
-            error_info.response_error_code,
-            QuicServiceError::SlowDown as QuicErrorStatus,
-        );
-        assert_eq!(error_info.message_handle_label, "SessionLimitReached");
-        assert!(!error_info.is_internal_error);
-        assert!(!error_info.is_appropriate_for_logging);
     }
 }

@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 
 use super::TypedBytes;
@@ -30,7 +29,7 @@ use crate::util::serde::u8_as_bool;
 
 /// Summary information about a single revision.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionInfoEventData {
     /// Repository identifier the revision belongs to.
@@ -57,7 +56,7 @@ impl LoreRevisionInfoEventData {
 
 /// Per-file change information between a revision and its parent.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionInfoDeltaEventData {
     /// Path of the file relative to the repository root.
@@ -164,7 +163,13 @@ pub struct InfoOptions {
     pub metadata: bool,
 }
 
-pub async fn info(
+/// Report the revision `options` names, the metadata it records, and the delta it
+/// carries when asked for.
+///
+/// A revision naming metadata that cannot be read is reported without the branch, date and
+/// message that blob carries, and warned about, rather than leaving those fields silently
+/// empty.
+pub(crate) async fn info(
     repository: Arc<RepositoryContext>,
     options: InfoOptions,
 ) -> Result<(), InfoError> {
@@ -172,7 +177,6 @@ pub async fn info(
         revision::resolve(
             repository.clone(),
             signature,
-            execution_context().globals().search_limit(),
             execution_context().globals().search_location(),
         )
         .await
@@ -191,11 +195,8 @@ pub async fn info(
     event::LoreEvent::RevisionInfo(LoreRevisionInfoEventData::new(repository.id, state.clone()))
         .send();
 
-    let metadata_hash = state.metadata_hash();
-    if !metadata_hash.is_zero()
-        && let Ok(metadata) = Metadata::deserialize(repository.clone(), metadata_hash)
-            .await
-            .forward::<InfoError>("deserializing revision metadata")
+    if let Some(metadata) =
+        revision::reported_metadata(repository.clone(), state.metadata_hash()).await
     {
         event::metadata::send(&metadata);
     }
@@ -330,4 +331,12 @@ pub async fn info(
     }
 
     Ok(())
+}
+
+/// Boxed version of [`info`] for cross-crate use.
+pub fn info_boxed(
+    repository: Arc<RepositoryContext>,
+    options: InfoOptions,
+) -> crate::BoxFuture<'static, Result<(), InfoError>> {
+    Box::pin(info(repository, options))
 }

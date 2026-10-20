@@ -290,7 +290,9 @@ def test_dirty_move_of_uncommitted_source_stays_add(new_lore_repo):
         "--scan must not invent move provenance, "
         f"got fromPath={scanned_entry.get('fromPath')!r}"
     )
-    assert scanned_entry["flagDirty"] is True, "new.txt should stay flagDirty after scan"
+    assert scanned_entry["flagDirty"] is True, (
+        "new.txt should stay flagDirty after scan"
+    )
     assert find_status_entry(scanned, "old.txt") is None, (
         "the vacated source path must not reappear after scan"
     )
@@ -381,6 +383,30 @@ def test_dirty_ignore(new_lore_repo):
     entries = get_status_files(repo)
     ghost_entry = find_status_entry(entries, "ghost.txt")
     assert ghost_entry is None, "ghost.txt should not appear"
+
+
+@pytest.mark.smoke
+def test_dirty_ignore_in_a_directory_that_does_not_exist(new_lore_repo):
+    """A named path in a directory neither the tree nor the disk holds marks nothing.
+
+    Reaching the path means walking down to where it would be added, and the directories that
+    lead there must be created only where something is actually added below them. Marked
+    alongside a real change, so the state is serialized and anything spurious is kept.
+    """
+    repo: Lore = new_lore_repo()
+
+    with repo.open_file("base.txt", "w+") as f:
+        f.write("base\n")
+    repo.stage(scan=True, offline=True)
+    repo.commit(offline=True)
+
+    with repo.open_file("base.txt", "w+") as f:
+        f.write("modified\n")
+    repo.dirty(["base.txt", os.path.join("ghost_dir", "ghost.txt")], offline=True)
+
+    entries = get_status_files(repo)
+    paths = sorted(entry.get("path") for entry in entries)
+    assert paths == ["base.txt"], f"Expected only the real change marked, got: {entries}"
 
 
 # ===========================================================================

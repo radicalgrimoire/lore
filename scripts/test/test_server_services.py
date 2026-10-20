@@ -14,6 +14,7 @@ import uuid
 
 import grpc
 import pytest
+import thin_client
 from grpc_probe import (
     CONTENT_DIFF,
     REVISION_DIFF,
@@ -27,14 +28,16 @@ from grpc_probe import (
     response_carries_a_revision,
     revision_diff,
     revision_info,
+    revision_info_raw_signature,
     revision_tree,
 )
-from lore import Lore
 from lore_server import (
     allocate_free_port,
     generate_server_config,
     lore_local_server,
 )
+
+from lore import Lore
 
 # Methods expected to return a status other than UNIMPLEMENTED when mounted.
 # `ContentDiff` has a separate test because its mounted handler is unimplemented.
@@ -376,6 +379,31 @@ class TestThinClientServesData:
             f"unknown={unknown_status} {len(unknown_body)}B"
         )
 
+    def test_a_partial_signature_is_refused_as_a_failed_precondition(
+        self, thin_services_in_effect, thin_target, pushed_revisions
+    ):
+        """A signature shorter than a whole one is a request the server cannot
+        act on, not a revision it looked for and did not find. FAILED_PRECONDITION
+        says retrying it unchanged fails the same way, and is distinguishable
+        from the NOT_FOUND a whole but unknown signature answers.
+        """
+        repo_id, _first, signature = pushed_revisions
+        # Poll on the whole signature so the push has certainly landed, which
+        # keeps the refusal below from passing for want of the revision.
+        until_found(lambda: revision_info(thin_target, repo_id, signature))
+
+        partial = bytes.fromhex(signature)[:8]
+        status, _body, details = revision_info_raw_signature(
+            thin_target, repo_id, partial
+        )
+
+        assert status == grpc.StatusCode.FAILED_PRECONDITION, (
+            f"expected FAILED_PRECONDITION for a partial signature, got {status} {details}"
+        )
+        assert "partial revision hash signature" in details, (
+            f"the refusal does not say what was wrong with the request: {details}"
+        )
+
     def test_the_thin_server_walks_the_revision_tree(
         self, thin_services_in_effect, thin_target, pushed_revisions
     ):
@@ -420,4 +448,61 @@ class TestThinClientServesData:
         assert "not yet implemented" in details, (
             f"expected the handler's own message, got {details!r} -- an empty "
             "message would mean ContentDiff is not mounted at all"
+        )
+
+
+def _wire_identity(repo: Lore) -> tuple[bytes, bytes]:
+    """The repository id and latest revision signature as the raw bytes the
+    thin-client wire expects."""
+    latest = repo.branch_info().local_latest
+    assert len(latest) == 64, f"Expected a full revision signature, got {latest!r}"
+    return bytes.fromhex(repo.get_id()), bytes.fromhex(latest)
+
+
+def _tree_address(nodes: list, path: str):
+    matches = [node for node in nodes if node.path == path]
+    assert len(matches) == 1, f"Expected one tree entry for {path}, got {matches}"
+    address = matches[0].address
+    assert address is not None, f"Tree entry for {path} carries no address"
+    return address
+
+
+@pytest.mark.smoke
+def test_thin_client_diff_content_addresses_match_the_tree_at_the_same_path(
+    new_lore_repo, lore_grpc_target
+):
+    """A commit gives each file its own addressing context, so a content address
+    is only resolvable as a whole `(hash, context)` pair. `RevisionTree` is the
+    reference for what that pair is at a revision."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("Initial commit", {"own.txt": "initial content\n"})
+
+    repository_id, before = _wire_identity(repo)
+
+    repo.write_commit_push(None, {"own.txt": "parent content, revised\n"})
+
+    _, after = _wire_identity(repo)
+
+    address_before = _tree_address(
+        thin_client.revision_tree(lore_grpc_target, repository_id, before), "own.txt"
+    )
+    address_after = _tree_address(
+        thin_client.revision_tree(lore_grpc_target, repository_id, after), "own.txt"
+    )
+    assert address_after.context, (
+        f"A committed file carries a generated addressing context, got {address_after}"
+    )
+
+    changes = thin_client.revision_diff(lore_grpc_target, repository_id, before, after)
+    own_changes = [change for change in changes if change.path == "own.txt"]
+    assert own_changes, f"Parent's own file change missing from diff: {changes}"
+
+    for change in own_changes:
+        assert change.content_from == address_before, (
+            f"The from side must carry the whole address the tree reports at "
+            f"{before.hex()}, got {change.content_from}"
+        )
+        assert change.content_to == address_after, (
+            f"The to side must carry the whole address the tree reports at "
+            f"{after.hex()}, got {change.content_to}"
         )

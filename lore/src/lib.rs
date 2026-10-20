@@ -3,7 +3,10 @@
 pub mod args;
 pub mod auth;
 pub mod branch;
+#[cfg(not(feature = "test-util"))]
 pub(crate) mod call;
+#[cfg(feature = "test-util")]
+pub mod call;
 pub mod call_delegation;
 pub mod dependency;
 pub mod file;
@@ -30,9 +33,9 @@ pub use lore_base::version::LORE_LIBRARY_VERSION;
 /// consumer aliases this into scope as `lore_error_set`.
 pub use lore_error_set as error_set;
 
-/// Time allowed for the shutdown work that has to be driven from a synchronous caller.
-/// Matches the runtime shutdown timeout in `lore_revision::interface::shutdown`, which
-/// runs immediately after it.
+/// Time allowed for each wait shutdown drives from a synchronous caller: the drains before the
+/// runtime shutdown, whose timeout in `lore_revision::interface::shutdown` it matches, and the
+/// reads of calls cut short after it.
 const SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Shuts the library down, returning whether this call was the one that did it.
@@ -44,6 +47,9 @@ const SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Claiming the shutdown also closes admission, so calls that arrive while the
 /// drains below are still running fail instead of being admitted onto runtimes
 /// that are about to go away.
+///
+/// Safe only once every call has completed. Calls still executing are cancelled at best effort: one
+/// not stopped in time may use the memory passed to it after this returns.
 pub fn shutdown() -> bool {
     if !lore_base::runtime::claim_runtime_shutdown() {
         lore_base::lore_warn!("Shutdown was already called");
@@ -75,6 +81,14 @@ pub fn shutdown() -> bool {
 
     lore_revision::interface::shutdown();
 
+    storage::lent::await_abandoned(SHUTDOWN_WAIT);
+
+    // Services this process started are otherwise collected when the next
+    // service call comes, and after a shutdown none will. A program whose
+    // service has already exited — stopped by someone else, or died — would
+    // hold that child unreaped for however long it outlives its Lore use.
+    remote::service_process::collect_exited_services();
+
     true
 }
 
@@ -88,6 +102,35 @@ pub fn runtime() -> tokio::runtime::Handle {
 /// applied, `false` if a limit was already set.
 pub fn set_thread_limit(count: usize) -> bool {
     lore_base::runtime::set_thread_limit(count)
+}
+
+/// Whether calls will be carried out by the Lore service rather than in this
+/// process.
+///
+/// Answered without a runtime, so a caller that builds one can ask first — see
+/// [`size_threads_for_relaying`]. Decided once per process and cached, so asking
+/// costs one config read however often it is asked.
+pub fn will_use_service() -> bool {
+    remote::service_process::service_in_use_blocking()
+}
+
+/// Sizes this process's thread pools for relaying its calls to the service, when
+/// that is what it will do. A no-op otherwise, and a no-op once a runtime exists.
+///
+/// Call it before the first Lore operation, and before building a runtime of your
+/// own. A relaying process writes a request to a socket and reads events back
+/// while the service does the work, so pools sized for that work are threads a
+/// whole machine's worth of clients pays for and none of them uses.
+///
+/// A program that runs the service itself must not call this: it does the work
+/// rather than relaying it, whatever this machine's clients do.
+pub fn size_threads_for_relaying() {
+    if !will_use_service() {
+        return;
+    }
+    lore_base::runtime::runtime_with_settings(
+        Some(lore_base::runtime::TokioSettings::relay_only()),
+    );
 }
 
 pub fn log_file_path() -> LoreString {

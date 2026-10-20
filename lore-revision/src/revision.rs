@@ -16,7 +16,6 @@ use std::sync::Arc;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use lore_transport::RevisionListIdentifier;
-use serde::Deserialize;
 use serde::Serialize;
 use tokio::join;
 use tokio::sync::mpsc;
@@ -27,6 +26,7 @@ use crate::change;
 use crate::change::FileAction;
 use crate::change::NodeChange;
 use crate::change::is_conflict;
+use crate::errors::NotSupported;
 use crate::errors::Oversized;
 use crate::errors::RevisionNotFound;
 use crate::errors::absent_unless;
@@ -35,15 +35,15 @@ use crate::filter::Filter;
 use crate::filter::FilterMode;
 use crate::find;
 use crate::history::find_branch_point;
-use crate::interface::LoreString;
 use crate::lore::*;
 use crate::lore_debug;
-use crate::lore_info;
 use crate::lore_warn;
 use crate::metadata;
 use crate::metadata::Metadata;
+use crate::node::Node;
 use crate::node::NodeFileMetadata;
 use crate::node::NodeFileMetadataBlock;
+use crate::node::NodeFlags;
 use crate::node::NodeIDExt;
 use crate::repository::RepositoryContext;
 use crate::state;
@@ -196,6 +196,33 @@ pub struct Diff3Summary {
 /// the caller to fall back to the unfiltered walk. The pre-streaming
 /// implementation absorbed these errors silently into a boolean —
 /// the explicit `Option` keeps that fallback path observable.
+/// The metadata `metadata_hash` names, or `None` where there is none to read.
+///
+/// That blob carries the branch, date and message of the revision naming it, so a report
+/// without it is a report without those, and the warning is what says so. A zero hash names
+/// none, and a blob that cannot be read is warned about rather than failing the caller: a
+/// revision list leaves the states of a segment in the local store without the metadata they
+/// name, so a revision read out of that cache offline has nothing to take those fields from,
+/// which is ordinary rather than damage.
+pub(crate) async fn reported_metadata(
+    repository: Arc<RepositoryContext>,
+    metadata_hash: Hash,
+) -> Option<Metadata> {
+    if metadata_hash.is_zero() {
+        return None;
+    }
+
+    match Metadata::deserialize(repository, metadata_hash).await {
+        Ok(metadata) => Some(metadata),
+        Err(err) => {
+            lore_warn!(
+                "Reporting revision without branch, date and message, metadata {metadata_hash} could not be read: {err}"
+            );
+            None
+        }
+    }
+}
+
 fn filter_from_source_changes(source_changes: &[NodeChange]) -> Option<Filter> {
     let mut filter = Filter::default();
     if let Err(err) = filter.view.add_exclusion("**") {
@@ -203,11 +230,11 @@ fn filter_from_source_changes(source_changes: &[NodeChange]) -> Option<Filter> {
         return None;
     }
     for change in source_changes.iter() {
-        if let Err(err) = filter.view.add_inclusion(change.path.as_str()) {
+        if let Err(err) = filter.view.add_inclusion(change.path().as_str()) {
             lore_warn!("Failed to add target filter re-inclusion: {err}");
             return None;
         }
-        if let Some(from_path) = change.from_path.as_ref()
+        if let Some(from_path) = change.move_source()
             && let Err(err) = filter.view.add_inclusion(from_path.as_str())
         {
             lore_warn!("Failed to add target filter re-inclusion of from path: {err}");
@@ -285,10 +312,12 @@ pub const DEFAULT_HISTORY_WALK_CONCURRENCY: usize = 24;
 
 /// `diff3` with optional tunables.
 ///
-/// * `source_cap` — abort with `StateError::Oversized` when source's
-///   `diff_collect` produces more than `n` items. The error message
-///   includes the cap and the produced count. Bounds peak memory for
-///   callers that need a ceiling. Library callers (filesystem diff,
+/// * `source_cap` — fail with `StateError::Oversized`, naming the cap, once the
+///   source walk has produced more than `n` changes. Counted as they arrive
+///   rather than once the walk is done, so a diff that will be rejected is not
+///   walked to the end. Bounds peak memory for callers that need a ceiling, and
+///   is what they map to `Status::resource_exhausted` through `is_oversized()`
+///   rather than by matching the message. Library callers (filesystem diff,
 ///   merge, capi, CLI) pass `None` via `diff3` to stay unbounded.
 /// * `history_walk_concurrency` — permit count for the semaphore
 ///   gating parallel `is_last_change_merged` history walks. Passing
@@ -324,7 +353,7 @@ pub async fn diff3_with_source_cap(
         .await?
         .branch;
 
-    lore_info!(
+    lore_debug!(
         "Calculating 3-way diff between\n  base {} -> {}\n  source {} -> {}\n  target {} -> {}",
         state_base.revision_number(),
         state_base.revision(),
@@ -334,14 +363,7 @@ pub async fn diff3_with_source_cap(
         state_target.revision()
     );
 
-    // Stream source so the cap fires mid-walk: drop the channel and
-    // abort the producer as soon as we cross `source_cap`, instead of
-    // paying for a full walk that we're going to reject. Surfaces as
-    // `StateError::Oversized` so callers can map to
-    // `Status::resource_exhausted` via `is_oversized()` without
-    // string-matching across crates.
-    lore_info!("Diff source branch revisions (streaming)");
-    let (source_tx, mut source_rx) = mpsc::channel::<Result<NodeChange, StateError>>(256);
+    lore_debug!("Diff source branch revisions (streaming)");
     let source_walker_repo = repository.clone();
     let source_walker_state_base = state_base.clone();
     let source_walker_state_source = state_source.clone();
@@ -355,8 +377,7 @@ pub async fn diff3_with_source_cap(
             view,
         ))
     });
-    let source_walker = lore_spawn!(async move {
-        let mut sink = state::ChangeSink::Channel(&source_tx);
+    let mut source_walk = state::ChangeStream::spawn(async move |changes| {
         state::diff(
             source_walker_repo.clone(),
             source_walker_state_base,
@@ -364,7 +385,7 @@ pub async fn diff3_with_source_cap(
             source_walker_state_source,
             source_walker_path,
             source_walker_graft,
-            &mut sink,
+            &changes,
             FilterMode::View,
         )
         .await
@@ -372,15 +393,7 @@ pub async fn diff3_with_source_cap(
 
     let mut source_changes: Vec<NodeChange> = Vec::new();
     let mut oversized = false;
-    while let Some(item) = source_rx.recv().await {
-        let change = match item {
-            Ok(c) => c,
-            Err(err) => {
-                drop(source_rx);
-                let _ = source_walker.await;
-                return Err(err);
-            }
-        };
+    while let Some(change) = source_walk.next().await {
         let is_file_id_only_churn = !change.from.address.hash.is_zero()
             && change.action != FileAction::Move
             && change.from.address.hash == change.to.address.hash;
@@ -396,12 +409,7 @@ pub async fn diff3_with_source_cap(
         }
     }
     if oversized {
-        // Drop the receiver so the producer's next `send` errors on
-        // closed channel and `state::diff` exits naturally — no abort,
-        // so an in-flight side effect inside `state::diff` is allowed
-        // to complete before the task ends.
-        drop(source_rx);
-        let _ = source_walker.await;
+        source_walk.abandon().await;
         return Err(StateError::from(Oversized {
             context: format!(
                 "source-side diff change count exceeds configured limit of {}",
@@ -409,20 +417,17 @@ pub async fn diff3_with_source_cap(
             ),
         }));
     }
-    match source_walker.await {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => return Err(err),
-        Err(join_err) => {
-            return Err(StateError::internal_with_context(
-                join_err,
-                "3-way diff source walker task failed",
-            ));
-        }
-    }
+    source_walk.finish().await?;
     state::detect_and_coalesce_moves(&mut source_changes);
 
-    lore_info!("Sorting {} source changes", source_changes.len());
+    lore_debug!("Sorting {} source changes", source_changes.len());
     change::sort_by_path(&mut source_changes);
+
+    // The subtree moves between repositories along with a mount either side replaced, so a change
+    // the other side made below one cannot be applied on its own.
+    let source_mounts = replaced_mount_paths(&source_changes);
+    let mut target_mounts: Vec<RelativePath> = Vec::new();
+    let mut conflicting_mounts: Vec<RelativePath> = Vec::new();
 
     let target_filter = if source_changes.len() < SOURCE_FILTER_THRESHOLD
         && let Some(filter) = filter_from_source_changes(&source_changes)
@@ -433,22 +438,21 @@ pub async fn diff3_with_source_cap(
     };
     let target_repository = Arc::new(repository.to_filter_context(target_filter));
 
-    lore_info!("Diff target branch revisions (streaming)");
-    let (target_tx, mut target_rx) = mpsc::channel::<Result<NodeChange, StateError>>(256);
+    lore_debug!("Diff target branch revisions (streaming)");
     let walker_repo = target_repository.clone();
     let walker_state_base = state_base.clone();
     let walker_path = path.clone();
-    let walker = lore_spawn!(async move {
-        let mut sink = state::ChangeSink::Channel(&target_tx);
+    let walker_state_target = state_target.clone();
+    let mut target_walk = state::ChangeStream::spawn(async move |changes| {
         state::diff(
             walker_repo.clone(),
             walker_state_base,
             walker_repo,
-            state_target,
+            walker_state_target,
             walker_path,
             // Adoption is a source-side decision.
             None,
-            &mut sink,
+            &changes,
             FilterMode::View,
         )
         .await
@@ -460,19 +464,23 @@ pub async fn diff3_with_source_cap(
     let mut joined_changes: Vec<NodeChange> = Vec::new();
     let mut joined_conflicts: Vec<(NodeChange, NodeChange)> = Vec::new();
     let mut source_consumed = vec![false; source_changes.len()];
-    while let Some(item) = target_rx.recv().await {
-        let mut target_change = match item {
-            Ok(c) => c,
-            Err(e) => {
-                return Err(e);
-            }
-        };
+    while let Some(mut target_change) = target_walk.next().await {
         let is_file_id_only_churn = !target_change.from.address.hash.is_zero()
             && target_change.from.address.hash == target_change.to.address.hash;
         if is_file_id_only_churn {
             continue;
         }
-        match source_changes.binary_search_by(|c| c.path.as_str().cmp(target_change.path.as_str()))
+        if change::is_link_replacement(&target_change) {
+            push_unique_path(&mut target_mounts, target_change.path());
+        }
+        if let Some(mount) = source_mounts
+            .iter()
+            .find(|mount| is_below(mount, target_change.path()))
+        {
+            push_unique_path(&mut conflicting_mounts, mount);
+        }
+        match source_changes
+            .binary_search_by(|c| c.path().as_str().cmp(target_change.path().as_str()))
         {
             Ok(idx) => {
                 source_consumed[idx] = true;
@@ -484,7 +492,7 @@ pub async fn diff3_with_source_cap(
                     joined_conflicts.push((sc, target_change));
                 } else if include_same
                     && (joined_changes.is_empty()
-                        || joined_changes[joined_changes.len() - 1].path != source_change.path)
+                        || joined_changes[joined_changes.len() - 1].path() != source_change.path())
                 {
                     joined_changes.push(source_change.clone());
                 }
@@ -495,20 +503,20 @@ pub async fn diff3_with_source_cap(
         }
     }
 
-    match walker.await {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => return Err(err),
-        Err(join_err) => {
-            return Err(StateError::internal_with_context(
-                join_err,
-                "3-way diff target walker task failed",
-            ));
-        }
-    }
+    target_walk.finish().await?;
 
     for (idx, consumed) in source_consumed.iter().enumerate() {
         if !*consumed {
             joined_changes.push(source_changes[idx].clone());
+        }
+    }
+
+    for mount in target_mounts.iter() {
+        if source_changes
+            .iter()
+            .any(|change| is_below(mount, change.path()))
+        {
+            push_unique_path(&mut conflicting_mounts, mount);
         }
     }
 
@@ -518,7 +526,7 @@ pub async fn diff3_with_source_cap(
         joined_changes.retain(|item| {
             if item.from.flags.is_directory() && item.action == FileAction::Delete {
                 for (from, _to) in joined_conflicts.iter() {
-                    if from.path.overlaps(&item.path) {
+                    if from.path().overlaps(item.path()) {
                         return false;
                     }
                 }
@@ -628,8 +636,8 @@ pub async fn diff3_with_source_cap(
                 "Conflict resolved: {:?}",
                 (source_conflict, target_conflict)
             );
-            // If the file was added on source branch and either added or
-            // modified on target branch, show the change as modified.
+            // A file both branches hold stands where it stood, whichever of them added it, so the
+            // change states no move of it.
             if source_conflict.action == FileAction::Add
                 && target_conflict.action != FileAction::Delete
             {
@@ -647,6 +655,24 @@ pub async fn diff3_with_source_cap(
             );
         }
     }
+    for mount in conflicting_mounts.iter() {
+        lore_debug!("Mount {mount} was replaced and changed below, conflict at the mount");
+        joined_changes.retain(|change| !mount.covers(change.path()));
+        final_conflicts.retain(|(source_conflict, target_conflict)| {
+            !mount.covers(source_conflict.path()) && !mount.covers(target_conflict.path())
+        });
+        final_conflicts.push(
+            mount_replacement_conflict(
+                &repository,
+                &state_base,
+                &state_source,
+                &state_target,
+                mount,
+            )
+            .await,
+        );
+    }
+
     if !final_conflicts.is_empty() {
         lore_debug!("Final {} conflicts", final_conflicts.len());
     }
@@ -658,19 +684,102 @@ pub async fn diff3_with_source_cap(
     };
 
     for change in joined_changes {
-        tx.send(Ok(DiffItem::Change(change)))
+        let permit = tx
+            .reserve()
             .await
-            .map_err(|_send_err| StateError::internal("3-way diff receiver dropped"))?;
+            .map_err(|_closed| StateError::internal("3-way diff receiver dropped"))?;
+        permit.send(Ok(DiffItem::Change(change)));
     }
     for (source_change, target_change) in final_conflicts {
-        tx.send(Ok(DiffItem::Conflict(Box::new((
+        let permit = tx
+            .reserve()
+            .await
+            .map_err(|_closed| StateError::internal("3-way diff receiver dropped"))?;
+        permit.send(Ok(DiffItem::Conflict(Box::new((
             source_change,
             target_change,
-        )))))
-        .await
-        .map_err(|_send_err| StateError::internal("3-way diff receiver dropped"))?;
+        )))));
     }
     Ok(summary)
+}
+
+#[lore_macro::test_pub]
+fn is_below(mount: &RelativePath, path: &RelativePath) -> bool {
+    mount.covers(path) && mount != path
+}
+
+#[lore_macro::test_pub]
+fn push_unique_path(paths: &mut Vec<RelativePath>, path: &RelativePath) {
+    if !paths.contains(path) {
+        paths.push(path.clone());
+    }
+}
+
+/// A replacement is walked as a delete of the old node and an add of the new one, so both changes
+/// name the same path and it is collected once.
+fn replaced_mount_paths(changes: &[NodeChange]) -> Vec<RelativePath> {
+    let mut paths: Vec<RelativePath> = Vec::new();
+    for change in changes.iter().filter(|c| change::is_link_replacement(c)) {
+        push_unique_path(&mut paths, change.path());
+    }
+    paths
+}
+
+async fn mount_replacement_conflict(
+    repository: &Arc<RepositoryContext>,
+    state_base: &Arc<State>,
+    state_source: &Arc<State>,
+    state_target: &Arc<State>,
+    path: &RelativePath,
+) -> (NodeChange, NodeChange) {
+    let base = mount_node_change_state(repository, state_base, path).await;
+    let source = mount_node_change_state(repository, state_source, path).await;
+    let target = mount_node_change_state(repository, state_target, path).await;
+    (
+        mount_conflict_change(base.clone(), source),
+        mount_conflict_change(base, target),
+    )
+}
+
+/// The node `state` holds at `path`, which is the link node itself where the path ends at a mount
+/// rather than anything the linked repository holds. A side that holds nothing there is the side
+/// that deleted the path.
+async fn mount_node_change_state(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    path: &RelativePath,
+) -> change::NodeChangeState {
+    let mapping = state::NodeMapping::root(repository.clone(), state.clone());
+    let link = mapping.node_at(path).await;
+    let node = if link.node.is_valid_node_id() {
+        state
+            .node(repository.clone(), link.node)
+            .await
+            .unwrap_or_default()
+    } else {
+        Node::default()
+    };
+    change::NodeChangeState {
+        mapping: state::NodeMapping {
+            repository: repository.clone(),
+            state: state.clone(),
+            path: path.clone(),
+            node: link.node,
+        },
+        observed: None,
+        flags: NodeFlags::from_bits_retain(node.flags),
+        address: node.address,
+        mode: node.mode,
+    }
+}
+
+fn mount_conflict_change(from: change::NodeChangeState, to: change::NodeChangeState) -> NodeChange {
+    NodeChange {
+        action: FileAction::Keep,
+        flags: change::Flags::Conflict,
+        from,
+        to,
+    }
 }
 
 /// Resolves `Move + other-change-at-from-path` interactions per the
@@ -689,10 +798,11 @@ fn apply_move_from_path_pass(
     let mut from_path_absorbed: Vec<usize> = Vec::new();
     for (outer_index, change_move) in changes.iter().enumerate() {
         if change_move.action == FileAction::Move
-            && let Some(ref from_path) = change_move.from_path
+            && let Some(from_path) = change_move.move_source()
         {
             for (inner_index, change_match) in changes.iter().enumerate() {
-                if outer_index != inner_index && change_match.path.as_str() == from_path.as_str() {
+                if outer_index != inner_index && change_match.path().as_str() == from_path.as_str()
+                {
                     if change_match.action == FileAction::Delete {
                         from_path_conflict_pairs.push((outer_index, inner_index));
                     } else if change_move.from.address.hash == change_move.to.address.hash {
@@ -778,13 +888,13 @@ async fn is_last_change_merged(
 ) -> Result<bool, StateError> {
     lore_debug!(
         "{} find last modified source revision",
-        source_conflict.path.as_str()
+        source_conflict.path().as_str()
     );
     let (last_source_modified_revision, last_source_modified_revision_number) =
         find_last_modified_revision(&source_conflict, state_branch_point.clone()).await?;
     lore_debug!(
         "{} last modified source {} revision {} -> {}",
-        source_conflict.path.as_str(),
+        source_conflict.path().as_str(),
         source_branch,
         last_source_modified_revision,
         last_source_modified_revision_number,
@@ -792,7 +902,7 @@ async fn is_last_change_merged(
 
     lore_debug!(
         "{} find last merged source {} -> target {} revision",
-        source_conflict.path.as_str(),
+        source_conflict.path().as_str(),
         source_branch,
         target_branch,
     );
@@ -807,7 +917,7 @@ async fn is_last_change_merged(
     {
         lore_debug!(
             "{} last merged from source {} into target {} revision {} -> {}",
-            source_conflict.path.as_str(),
+            source_conflict.path().as_str(),
             source_branch,
             target_branch,
             last_merged_from_source_revision,
@@ -817,7 +927,7 @@ async fn is_last_change_merged(
         if last_source_modified_revision_number <= last_merged_from_source_revision_number {
             lore_debug!(
                 "Final change check for {} is MERGED - last source merged revision {}, last source modified revision {}",
-                source_conflict.path.as_str(),
+                source_conflict.path().as_str(),
                 last_merged_from_source_revision_number,
                 last_source_modified_revision_number,
             );
@@ -825,7 +935,7 @@ async fn is_last_change_merged(
         } else {
             lore_debug!(
                 "Final change merge check for {} is UNMERGED - last source merged revision {}, last source modified revision {}",
-                source_conflict.path.as_str(),
+                source_conflict.path().as_str(),
                 last_merged_from_source_revision_number,
                 last_source_modified_revision_number,
             );
@@ -834,7 +944,7 @@ async fn is_last_change_merged(
     } else {
         lore_debug!(
             "Final change merge check for {} is UNMERGED - no merged revision found",
-            source_conflict.path.as_str()
+            source_conflict.path().as_str()
         );
         Ok(false)
     }
@@ -844,30 +954,30 @@ async fn find_last_modified_revision(
     change: &NodeChange,
     state_branch_point: Arc<State>,
 ) -> Result<(Hash, u64), StateError> {
-    if !change.to.node.is_valid_node_id() {
+    if !change.to.mapping.node.is_valid_node_id() {
         // File was deleted from the target state, need to walk history to find it
         // TODO(mjansson): Figure out a better way to store this metadata around file deletions
         lore_debug!("Find last modified revision without to state, iterate revisions");
 
-        let repository = change.from.repository.clone();
-        let mut state_current = change.to.state.clone();
+        let repository = change.from.mapping.repository.clone();
+        let mut state_current = change.to.mapping.state.clone();
         let mut state_parent = state_current.clone();
         while state_current.revision_number() >= state_branch_point.revision_number() {
             if let Ok(node_link) = state_current
-                .find_node_link(repository.clone(), change.path.as_str())
+                .find_node_link(repository.clone(), change.path().as_str())
                 .await
             {
                 // If the node was existing in the current state, it means it was deleted in the previous (parent) revision
                 lore_debug!(
                     "Found {} existing in revision {} - {}",
-                    change.path.as_str(),
+                    change.path().as_str(),
                     state_current.revision(),
                     state_current.revision_number()
                 );
                 if node_link.is_valid() {
                     lore_debug!(
                         "Last modified {} in parent revision {} - {}",
-                        change.path.as_str(),
+                        change.path().as_str(),
                         state_parent.revision(),
                         state_parent.revision_number()
                     );
@@ -886,7 +996,7 @@ async fn find_last_modified_revision(
 
         lore_debug!(
             "Did not find node {} last modified, using branch point revision {} - {}",
-            change.path.as_str(),
+            change.path().as_str(),
             state_branch_point.revision(),
             state_branch_point.revision_number()
         );
@@ -897,9 +1007,9 @@ async fn find_last_modified_revision(
         ));
     };
 
-    let repository = change.to.repository.clone();
-    let state = change.to.state.clone();
-    let node_id = change.to.node;
+    let repository = change.to.mapping.repository.clone();
+    let state = change.to.mapping.state.clone();
+    let node_id = change.to.mapping.node;
 
     let mut last_modified_revision = state.revision();
     let mut last_modified_revision_number = state.revision_number();
@@ -908,14 +1018,14 @@ async fn find_last_modified_revision(
     if let Ok(Some(_node_delta)) = state.node_delta(repository.clone(), node_id).await {
         lore_debug!(
             "{} found last modified revision {} -> {} (HEAD)",
-            change.path.as_str(),
+            change.path().as_str(),
             last_modified_revision,
             last_modified_revision_number
         );
     } else {
         lore_debug!(
             "{} not modified in HEAD, walk file history",
-            change.path.as_str()
+            change.path().as_str()
         );
         // Node was not modified in the target LATEST revision, find the
         // previous revision from file history block
@@ -924,7 +1034,7 @@ async fn find_last_modified_revision(
             .await
         {
             let node = block.node(NodeFileMetadata::index(node_id));
-            lore_debug!("{} node history {:?}", change.path.as_str(), node);
+            lore_debug!("{} node history {:?}", change.path().as_str(), node);
             if let Ok(state_modified) =
                 state::State::deserialize(repository.clone(), node.revision[0]).await
             {
@@ -932,20 +1042,20 @@ async fn find_last_modified_revision(
                 last_modified_revision_number = state_modified.revision_number();
                 lore_debug!(
                     "{} found last modified revision {} -> {}",
-                    change.path.as_str(),
+                    change.path().as_str(),
                     last_modified_revision_number,
                     last_modified_revision
                 );
             } else {
                 lore_warn!(
                     "Failed to deserialize last modified state when searching history for {}",
-                    change.path.as_str()
+                    change.path().as_str()
                 );
             }
         } else {
             lore_warn!(
                 "Failed to deserialize file metadata block when searching history for {}",
-                change.path.as_str()
+                change.path().as_str()
             );
         }
     }
@@ -953,29 +1063,36 @@ async fn find_last_modified_revision(
     Ok((last_modified_revision, last_modified_revision_number))
 }
 
+/// Finds the last revision of `source_branch` that the target branch merged the file of `change`
+/// from, walking the file's history back from the target side of `change` to the branch point.
+///
+/// Each step reads the earlier revision's history at the node ID the history records for the file
+/// there, as a revision need not number the file as its first parent does. The walk ends at a
+/// revision that [adds the file without a merge](added_without_merge), the start revision included.
+#[lore_macro::test_pub]
 async fn find_last_merged_revision(
     change: &NodeChange,
     source_branch: BranchId,
     target_branch: BranchId,
     state_branch_point: Arc<State>,
 ) -> Result<Option<(Hash, u64)>, StateError> {
-    let (state_start, node_current) = if change.to.node.is_valid_node_id() {
-        (change.to.state.clone(), change.to.node)
+    let (state_start, mut node_current) = if change.to.mapping.node.is_valid_node_id() {
+        (change.to.mapping.state.clone(), change.to.mapping.node)
     } else {
         // TODO(mjansson): Figure out a better way to store this metadata around file deletions
         lore_debug!("Find last merged revision without to state, iterate revisions");
 
-        let repository = change.to.repository.clone();
-        let mut state_current = change.to.state.clone();
+        let repository = change.to.mapping.repository.clone();
+        let mut state_current = change.to.mapping.state.clone();
         let mut state_parent = state_current.clone();
         loop {
             if let Ok(node_link) = state_current
-                .find_node_link(repository.clone(), change.path.as_str())
+                .find_node_link(repository.clone(), change.path().as_str())
                 .await
             {
                 lore_debug!(
                     "Found {} existing in revision {} - {} for last merged",
-                    change.path.as_str(),
+                    change.path().as_str(),
                     state_current.revision(),
                     state_current.revision_number()
                 );
@@ -984,7 +1101,7 @@ async fn find_last_merged_revision(
                 if node_link.is_valid() {
                     lore_debug!(
                         "Using {} parent revision {} - {} as last merged start revision",
-                        change.path.as_str(),
+                        change.path().as_str(),
                         state_parent.revision(),
                         state_parent.revision_number()
                     );
@@ -995,14 +1112,14 @@ async fn find_last_merged_revision(
             if state_current.revision_number() <= state_branch_point.revision_number() {
                 lore_debug!(
                     "Did not find node {} last modified, no merged revision",
-                    change.path.as_str()
+                    change.path().as_str()
                 );
                 return Ok(None);
             }
 
             lore_debug!(
                 "Node {} not present in revision {} - {} for last merged start, move to parent",
-                change.path.as_str(),
+                change.path().as_str(),
                 state_current.revision(),
                 state_current.revision_number()
             );
@@ -1016,7 +1133,15 @@ async fn find_last_merged_revision(
     // Now walk the history for the file from the target branch LATEST revision and
     // see if we arrive on source branch along any merge, and if that target revision
     // is later than the last modified revision we identified from the source branch file history
-    let repository = change.to.repository.clone();
+    let repository = change.to.mapping.repository.clone();
+    if node_current.is_valid_node_id()
+        && let Some(delta) = state_start
+            .node_delta(repository.clone(), node_current)
+            .await?
+        && added_without_merge(delta.action, delta.flags)
+    {
+        return Ok(None);
+    }
     let mut state_current = state_start.clone();
     while state_current.revision_number() > state_branch_point.revision_number()
         && node_current.is_valid_node_id()
@@ -1032,10 +1157,10 @@ async fn find_last_merged_revision(
                 // to also catch merges that happen through other branches
                 lore_debug!(
                     "{} branch {} revision {} node {} history is a merge, {:?} check if other parent {} is from branch {}",
-                    change.path.as_str(),
+                    change.path().as_str(),
                     target_branch,
-                    node_current,
                     state_current.revision(),
+                    node_current,
                     node,
                     node.revision[1],
                     source_branch
@@ -1049,7 +1174,7 @@ async fn find_last_merged_revision(
                         if state_metadata.branch == source_branch {
                             lore_debug!(
                                 "{} revision merged from branch {} revision {} -> {}",
-                                change.path.as_str(),
+                                change.path().as_str(),
                                 source_branch,
                                 state_other.revision(),
                                 state_other.revision_number()
@@ -1061,7 +1186,7 @@ async fn find_last_merged_revision(
                         } else {
                             lore_debug!(
                                 "{} revision {} -> {} is NOT a merge from branch {}",
-                                change.path.as_str(),
+                                change.path().as_str(),
                                 state_other.revision(),
                                 state_other.revision_number(),
                                 source_branch,
@@ -1079,11 +1204,15 @@ async fn find_last_merged_revision(
             } else {
                 lore_debug!(
                     "{} revision {} node history {:?} is not a merge, continue search in branch node history {}",
-                    change.path.as_str(),
+                    change.path().as_str(),
                     state_current.revision_number(),
                     node,
                     node.revision[0]
                 );
+            }
+
+            if added_without_merge(node.action[0], node.flags[0]) {
+                break;
             }
 
             if let Ok(state_previous) =
@@ -1092,7 +1221,7 @@ async fn find_last_merged_revision(
                 if state_previous.revision_number() < state_branch_point.revision_number() {
                     lore_debug!(
                         "{} stop iterating revisions, reached revision {} < branch point modified revision {}",
-                        change.path.as_str(),
+                        change.path().as_str(),
                         state_previous.revision_number(),
                         state_branch_point.revision_number()
                     );
@@ -1100,11 +1229,12 @@ async fn find_last_merged_revision(
                 } else {
                     lore_debug!(
                         "{} step to revision {} -> {}",
-                        change.path.as_str(),
+                        change.path().as_str(),
                         state_previous.revision_number(),
                         state_previous.revision()
                     );
                     state_current = state_previous;
+                    node_current = node.node[0];
                 }
             } else {
                 lore_warn!("Failed to deserialize state when walking source branch file history");
@@ -1119,6 +1249,13 @@ async fn find_last_merged_revision(
     }
 
     Ok(None)
+}
+
+/// Whether `action` and `flags` record a file added in its revision without a merge, which leaves
+/// no history of the file before that revision: a node reused for the file still holds the history
+/// of the file that had it before.
+fn added_without_merge(action: u16, flags: u16) -> bool {
+    action == FileAction::Add as u16 && flags & change::Flags::Merge.bits() == 0
 }
 
 pub struct TreeResult {
@@ -1144,19 +1281,40 @@ pub async fn tree(
     Ok(TreeResult { paths })
 }
 
-/// Information about a revision being resolved from a signature.
+/// What a revision specifier names on a branch.
+/// cbindgen:prefix-with-name
+/// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[serde(rename_all = "camelCase")]
+pub enum LoreRevisionResolveTarget {
+    /// A revision by its number on the branch.
+    Number = 1,
+    /// The latest revision of the branch.
+    Latest = 2,
+    /// A revision by its whole hash signature, taken on the branch.
+    Signature = 3,
+}
+
+/// Information about a revision being resolved on a branch.
+///
+/// Reported before the lookup runs, since finding a revision by number can walk
+/// a long stretch of history. A specifier that names no branch resolves to
+/// itself and reports nothing.
+#[repr(C)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionResolveEventData {
     /// Repository identifier in which repository
     pub repository: RepositoryId,
     /// Identifier of the branch on which resolution is being done
     pub branch: BranchId,
-    /// If set to non-empty, the partial hash being resolved
-    pub revision: LoreString,
-    /// If set to non-zero, the revision number being resolved
+    /// What the specifier names on the branch
+    pub target: LoreRevisionResolveTarget,
+    /// The revision number being resolved, zero unless `target` is `Number`
     pub revision_number: u64,
+    /// The revision being resolved, zero unless `target` is `Signature`
+    pub revision: Hash,
     /// Resolving using remote data
     pub remote: u8,
     /// Resolving using local data
@@ -1196,17 +1354,427 @@ fn absent_unless_sole_source<T, Source: ErrorSet>(
     absent_unless(result, propagate, context)
 }
 
-pub async fn resolve(
+/// A revision resolved from a specifier, with the branch it is taken on.
+pub struct ResolvedRevision {
+    /// The revision the specifier resolved to.
+    pub revision: Hash,
+    /// The branch [`Self::revision`] is taken on: the branch the specifier named
+    /// where the revision is the one that branch was created at, and the branch
+    /// the revision itself records otherwise.
+    pub branch: BranchId,
+}
+
+/// The branch `revision` records, which is the branch it was committed on.
+async fn recorded_branch(
     repository: Arc<RepositoryContext>,
-    signature: impl AsRef<str>,
-    search_limit: Option<usize>,
-    search_location: ResolveSearchLocation,
+    revision: Hash,
+) -> Result<BranchId, StateError> {
+    let state = State::deserialize(repository.clone(), revision).await?;
+    let metadata = Metadata::deserialize(repository, state.metadata_hash())
+        .await
+        .forward::<StateError>("deserializing revision metadata")?;
+    metadata
+        .get_branch()
+        .forward::<StateError>("reading the branch a revision records")
+}
+
+/// The branch `revision` is taken on, given the branch a specifier named and the
+/// metadata that branch resolved to.
+///
+/// A revision records the branch it was committed on, which answers for every
+/// revision a branch holds but one: the revision the branch was created at
+/// belongs to the branch that was branched from, being the last one the two
+/// share. Naming a branch is what picks that revision's other side, and it is
+/// answered from the branch's own metadata, so it is taken first and costs no
+/// read of the revision.
+async fn resolved_branch(
+    repository: Arc<RepositoryContext>,
+    revision: Hash,
+    named: Option<(BranchId, Hash)>,
+) -> Result<BranchId, StateError> {
+    if let Some((branch, branch_metadata)) = named {
+        let metadata = if branch_metadata.is_zero() {
+            branch::metadata(repository.clone(), branch).await
+        } else {
+            branch::load_metadata(repository.clone(), branch_metadata).await
+        }
+        .forward::<StateError>("loading branch metadata")?;
+
+        if branch::stack(&metadata)
+            .first()
+            .is_some_and(|branch_point| branch_point.revision == revision)
+        {
+            return Ok(branch);
+        }
+    }
+
+    // A revision taken from a cached revision list carries no metadata blob to
+    // read a branch from, which is ordinary rather than damage, so the branch a
+    // specifier named answers where the revision cannot answer for itself.
+    Ok(absent_unless::<_, _, StateError>(
+        recorded_branch(repository, revision).await,
+        StateError::is_slow_down,
+        "reading the branch a revision records",
+    )?
+    .unwrap_or_else(|| named.map(|(branch, _)| branch).unwrap_or_default()))
+}
+
+/// True when `signature` is a complete revision hash signature.
+fn is_hash_signature(signature: &str) -> bool {
+    signature.len() == HASH_STRING_LENGTH && signature.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// True when `signature` is a revision number rather than a hash signature.
+///
+/// A signature of the full hash length is a hash even when it is all digits:
+/// the two forms only overlap at that one length, and a hash is what a caller
+/// pasting 64 characters means.
+fn is_revision_number(signature: &str) -> bool {
+    !signature.is_empty()
+        && signature.len() != HASH_STRING_LENGTH
+        && signature.chars().all(|c| c.is_ascii_digit())
+}
+
+/// The failure for a specifier that names neither a complete hash signature nor
+/// a revision number.
+///
+/// Hex digits alone make a hash signature of the wrong length, which is a form
+/// that is not supported rather than a revision that could not be found:
+/// reporting it as missing would send the caller looking for a revision they
+/// never named.
+fn unresolvable(signature: &str, original_input: &str) -> StateError {
+    if !signature.is_empty() && signature.chars().all(|c| c.is_ascii_hexdigit()) {
+        lore_debug!("Partial revision hash signature {signature:?} is not supported");
+        return NotSupported {
+            operation: format!(
+                "partial revision hash signature {signature:?} - give the whole \
+                 {HASH_STRING_LENGTH} character signature, a revision number, or \
+                 <branch>@<revision number>"
+            ),
+        }
+        .into();
+    }
+
+    lore_debug!("Malformed revision specifier {signature:?}");
+    RevisionNotFound {
+        revision: original_input.to_string(),
+    }
+    .into()
+}
+
+/// The branch this instance is on.
+async fn current_anchor_branch(
+    repository: &Arc<RepositoryContext>,
+) -> Result<BranchId, StateError> {
+    let (_current_revision, current_branch) = crate::instance::load_current_anchor(repository)
+        .await
+        .forward::<StateError>("Failed deserializing anchor")?;
+    Ok(current_branch)
+}
+
+/// Reads a revision number [`is_revision_number`] has already accepted,
+/// reporting one too large to hold as a revision that was not found.
+fn parse_revision_number(signature: &str, original_input: &str) -> Result<u64, StateError> {
+    signature.parse::<u64>().map_err(|err| {
+        lore_debug!("Invalid revision number {signature:?}: {err}");
+        StateError::from(RevisionNotFound {
+            revision: original_input.to_string(),
+        })
+    })
+}
+
+/// Reads a hash signature [`is_hash_signature`] has already accepted.
+fn parse_hash_signature(signature: &str, original_input: &str) -> Result<Hash, StateError> {
+    Hash::from_str(signature).map_err(|err| {
+        lore_debug!("Malformed revision signature {signature:?}: {err}");
+        StateError::from(RevisionNotFound {
+            revision: original_input.to_string(),
+        })
+    })
+}
+
+/// What the part of a `[branch]@<target>` specifier after the `@` names.
+enum BranchTarget {
+    /// The branch's latest revision.
+    Latest,
+    /// A revision by its number on the branch.
+    Number(u64),
+    /// A revision by its whole hash signature, taken on the branch.
+    Signature(Hash),
+}
+
+/// What the part of `[branch]@<target>` after the `@` names.
+///
+/// Read before the branch it belongs to is looked up, since it is a property of
+/// the input alone: a specifier that can never resolve is refused without
+/// spending a store or remote round trip on the branch first, and names the
+/// part of itself that is wrong.
+fn branch_target(suffix: &str, original_input: &str) -> Result<BranchTarget, StateError> {
+    if suffix.eq_ignore_ascii_case("LATEST") || suffix.eq_ignore_ascii_case("HEAD") {
+        Ok(BranchTarget::Latest)
+    } else if is_revision_number(suffix) {
+        Ok(BranchTarget::Number(parse_revision_number(
+            suffix,
+            original_input,
+        )?))
+    } else if is_hash_signature(suffix) {
+        Ok(BranchTarget::Signature(parse_hash_signature(
+            suffix,
+            original_input,
+        )?))
+    } else {
+        Err(unresolvable(suffix, original_input))
+    }
+}
+
+/// The latests a lookup on `branch` can anchor on, as `(remote, local)`.
+async fn branch_latests(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    should_search_remote: bool,
+    should_search_local: bool,
+) -> Result<(Option<Hash>, Option<Hash>), StateError> {
+    let remote_latest = if should_search_remote && let Ok(remote) = repository.remote().await {
+        // no propagation here: a throttled or unreachable remote is what the
+        // local latest below exists to cover, so it stays `None` rather than
+        // failing here.
+        branch::load_remote_latest(remote.clone(), repository.id, branch)
+            .await
+            .ok()
+    } else {
+        None
+    };
+
+    let local_latest = if should_search_local {
+        // The remote latest stands in for this one: a lookup answers from it
+        // alone when the local one is absent.
+        absent_unless_sole_source(
+            branch::load_latest(repository.clone(), branch).await,
+            remote_latest,
+            branch::BranchError::is_slow_down,
+            "loading branch latest",
+        )?
+    } else {
+        None
+    };
+
+    Ok((remote_latest, local_latest))
+}
+
+/// The latest revision of `branch`, zero when neither side has one.
+///
+/// The two sides only disagree between syncs. A remote that is ahead and
+/// convergent has revisions this instance has not seen yet and answers for
+/// both; anything else keeps the local one, which is the revision the working
+/// tree was realized against.
+async fn branch_latest(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    should_search_remote: bool,
+    should_search_local: bool,
 ) -> Result<Hash, StateError> {
-    let signature = signature.as_ref();
-    let original_input = signature.to_string();
+    event::LoreEvent::RevisionResolve(LoreRevisionResolveEventData {
+        repository: repository.id,
+        branch,
+        target: LoreRevisionResolveTarget::Latest,
+        revision_number: 0,
+        revision: Hash::default(),
+        remote: should_search_remote.into(),
+        local: should_search_local.into(),
+    })
+    .send();
+
+    let (remote_latest, local_latest) = branch_latests(
+        repository.clone(),
+        branch,
+        should_search_remote,
+        should_search_local,
+    )
+    .await?;
+
+    let local = local_latest.filter(|head| !head.is_zero());
+    let remote = remote_latest.filter(|head| !head.is_zero());
+    Ok(match (local, remote) {
+        (Some(local), Some(remote)) if local == remote => local,
+        (Some(local), Some(remote)) => {
+            match find_branch_point(repository.clone(), remote, local).await {
+                Ok((_branch_point, remote_history, local_history)) => {
+                    if local_history.is_empty() && !remote_history.is_empty() {
+                        lore_debug!(
+                            "Remote latest {remote} is ahead of local latest {local} and convergent, using remote"
+                        );
+                        remote
+                    } else {
+                        local
+                    }
+                }
+                Err(err) => {
+                    lore_debug!(
+                        "Failed to find branch point between local {local} and remote {remote}, falling back to local: {err}"
+                    );
+                    local
+                }
+            }
+        }
+        (Some(local), None) => local,
+        (None, Some(remote)) => remote,
+        (None, None) => Hash::default(),
+    })
+}
+
+/// The revision numbered `revision_number` on `branch`, zero when the branch
+/// has no such revision.
+///
+/// The remote answers from its revision list where it can, since that costs one
+/// request against a walk of every revision in between. Whichever latest the
+/// list did not answer from anchors that walk.
+///
+/// Numbering starts at one, so zero names no revision and is refused before any
+/// lookup rather than after walking the whole history to find nothing.
+async fn resolve_revision_number(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    revision_number: u64,
+    should_search_remote: bool,
+    should_search_local: bool,
+) -> Result<Hash, StateError> {
+    if revision_number == 0 {
+        lore_debug!("Revision number 0 names no revision");
+        return Ok(Hash::default());
+    }
+
+    let (remote_latest, local_latest) = branch_latests(
+        repository.clone(),
+        branch,
+        should_search_remote,
+        should_search_local,
+    )
+    .await?;
+
     let mut revision = Hash::default();
 
-    let (signature, offset) = if let Some(split) = signature.split_once("~") {
+    if should_search_remote
+        && let Ok(connection) = repository.remote().await
+        && let Ok(revision_service) = connection.revision(repository.id).await
+        && let Ok(response) = revision_service
+            .revision_list(
+                RevisionListIdentifier {
+                    branch,
+                    number: revision_number,
+                }
+                .into(),
+            )
+            .await
+    {
+        if let Ok(item) = response
+            .items
+            .as_slice()
+            .binary_search_by(|item| item.number.cmp(&revision_number))
+        {
+            revision = response.items[item].signature;
+            lore_debug!("response revision {}", revision);
+        }
+        find::cache_revision_list_states(repository.clone(), &response.items).await;
+    }
+
+    if revision.is_zero()
+        && let Some(head) = remote_latest
+    {
+        // The local latest stands in for this search: the local-anchored
+        // attempt below runs next. A zero one cannot — a search anchored on it
+        // finds nothing.
+        let found = absent_unless_sole_source(
+            find::revision_by_number(repository.clone(), branch, head, revision_number).await,
+            local_latest,
+            find::FindError::is_slow_down,
+            "finding revision by number",
+        )?;
+        if let Some(found_revision) = found {
+            revision = found_revision;
+        }
+    }
+    if revision.is_zero()
+        && let Some(head) = local_latest
+        && let Some(found_revision) = absent_unless::<_, _, StateError>(
+            find::revision_by_number(repository.clone(), branch, head, revision_number).await,
+            find::FindError::is_slow_down,
+            "finding revision by number",
+        )?
+    {
+        revision = found_revision;
+    }
+
+    Ok(revision)
+}
+
+/// Resolves a revision specifier to the revision it names.
+///
+/// See [`resolve_in_branch`] for the specifier forms. This reads nothing of the
+/// revision itself, so a caller that only needs the revision does not pay for
+/// the branch it is taken on.
+pub(crate) async fn resolve(
+    repository: Arc<RepositoryContext>,
+    signature: impl AsRef<str>,
+    search_location: ResolveSearchLocation,
+) -> Result<Hash, StateError> {
+    resolve_revision(repository, signature, search_location)
+        .await
+        .map(|(revision, _named_branch)| revision)
+}
+
+/// Boxed version of [`resolve`] for cross-crate use.
+pub fn resolve_boxed(
+    repository: Arc<RepositoryContext>,
+    signature: impl AsRef<str> + Send,
+    search_location: ResolveSearchLocation,
+) -> crate::BoxFuture<'static, Result<Hash, StateError>> {
+    let signature = signature.as_ref().to_owned();
+    Box::pin(resolve(repository, signature, search_location))
+}
+
+/// Resolves a revision specifier to the revision it names and the branch it is
+/// taken on.
+///
+/// A revision is named by its whole hash signature, by `[branch]@<number>`, by
+/// `[branch]@LATEST`, or by `<branch>@<hash>`, each taking an optional
+/// `~<count>` suffix walking that many parent revisions (a bare `~` walks one).
+/// The `@` is optional, a target given without it applying to the branch the
+/// instance is on. Partial signatures are not resolved, which is what leaves a
+/// number free to be read as a revision number.
+///
+/// A revision identifies the branch it was created on. A branch point can also
+/// identify the child branch by naming that child branch.
+pub async fn resolve_in_branch(
+    repository: Arc<RepositoryContext>,
+    signature: impl AsRef<str>,
+    search_location: ResolveSearchLocation,
+) -> Result<ResolvedRevision, StateError> {
+    let (revision, named_branch) =
+        resolve_revision(repository.clone(), signature, search_location).await?;
+
+    // Taken for the revision reached rather than the one named, since a `~<count>`
+    // walk can cross the branch point into the branch this one was created from.
+    let branch = resolved_branch(repository, revision, named_branch).await?;
+
+    Ok(ResolvedRevision { revision, branch })
+}
+
+/// The revision a specifier names, and the branch it named to find it in.
+///
+/// See [`resolve_in_branch`] for the specifier forms. The branch is reported as
+/// named rather than as the revision is taken on, which reads the revision.
+async fn resolve_revision(
+    repository: Arc<RepositoryContext>,
+    signature: impl AsRef<str>,
+    search_location: ResolveSearchLocation,
+) -> Result<(Hash, Option<(BranchId, Hash)>), StateError> {
+    let original_input = signature.as_ref();
+    let mut revision;
+    // The branch the specifier named, with the metadata it resolved to, which
+    // answers for the revision it was created at.
+    let mut named_branch = None;
+
+    let (signature, offset) = if let Some(split) = original_input.split_once("~") {
         let prefix = split.0;
         let suffix = split.1;
         if suffix.is_empty() {
@@ -1215,14 +1783,14 @@ pub async fn resolve(
             let offset: u64 = suffix.parse::<u64>().map_err(|err| {
                 lore_debug!("Malformed revision offset {suffix:?}: {err}");
                 StateError::from(RevisionNotFound {
-                    revision: original_input.clone(),
+                    revision: original_input.to_string(),
                 })
             })?;
 
             (prefix, Some(offset))
         }
     } else {
-        (signature, None)
+        (original_input, None)
     };
 
     lore_debug!("Resolving signature {signature}, offset {offset:?}");
@@ -1233,212 +1801,88 @@ pub async fn resolve(
         ResolveSearchLocation::Local => (false, true),
     };
 
-    if signature.len() == HASH_STRING_LENGTH && signature.chars().all(|c| c.is_ascii_hexdigit()) {
-        revision = Hash::from_str(signature).map_err(|err| {
-            lore_debug!("Malformed revision signature {signature:?}: {err}");
-            StateError::from(RevisionNotFound {
-                revision: original_input.clone(),
-            })
-        })?;
+    if is_hash_signature(signature) {
+        revision = parse_hash_signature(signature, original_input)?;
         lore_debug!("Resolved direct hash signature: {revision}");
-    } else if let Some(split) = signature.split_once("@") {
-        let prefix = split.0;
-        let suffix = split.1;
+    } else {
+        // An empty prefix is the branch the instance is on, which is what makes
+        // the `@` optional: no branch reads as a target, so a specifier carrying
+        // one and a specifier carrying none cannot be confused.
+        let (prefix, suffix) = signature.split_once("@").unwrap_or(("", signature));
+        let target = branch_target(suffix, original_input)?;
 
         lore_debug!("Resolving branch {prefix} signature {signature}");
-        let branch = if prefix.is_empty() {
-            let (_current_revision, current_branch) =
-                crate::instance::load_current_anchor(&repository)
-                    .await
-                    .forward::<StateError>("Failed deserializing anchor")?;
-            current_branch
+        let (branch, branch_metadata) = if prefix.is_empty() {
+            (current_anchor_branch(&repository).await?, Hash::default())
         } else {
             let branch_status = branch::resolve(repository.clone(), prefix)
                 .await
                 .map_matched_err("Invalid branch specifier", |m| match m {
                     branch::MatchedBranchError::BranchNotFound(_) => {
                         StateError::from(RevisionNotFound {
-                            revision: original_input.clone(),
+                            revision: original_input.to_string(),
                         })
                     }
                     other => other.forward::<StateError>("resolving branch for revision"),
                 })?;
-            branch_status.id
+            (branch_status.id, branch_status.metadata)
         };
+        named_branch = Some((branch, branch_metadata));
 
-        let remote_latest = if should_search_remote && let Ok(remote) = repository.remote().await {
-            // no propagation here: a throttled or unreachable remote is what
-            // the local latest below exists to cover, so it stays `None` rather
-            // than failing here.
-            branch::load_remote_latest(remote.clone(), repository.id, branch)
-                .await
-                .ok()
-        } else {
-            None
-        };
-
-        let local_latest = if should_search_local {
-            // The remote latest stands in for this one: the resolution below
-            // answers from it alone when the local one is absent.
-            absent_unless_sole_source(
-                branch::load_latest(repository.clone(), branch).await,
-                remote_latest,
-                branch::BranchError::is_slow_down,
-                "loading branch latest",
-            )?
-        } else {
-            None
-        };
-
-        if suffix.to_uppercase() == "LATEST" || suffix.to_uppercase() == "HEAD" {
-            let local = local_latest.filter(|head| !head.is_zero());
-            let remote = remote_latest.filter(|head| !head.is_zero());
-            revision = match (local, remote) {
-                (Some(local), Some(remote)) if local == remote => local,
-                (Some(local), Some(remote)) => {
-                    match find_branch_point(repository.clone(), remote, local).await {
-                        Ok((_branch_point, remote_history, local_history)) => {
-                            if local_history.is_empty() && !remote_history.is_empty() {
-                                lore_debug!(
-                                    "Remote latest {remote} is ahead of local latest {local} and convergent, using remote"
-                                );
-                                remote
-                            } else {
-                                local
-                            }
-                        }
-                        Err(err) => {
-                            lore_debug!(
-                                "Failed to find branch point between local {local} and remote {remote}, falling back to local: {err}"
-                            );
-                            local
-                        }
-                    }
-                }
-                (Some(local), None) => local,
-                (None, Some(remote)) => remote,
-                (None, None) => Hash::default(),
-            };
-        } else {
-            let revision_number: u64 = suffix.parse::<u64>().map_err(|err| {
-                lore_debug!("Invalid revision number {suffix:?}: {err}");
-                StateError::from(RevisionNotFound {
-                    revision: original_input.clone(),
+        match target {
+            BranchTarget::Latest => {
+                revision = branch_latest(
+                    repository.clone(),
+                    branch,
+                    should_search_remote,
+                    should_search_local,
+                )
+                .await?;
+            }
+            BranchTarget::Number(revision_number) => {
+                event::LoreEvent::RevisionResolve(LoreRevisionResolveEventData {
+                    repository: repository.id,
+                    branch,
+                    target: LoreRevisionResolveTarget::Number,
+                    revision_number,
+                    revision: Hash::default(),
+                    remote: should_search_remote.into(),
+                    local: should_search_local.into(),
                 })
-            })?;
-
-            event::LoreEvent::RevisionResolve(LoreRevisionResolveEventData {
-                repository: repository.id,
-                branch,
-                revision: LoreString::default(),
-                revision_number,
-                remote: should_search_remote.into(),
-                local: should_search_local.into(),
-            })
-            .send();
-
-            if should_search_remote
-                && let Ok(connection) = repository.remote().await
-                && let Ok(revision_service) = connection.revision(repository.id).await
-                && let Ok(response) = revision_service
-                    .revision_list(
-                        RevisionListIdentifier {
-                            branch,
-                            number: revision_number,
-                        }
-                        .into(),
-                    )
-                    .await
-            {
-                if let Ok(item) = response
-                    .items
-                    .as_slice()
-                    .binary_search_by(|item| item.number.cmp(&revision_number))
-                {
-                    revision = response.items[item].signature;
-                    lore_debug!("response revision {}", revision);
-                }
-                find::cache_revision_list_states(repository.clone(), &response.items).await;
+                .send();
+                revision = resolve_revision_number(
+                    repository.clone(),
+                    branch,
+                    revision_number,
+                    should_search_remote,
+                    should_search_local,
+                )
+                .await?;
             }
+            BranchTarget::Signature(signature) => {
+                event::LoreEvent::RevisionResolve(LoreRevisionResolveEventData {
+                    repository: repository.id,
+                    branch,
+                    target: LoreRevisionResolveTarget::Signature,
+                    revision_number: 0,
+                    revision: signature,
+                    remote: should_search_remote.into(),
+                    local: should_search_local.into(),
+                })
+                .send();
 
-            if revision.is_zero()
-                && let Some(head) = remote_latest
-            {
-                // The local latest stands in for this search: the
-                // local-anchored attempt below runs next. A zero one cannot —
-                // a search anchored on it finds nothing.
-                let found = absent_unless_sole_source(
-                    find::revision_by_number(repository.clone(), branch, head, revision_number)
-                        .await,
-                    local_latest,
-                    find::FindError::is_slow_down,
-                    "finding revision by number",
-                )?;
-                if let Some(found_revision) = found {
-                    revision = found_revision;
-                }
-            }
-            if revision.is_zero()
-                && let Some(head) = local_latest
-                && let Some(found_revision) = absent_unless::<_, _, StateError>(
-                    find::revision_by_number(repository.clone(), branch, head, revision_number)
-                        .await,
-                    find::FindError::is_slow_down,
-                    "finding revision by number",
-                )?
-            {
-                revision = found_revision;
+                revision = signature;
             }
         }
 
         if !revision.is_zero() {
             lore_debug!("Resolved to branch {branch} revision {revision}");
         }
-    } else {
-        if !signature.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(RevisionNotFound {
-                revision: original_input.clone(),
-            }
-            .into());
-        }
-
-        let (_current_revision, current_branch) = crate::instance::load_current_anchor(&repository)
-            .await
-            .forward::<StateError>("Failed deserializing anchor")?;
-        let branch = current_branch;
-
-        if signature.len() < HASH_STRING_LENGTH {
-            event::LoreEvent::RevisionResolve(LoreRevisionResolveEventData {
-                repository: repository.id,
-                branch,
-                revision: signature.into(),
-                revision_number: 0,
-                remote: should_search_remote.into(),
-                local: should_search_local.into(),
-            })
-            .send();
-        }
-
-        if let Some(found_revision) = absent_unless::<_, _, StateError>(
-            find::revision_by_string(
-                repository.clone(),
-                branch,
-                signature,
-                search_limit,
-                should_search_remote,
-            )
-            .await,
-            find::FindError::is_slow_down,
-            "finding revision by partial signature",
-        )? {
-            revision = found_revision;
-            lore_debug!("Resolved partial match revision {revision}");
-        }
     }
 
     if revision.is_zero() {
         return Err(RevisionNotFound {
-            revision: original_input.clone(),
+            revision: original_input.to_string(),
         }
         .into());
     }
@@ -1451,7 +1895,7 @@ pub async fn resolve(
 
             if parent.is_zero() {
                 return Err(RevisionNotFound {
-                    revision: original_input.clone(),
+                    revision: original_input.to_string(),
                 }
                 .into());
             }
@@ -1461,5 +1905,5 @@ pub async fn resolve(
         }
     }
 
-    Ok(revision)
+    Ok((revision, named_branch))
 }

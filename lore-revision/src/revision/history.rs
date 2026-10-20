@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 
 use crate::branch;
@@ -14,14 +13,14 @@ use crate::lore::Context;
 use crate::lore::Hash;
 use crate::lore::RepositoryId;
 use crate::lore_debug;
-use crate::metadata::Metadata;
 use crate::repository::RepositoryContext;
+use crate::revision;
 use crate::runtime::execution_context;
 use crate::state::State;
 
 /// Header information for a revision history listing.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionHistoryEventData {
     /// Repository identifier the history belongs to.
@@ -38,7 +37,7 @@ impl LoreRevisionHistoryEventData {
 
 /// A single entry in a revision history listing.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionHistoryEntryEventData {
     /// Revision hash signature.
@@ -140,36 +139,18 @@ async fn find_start_revision(
     }
 
     if let Some(revision) = options.revision {
-        // Extract branch from "branch@number" or "branch@head" specifier
-        let branch = if let Some((prefix, _)) = revision.split_once('@') {
-            if prefix.is_empty() {
-                // "@number" uses the current anchor branch
-                crate::instance::load_current_anchor(&repository)
-                    .await
-                    .ok()
-                    .map(|(_revision, branch)| branch)
-            } else {
-                branch::resolve(repository.clone(), prefix)
-                    .await
-                    .ok()
-                    .map(|b| b.id)
-            }
-        } else {
-            // Raw hash — no branch information available
-            None
-        };
-
-        let resolved_revision = super::resolve(
+        let resolved = super::resolve_in_branch(
             repository.clone(),
             revision,
-            execution_context().globals().search_limit(),
             execution_context().globals().search_location(),
         )
-        .await;
-        return Ok((
-            resolved_revision.forward::<RevisionHistoryError>("resolving revision for history")?,
-            branch,
-        ));
+        .await
+        .forward::<RevisionHistoryError>("resolving revision for history")?;
+
+        // A bare hash signature names no branch, which leaves `only_branch`
+        // nothing to stop at and reports the whole line of history.
+        let branch = Some(resolved.branch).filter(|branch| !branch.is_zero());
+        return Ok((resolved.revision, branch));
     }
 
     if let Some(target_branch) = options.branch {
@@ -232,7 +213,7 @@ async fn load_remote_latest(repository: Arc<RepositoryContext>, branch: BranchId
     }
 }
 
-pub async fn history(
+pub(crate) async fn history(
     repository: Arc<RepositoryContext>,
     options: HistoryOptions,
 ) -> Result<(), RevisionHistoryError> {
@@ -255,13 +236,11 @@ pub async fn history(
             .await
             .forward::<RevisionHistoryError>("deserializing state")?;
 
-        let metadata_hash = state.metadata_hash();
-        let metadata = Metadata::deserialize(repository.clone(), metadata_hash)
-            .await
-            .forward::<RevisionHistoryError>("deserializing metadata")?;
+        let metadata = revision::reported_metadata(repository.clone(), state.metadata_hash()).await;
 
         // Check if we've crossed a date boundary
         if options.date != 0
+            && let Some(metadata) = &metadata
             && let Ok(ts) = metadata.get_timestamp()
             && ts < options.date
         {
@@ -270,6 +249,7 @@ pub async fn history(
 
         // Check if we've crossed a branch boundary
         let crossed_branch = if options.only_branch
+            && let Some(metadata) = &metadata
             && let Ok(branch) = metadata.get_branch()
         {
             if let Some(ref start) = start_branch {
@@ -291,11 +271,13 @@ pub async fn history(
                 )
                 .await
                 .forward::<RevisionHistoryError>("loading branch name")?
-            } else {
+            } else if let Some(metadata) = &metadata {
                 // Take branch from top revision.
                 metadata
                     .get_branch()
                     .forward::<RevisionHistoryError>("getting branch from metadata")?
+            } else {
+                BranchId::default()
             };
 
             event::LoreEvent::RevisionHistory(LoreRevisionHistoryEventData::new(
@@ -310,8 +292,8 @@ pub async fn history(
         ))
         .send();
 
-        if !metadata_hash.is_zero() {
-            event::metadata::send(&metadata);
+        if let Some(metadata) = &metadata {
+            event::metadata::send(metadata);
         }
 
         if crossed_branch {
@@ -324,4 +306,12 @@ pub async fn history(
     }
 
     Ok(())
+}
+
+/// Boxed version of [`history`] for cross-crate use.
+pub fn history_boxed(
+    repository: Arc<RepositoryContext>,
+    options: HistoryOptions,
+) -> crate::BoxFuture<'static, Result<(), RevisionHistoryError>> {
+    Box::pin(history(repository, options))
 }

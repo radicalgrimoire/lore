@@ -42,7 +42,7 @@ pub async fn dump(
         let node_link = state
             .find_node_link(repository.clone(), path.as_str())
             .await?;
-        let link_repository = Arc::new(repository.to_link_context(node_link.repository).await);
+        let link_repository = repository.to_link_context(node_link.repository).await;
         let entry_node = state.node(link_repository.clone(), node_link.node).await?;
         let mut cycle = SiblingCycleGuard::new(entry_node.parent);
         dump_node(
@@ -101,10 +101,13 @@ pub async fn dump_node(
     }
     node.walk_step(node_id, expected_parent, cycle)?;
     {
-        let node_name = state
-            .node_name_ref(repository.clone(), node_id)
+        let Some(node_name) = state
+            .node_name_ref_or_skip(repository.clone(), node_id)
             .await
-            .forward::<StateError>("Failed to get node name")?;
+            .forward::<StateError>("Failed to get node name")?
+        else {
+            return Ok(node.sibling());
+        };
         subpath.push(node_name);
 
         let type_data = if node.is_directory() {
@@ -138,7 +141,7 @@ pub async fn dump_node(
     }
     if node.is_link() && ((max_depth == 0) || (depth + 1 < max_depth)) {
         let link_node = node.linked_node();
-        let linked_repository = Arc::new(repository.to_link_context(link_node.repository).await);
+        let linked_repository = repository.to_link_context(link_node.repository).await;
         let link_state = State::deserialize(linked_repository.clone(), link_node.revision).await?;
         let link_entry_id = link_node.node as NodeID;
         let link_entry = link_state

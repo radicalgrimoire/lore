@@ -44,15 +44,19 @@ When `identity` is unset and you try to commit, Lore fails with: `No commit iden
 
 ### `[store]` table
 
-The `[store]` table tunes the repository's local stores — the on-disk immutable store (content-addressed fragments) and how much disk it may use before eviction and compaction reclaim space.
+The `[store]` table tunes the repository's local stores — the on-disk immutable store (content-addressed fragments) and how much it may hold before eviction and compaction reclaim space.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `max_capacity` | integer (bytes) | `10485760` (10 MiB) | Maximum capacity of the local immutable store in bytes. |
-| `eviction_delay` | integer (seconds) | `10` | Delay before evicting over-capacity fragments. |
-| `max_size` | integer (bytes) | `10737418240` (10 GiB) | Maximum total store size in bytes before background compaction reclaims space. |
-| `compaction_delay` | integer (seconds) | `30` | Delay between background compaction passes. |
+| `max_capacity` | integer (fragments) | `2000000` | Maximum number of fragments in the local immutable store. Eviction removes the least recently used fragments to hold the store near 70% of it. The periodic eviction pass treats a value below `1048576` as `1048576`. |
+| `eviction_delay` | integer (seconds) | `30` | Interval between background eviction passes. The first pass runs one interval after the store opens. |
+| `max_size` | integer (bytes) | `10737418240` (10 GiB) | Maximum total size of the local immutable store's packfiles. Above it, compaction evicts the least recently used content toward 70% of it and rewrites packfiles to reclaim the space. |
+| `compaction_delay` | integer (seconds) | `50` | Interval before a background compaction pass starts from the beginning. A pass that an earlier command stopped after its first step resumes as soon as the store opens. |
 | `verify_write` | Boolean | unset (behaves as `false`) | Verify each write by reading the data back and rehashing it. |
+
+A command that finds the store over a limit as it loads it starts a pass at once rather than after the interval.
+
+Eviction removes only content the remote also holds, which Lore fetches again when it's next read. Content held only locally, such as commits not yet pushed, counts toward both limits but is never evicted. Once it fills about 70% of a limit, eviction removes the remote content cached beside it. The store keeps its packfiles in 256 groups, and compaction rewrites a group's packfiles only once at least 10% of their bytes are no longer referenced.
 
 The **Default** column shows the value `lore repository create` and `lore clone` write into a freshly generated `config.toml`. A new repository's `[store]` table already contains every field at these values, so editing the file means changing values that are already present rather than adding missing ones.
 
@@ -88,7 +92,7 @@ The table key and both fields accept legacy serde aliases for backward compatibi
 
 A config that uses the legacy names still loads. New configs use the current names.
 
-Lore normally writes this table for you when you clone with `--use-shared-store`. For how shared stores work and how to set one up, see [Step 6 of the Quickstart](../tutorials/quickstart.md#step-6-set-up-a-shared-store-and-clone-a-second-working-tree); for the `lore clone` and `lore shared-store` flags, see the [Lore CLI command reference](lore-cli-commands.md).
+Lore normally writes this table for you when you clone with `--use-shared-store`, or with automatic use turned on by `lore shared-store set-use-automatically true`. For how shared stores work and how to set one up, see [Step 6 of the Quickstart](../tutorials/quickstart.md#step-6-set-up-a-shared-store-and-clone-a-second-working-tree); for running and maintaining many instances over one store, see [Run parallel instances over a shared store](../how-to/run-parallel-instances-over-a-shared-store.md); for the `lore clone` and `lore shared-store` flags, see the [Lore CLI command reference](lore-cli-commands.md).
 
 ## User-level `cli.toml`
 
@@ -112,6 +116,67 @@ The file is optional; when it's absent, Lore uses the defaults below.
 
 `pager` is the only field Lore reads from `cli.toml` today. The CLI's other behavioral settings — JSON output, log level, debug logging, and non-interactive mode — are set per invocation through command-line flags, not through this file. Passing `--no-pager` (or requesting JSON output) overrides `pager` for that command and disables paging.
 
+## User-level `config.toml`
+
+### Location
+
+`config.toml` sits beside `cli.toml` in the same OS user config directory (`~/.config/lore/config.toml` on a typical Linux setup), and holds settings that apply to every repository rather than to one. It is optional. Don't confuse it with the per-repository `config.toml` documented above, which lives in a repository's `.lore/` folder.
+
+### `[service]` table
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `executable` | string | unset | Path of the `lore` executable to run as the [background service](lore-cli-commands.md#lore-service). |
+| `use_automatically` | boolean | `false` | Whether commands are carried out by the service rather than in the process you ran. |
+
+**Both are required.** Commands are carried out by the service only when `use_automatically` is on *and* an executable is named. Turning the setting on by itself changes nothing, and Lore says so on each command rather than leaving you to wonder.
+
+```toml
+[service]
+executable = "/opt/lore/1.9/bin/lore"
+use_automatically = true
+```
+
+Set both with commands rather than by hand:
+
+```bash
+lore service set-executable /opt/lore/1.9/bin/lore
+lore service set-use-automatically true
+```
+
+`lore service set-executable` with an empty path clears the setting, which also stops commands being carried out by the service.
+
+Naming the executable is required because it decides which build serves the machine. A command that finds no service running starts one, so without a name that would be whichever program relayed first — an editor's bundled plugin as readily as the client you installed, and every client on the machine served by it thereafter. Requiring the name makes the version serving a machine something you chose and can read back, rather than an accident of ordering. This matters most where clients or plugins of different versions share a machine.
+
+Lore resolves the executable to start in this order, and the order is stable — a client released later still reads this setting, which is what lets an existing installation be pointed at a specific build after the fact:
+
+1. The `LORE_SERVICE_EXECUTABLE` environment variable, which overrides the setting for a single command. Use it for a build under test, not as a permanent choice.
+2. `[service] executable` in this file.
+3. The running program, when it is the `lore` client itself.
+4. A `lore` executable in the same directory as the running program. This is the case for a program that links `liblore` and ships the client beside it.
+
+Steps 3 and 4 serve `lore service start`, which asks for a service outright and so needs no name. They are not enough for commands to be carried out by the service automatically: that needs step 1 or 2.
+
+If none of those resolve, starting a service fails and names both places one can be set. Running `lore service run` by hand always serves from the build you ran, whatever this setting says; the service reports on startup when that isn't the configured one.
+
+`use_automatically` is what turns the service on and leaves it on. `LORE_USE_SERVICE` overrides it for a single command, and reads `0`, `false`, `no` and `off` as off — so `LORE_USE_SERVICE=0 lore status` runs in the process you ran even where the setting turns the service on. A blank value reads as unset and defers to the setting, as a blank `executable` does. Turning it on through the environment still requires an executable to be named, in either of the two places above.
+
+### Giving a run its own service
+
+| Variable | Effect |
+| --- | --- |
+| `LORE_SERVICE_SOCKET` | Names the socket a service listens on. Processes sharing a value share a service; processes with different values get one each. |
+
+Every service belonging to a user answers on the same socket by default, which is what makes one service serve every command that user runs. It is also why a test suite, or a second checkout, would otherwise take over the service already running: stopping and starting one affects whatever else was using it.
+
+Set `LORE_SERVICE_SOCKET` to give a group of processes a service of their own. The value names a single file, not a path — anything containing a path separator is refused in favour of the default rather than honoured, since the socket's directory is chosen for being private to your user and a path could move it somewhere with weaker permissions.
+
+```bash
+export LORE_SERVICE_SOCKET=lore_service-my-checkout
+```
+
+The Python test suite sets this per run, so running it leaves a service you have running alone.
+
 ## Examples
 
 ### Minimal `config.toml`
@@ -132,8 +197,9 @@ remote_url = "lore://127.0.0.1:41337/my-project"
 identity = "alex@example.com"
 
 [store]
-max_capacity = 1073741824   # 1 GiB
-eviction_delay = 30
+max_size = 53687091200    # 50 GiB
+max_capacity = 10000000   # fragments
+eviction_delay = 60
 ```
 
 A repository created by `lore repository create` or `lore clone` already has every `[store]` field populated at its written default, so you edit values that are already present. The `[store]` example above is shown trimmed for clarity.
@@ -163,4 +229,5 @@ pager = "bat --paging=always"
 
 - [Lore Server configuration reference](lore-server-config.md) — the `loreserver` daemon's settings, distinct from the client config on this page.
 - [Quickstart](../tutorials/quickstart.md) — clone, stage, commit, and push your first revision, and set up a shared store.
+- [Run parallel instances over a shared store](../how-to/run-parallel-instances-over-a-shared-store.md) — keep many working trees over one shared store, and move, prune, and remove them.
 - [Lore CLI command reference](lore-cli-commands.md) — the `lore clone`, `lore repository create`, and `lore shared-store` flags that write these files.

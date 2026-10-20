@@ -38,6 +38,7 @@ use lore_storage::StoreGetData;
 use lore_storage::StoreMatch;
 use lore_storage::StoreMatchResult;
 use lore_storage::StoreObliterateStats;
+use lore_storage::immutable_store::CopyBehavior;
 #[cfg(test)]
 use lore_storage::immutable_store::query_one;
 use lore_storage::immutable_store::sanitise_fragment_behavior_flags;
@@ -1755,6 +1756,16 @@ impl AwsImmutableStore {
 
 #[async_trait]
 impl ImmutableStoreTrait for AwsImmutableStore {
+    /// Nothing on disk to claim.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        Ok(None)
+    }
+
     /// Durable storage for every tenant at once, so a payload is only ever served to the partition
     /// that holds an association for it.
     fn isolates_partitions(&self) -> bool {
@@ -1936,6 +1947,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
             match_made: StoreMatch::MatchFull,
             partition,
             payload: Some(payload),
+            content: None,
         })
     }
 
@@ -2111,9 +2123,9 @@ impl ImmutableStoreTrait for AwsImmutableStore {
         source_address: Address,
         destination_partition: Partition,
         destination_context: Context,
-        // S3 itself tracks the destination object's existence as the source of durability; the
-        // local-flag bookkeeping that `durable` controls is irrelevant here.
-        _durable: bool,
+        // S3 itself tracks the destination object's existence as the source of durability, and it
+        // has no replicas of its own to pass the copy on to, so neither flag applies here.
+        _behavior: CopyBehavior,
     ) -> Result<(), StoreError> {
         // The destination tuple shares the source's hash but takes the caller's chosen context
         // — that is the only field the storage trait allows the caller to pivot on a copy.
@@ -3836,7 +3848,16 @@ mod test {
 
         let destination_context: Context = random();
         store
-            .copy(partition, source, partition, destination_context, true)
+            .copy(
+                partition,
+                source,
+                partition,
+                destination_context,
+                CopyBehavior {
+                    durable: true,
+                    do_not_replicate: false,
+                },
+            )
             .await
             .expect("copy should succeed");
 
@@ -3860,7 +3881,16 @@ mod test {
 
         store(&fake)
             .await
-            .copy(partition, source, partition, random::<Context>(), true)
+            .copy(
+                partition,
+                source,
+                partition,
+                random::<Context>(),
+                CopyBehavior {
+                    durable: true,
+                    do_not_replicate: false,
+                },
+            )
             .await
             .expect_err("nothing to copy");
 
@@ -3897,7 +3927,10 @@ mod test {
                 other_context,
                 partition,
                 random::<Context>(),
-                true,
+                CopyBehavior {
+                    durable: true,
+                    do_not_replicate: false,
+                },
             )
             .await
             .expect_err("a different context is not a full match");
@@ -3931,7 +3964,10 @@ mod test {
                 Address::zero_context_hash(hash),
                 partition,
                 random::<Context>(),
-                true,
+                CopyBehavior {
+                    durable: true,
+                    do_not_replicate: false,
+                },
             )
             .await
             .expect("a partition holding the hash answers a source naming no context");
@@ -3976,7 +4012,10 @@ mod test {
                 Address::zero_context_hash(hash),
                 random::<Partition>(),
                 random::<Context>(),
-                true,
+                CopyBehavior {
+                    durable: true,
+                    do_not_replicate: false,
+                },
             )
             .await
             .expect_err("a partition holding nothing has no association to name");

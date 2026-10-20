@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use lore_base::types::Context;
@@ -19,16 +20,37 @@ use tonic::Status;
 use tracing::debug;
 use tracing::instrument;
 
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::grpc::authorization_timeout_status;
 use crate::grpc::get_user_id;
+use crate::grpc::get_verified_token;
+use crate::grpc::no_repository_access_status;
 
 #[derive(Clone)]
 pub struct NotificationService {
     sender: Arc<crate::notification::local::NotificationSender>,
+    authorizer: Arc<dyn RepositoryAuthorizer>,
+    /// Bound on the subscribe authorization check alone, so a stalled online
+    /// authorizer cannot park subscribers. This is the authorization budget
+    /// every public gRPC access check answers to, not the longer
+    /// request-handler budget: the check is one online call, and sizing it
+    /// for a whole request is what lets a stalled authorizer hold a
+    /// subscriber for the length of a request instead of the length of a
+    /// permission question.
+    authorization_timeout: Duration,
 }
 
 impl NotificationService {
-    pub fn new(sender: Arc<crate::notification::local::NotificationSender>) -> Self {
-        Self { sender }
+    pub fn new(
+        sender: Arc<crate::notification::local::NotificationSender>,
+        authorizer: Arc<dyn RepositoryAuthorizer>,
+        authorization_timeout: Duration,
+    ) -> Self {
+        Self {
+            sender,
+            authorizer,
+            authorization_timeout,
+        }
     }
 }
 
@@ -44,11 +66,30 @@ impl lore_notification::NotificationService for NotificationService {
         &self,
         request: Request<lore_proto::lore::notification::SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
-        let user_id = get_user_id(request.extensions());
-        let repository: RepositoryId = Context::from(request.into_inner().repository).into();
+        let (_, extensions, message) = request.into_parts();
+        let user_id = get_user_id(&extensions);
+        let repository: RepositoryId = Context::from(message.repository).into();
 
         if repository.is_zero() {
             return Err(Status::failed_precondition("invalid stream"));
+        }
+
+        // Checked against the partition in the request *body*. The
+        // default authorization middleware validates access using the
+        // request metadata fields. The services passing a repository
+        // in the body need custom verification logic. A denial is folded
+        // into the boolean inside the bound, so elapsing is the only other
+        // thing the check reports.
+        let permitted = tokio::time::timeout(self.authorization_timeout, async {
+            self.authorizer
+                .check_repository_access(get_verified_token(&extensions).as_ref(), repository, None)
+                .await
+                .is_ok()
+        })
+        .await
+        .map_err(|_elapsed| authorization_timeout_status())?;
+        if !permitted {
+            return Err(no_repository_access_status());
         }
 
         let rx = self.sender.register(repository);

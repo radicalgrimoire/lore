@@ -12,6 +12,7 @@ from lore import Lore
 
 logger = logging.getLogger(__name__)
 
+
 def has_staged_anchor(repo: Lore) -> bool:
     """Check whether the repository has a staged revision by querying status."""
     output = repo.status(json=True, offline=True)
@@ -64,10 +65,14 @@ def test_unstage_clears_stage_flags_keeps_dirty(new_lore_repo):
         "anchor preserved after unstage — the unstaged add remains as a dirty add"
     )
     s1 = parse_status_json(repo.status(json=True))
-    s1_file = next((e for e in s1 if to_posix(e["path"]) == to_posix(new_dir_file)), None)
-    assert s1_file is not None and s1_file["flagStaged"] is False and s1_file["flagDirty"] is True, (
-        "unstage clears the stage flag but keeps the dirty flag on the add"
+    s1_file = next(
+        (e for e in s1 if to_posix(e["path"]) == to_posix(new_dir_file)), None
     )
+    assert (
+        s1_file is not None
+        and s1_file["flagStaged"] is False
+        and s1_file["flagDirty"] is True
+    ), "unstage clears the stage flag but keeps the dirty flag on the add"
 
     repo.branch_switch("main")
     repo.branch_switch("test-unstage")
@@ -90,10 +95,14 @@ def test_unstage_clears_stage_flags_keeps_dirty(new_lore_repo):
     )
 
     s2 = parse_status_json(repo.status(json=True))
-    s2_file = next((e for e in s2 if to_posix(e["path"]) == to_posix(another_file)), None)
-    assert s2_file is not None and s2_file["flagStaged"] is False and s2_file["flagDirty"] is True, (
-        "unstaged file becomes a dirty add (stage flag cleared, dirty kept)"
+    s2_file = next(
+        (e for e in s2 if to_posix(e["path"]) == to_posix(another_file)), None
     )
+    assert (
+        s2_file is not None
+        and s2_file["flagStaged"] is False
+        and s2_file["flagDirty"] is True
+    ), "unstaged file becomes a dirty add (stage flag cleared, dirty kept)"
     s2_dir = next((e for e in s2 if to_posix(e["path"]) == to_posix(another_dir)), None)
     assert s2_dir is not None and s2_dir["flagStaged"] is True, (
         "parent directory stays staged when only its child is unstaged"
@@ -134,9 +143,11 @@ def test_unstage_clears_stage_flags_keeps_dirty(new_lore_repo):
 
     s3 = parse_status_json(repo.status(json=True))
     s3_fa = next((e for e in s3 if to_posix(e["path"]) == to_posix(file_a)), None)
-    assert s3_fa is not None and s3_fa["flagStaged"] is False and s3_fa["flagDirty"] is True, (
-        "file A is a dirty add after unstaging dirA"
-    )
+    assert (
+        s3_fa is not None
+        and s3_fa["flagStaged"] is False
+        and s3_fa["flagDirty"] is True
+    ), "file A is a dirty add after unstaging dirA"
     s3_fb = next((e for e in s3 if to_posix(e["path"]) == to_posix(file_b)), None)
     assert s3_fb is not None and s3_fb["flagStaged"] is True, "file B remains staged"
 
@@ -299,7 +310,9 @@ def test_unstage_discard_counts(new_lore_repo):
 
     file_events = get_unstage_file_events(output)
     event_paths = sorted([e["path"] for e in file_events])
-    expected_paths = sorted([to_posix(os.path.join(dir2, f"file{i}.txt")) for i in range(3)])
+    expected_paths = sorted(
+        [to_posix(os.path.join(dir2, f"file{i}.txt")) for i in range(3)]
+    )
     assert event_paths == expected_paths, (
         f"Scenario 5: expected events for {expected_paths}, got {event_paths}"
     )
@@ -404,6 +417,32 @@ def test_unstage_discard_counts(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_stage_and_unstage_of_a_removed_dirty_add_leave_nothing(new_lore_repo):
+    """A file created, marked dirty and removed again was never tracked, so
+    staging stages nothing for it and unstaging leaves no entry behind for a
+    path that does not exist."""
+
+    repo: Lore = new_lore_repo()
+    with repo.open_file("initial.txt", "w+") as f:
+        f.write("initial content\n")
+    repo.stage(scan=True)
+    repo.commit()
+
+    with repo.open_file("phantom.txt", "w+") as f:
+        f.write("never tracked\n")
+    repo.dirty("phantom.txt")
+    repo.remove_file("phantom.txt")
+
+    repo.stage(".")
+    after_stage = parse_status_json(repo.status(json=True))
+    assert after_stage == [], f"stage recorded a never-tracked path: {after_stage}"
+
+    repo.unstage(".")
+    after_unstage = parse_status_json(repo.status(json=True))
+    assert after_unstage == [], f"unstage left an entry behind: {after_unstage}"
+
+
+@pytest.mark.smoke
 def test_restage_after_unstage_promotes_dirty_add_back_to_staged_add(new_lore_repo):
     """A staged add that is unstaged becomes a dirty add (the file is still
     pending — the user just dropped the intent to include it in the next
@@ -422,18 +461,20 @@ def test_restage_after_unstage_promotes_dirty_add_back_to_staged_add(new_lore_re
     entry = next(
         (e for e in after_stage if to_posix(e["path"]) == to_posix("file.txt")), None
     )
-    assert entry is not None and entry["flagStaged"] is True and entry["flagDirty"] is True, (
-        f"baseline: file.txt should be a staged dirty add after `stage`, got {entry}"
-    )
+    assert (
+        entry is not None and entry["flagStaged"] is True and entry["flagDirty"] is True
+    ), f"baseline: file.txt should be a staged dirty add after `stage`, got {entry}"
 
     repo.unstage(".")
     after_unstage = parse_status_json(repo.status(json=True))
     entry = next(
         (e for e in after_unstage if to_posix(e["path"]) == to_posix("file.txt")), None
     )
-    assert entry is not None and entry["flagStaged"] is False and entry["flagDirty"] is True, (
-        f"baseline: file.txt should be a dirty add after `unstage`, got {entry}"
-    )
+    assert (
+        entry is not None
+        and entry["flagStaged"] is False
+        and entry["flagDirty"] is True
+    ), f"baseline: file.txt should be a dirty add after `unstage`, got {entry}"
 
     output = repo.stage("file.txt", json=True)
     stage_events = parse_jsonl(output, "fileStageFile")
@@ -446,7 +487,9 @@ def test_restage_after_unstage_promotes_dirty_add_back_to_staged_add(new_lore_re
     entry = next(
         (e for e in after_restage if to_posix(e["path"]) == to_posix("file.txt")), None
     )
-    assert entry is not None and entry["flagStaged"] is True and entry["flagDirty"] is True, (
+    assert (
+        entry is not None and entry["flagStaged"] is True and entry["flagDirty"] is True
+    ), (
         "after re-stage, file.txt should be a staged dirty add again "
         f"(equivalent to its post-original-stage state), got {entry}"
     )

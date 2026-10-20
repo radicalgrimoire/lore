@@ -165,13 +165,9 @@ mod tests {
                 layer_messages: std::collections::HashMap::new(),
                 layer: None,
             };
-            Box::pin(commit::commit(
-                self.repository.clone(),
-                &self.write_token,
-                options,
-            ))
-            .await
-            .expect("Failed to commit revision")
+            commit::commit_boxed(self.repository.clone(), &self.write_token, options)
+                .await
+                .expect("Failed to commit revision")
         }
 
         /// Convenience: stage and commit in one step.
@@ -225,7 +221,7 @@ mod tests {
             // create::create stores the new branch as the current
             // anchor branch — read it back so callers can address it.
             let (_revision, branch_id) =
-                lore_revision::instance::load_current_anchor(&self.repository)
+                lore_revision::instance::load_current_anchor_boxed(&self.repository)
                     .await
                     .expect("Failed to load current anchor after branch create");
             branch_id
@@ -255,7 +251,7 @@ mod tests {
     fn changes_as_summary(changes: &[lore_revision::change::NodeChange]) -> Vec<(String, String)> {
         let mut out: Vec<(String, String)> = changes
             .iter()
-            .map(|c| (c.path.as_str().to_string(), format!("{:?}", c.action)))
+            .map(|c| (c.path().as_str().to_string(), format!("{:?}", c.action)))
             .collect();
         out.sort();
         out
@@ -322,7 +318,7 @@ mod tests {
                 let same_path_changes: Vec<_> = diff
                     .changes
                     .iter()
-                    .filter(|c| c.path.as_str() == "shared.txt")
+                    .filter(|c| c.path().as_str() == "shared.txt")
                     .collect();
                 assert_eq!(
                     same_path_changes.len(),
@@ -399,7 +395,7 @@ mod tests {
                 .expect("diff3_collect failed");
 
                 let summary = changes_as_summary(&diff.changes);
-                let paths: Vec<&str> = diff.changes.iter().map(|c| c.path.as_str()).collect();
+                let paths: Vec<&str> = diff.changes.iter().map(|c| c.path().as_str()).collect();
 
                 // The target-only change (beta.txt, untouched by source) is
                 // dropped: target's walk is scoped to source-touched paths.
@@ -471,13 +467,10 @@ mod tests {
                     .view
                     .add_exclusion("engine/**")
                     .expect("view exclude");
-                // `to_filter_context` drops the write token. Re-attach a
-                // shared one, so the view-scoped merge can write anchors.
                 let view_repo = std::sync::Arc::new(
                     fixture
                         .repository
-                        .to_filter_context(std::sync::Arc::new(view_filter))
-                        .with_write_token(fixture.write_token.share()),
+                        .to_filter_context(std::sync::Arc::new(view_filter)),
                 );
 
                 let merged_rev = Box::pin(lore_revision::branch::merge::merge_start(
@@ -486,6 +479,7 @@ mod tests {
                     main_branch,
                     lore_revision::branch::merge::MergeStartOptions {
                         message: "merge main into feature (sparse view)".to_string(),
+                        link_messages: std::collections::HashMap::new(),
                         no_commit: false,
                         scope: lore_revision::branch::merge::MergeScope::MainOnly,
                         inherit_metadata: Default::default(),
@@ -524,9 +518,10 @@ mod tests {
 
                 let full_summary = changes_as_summary(&full.changes);
                 let scoped_summary = changes_as_summary(&scoped.changes);
-                let full_paths: Vec<&str> = full.changes.iter().map(|c| c.path.as_str()).collect();
+                let full_paths: Vec<&str> =
+                    full.changes.iter().map(|c| c.path().as_str()).collect();
                 let scoped_paths: Vec<&str> =
-                    scoped.changes.iter().map(|c| c.path.as_str()).collect();
+                    scoped.changes.iter().map(|c| c.path().as_str()).collect();
 
                 // The view-scoped diff hides the out-of-view file.
                 assert!(
@@ -551,9 +546,6 @@ mod tests {
 
     /// Build a view filter that excludes `directory/` at every depth, and a
     /// repository context that applies it.
-    ///
-    /// `to_filter_context` drops the write token, so a shared one is re-attached
-    /// for the view-scoped merge to write anchors with.
     fn excluded_context(fixture: &DiffFixture, directory: &str) -> Arc<RepositoryContext> {
         let mut view_filter = lore_revision::filter::Filter::default();
         view_filter
@@ -564,12 +556,7 @@ mod tests {
             .view
             .add_exclusion(&format!("{directory}/**"))
             .expect("view exclude");
-        Arc::new(
-            fixture
-                .repository
-                .to_filter_context(Arc::new(view_filter))
-                .with_write_token(fixture.write_token.share()),
-        )
+        Arc::new(fixture.repository.to_filter_context(Arc::new(view_filter)))
     }
 
     fn engine_excluded_context(fixture: &DiffFixture) -> Arc<RepositoryContext> {
@@ -590,6 +577,7 @@ mod tests {
             main_branch,
             lore_revision::branch::merge::MergeStartOptions {
                 message: message.to_string(),
+                link_messages: std::collections::HashMap::new(),
                 no_commit: false,
                 scope: lore_revision::branch::merge::MergeScope::MainOnly,
                 inherit_metadata: Default::default(),
@@ -597,6 +585,78 @@ mod tests {
         ))
         .await
         .expect("merge_start failed")
+    }
+
+    /// A chmod is a modification of the executable bit and nothing else, which the content a
+    /// merge brings in answers nothing about. The merge writes the content and leaves the bit,
+    /// so the change the user made stands rather than being reverted by the write.
+    ///
+    /// The merge realizes every change it verified rather than the ones the working copy still
+    /// needs, so what the verify settles on a change has to reach the realize that follows it.
+    #[cfg(target_family = "unix")]
+    #[tokio::test]
+    async fn a_merge_keeps_a_local_executable_bit_over_incoming_content() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const SCRIPT: &str = "script.sh";
+        const FIRST: &[u8] = b"#!/bin/sh\necho first\n";
+        const SECOND: &[u8] = b"#!/bin/sh\necho second\n";
+        const FEATURE: &str = "feature.txt";
+
+        let execution = offline_execution().await;
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture = DiffFixture::new().await;
+
+                fixture.write_file(SCRIPT, FIRST);
+                let base_revision = fixture.stage_and_commit("base").await;
+                let main_branch = fixture.main_branch_id;
+
+                // The feature branch leaves the script alone, so the merge below carries main's
+                // rewrite of it whole.
+                let feature_branch = fixture.create_branch("feature").await;
+                fixture.write_file(FEATURE, b"feature\n");
+                let feature_rev = fixture.stage_and_commit("feature change").await;
+
+                fixture.switch_to(main_branch, base_revision).await;
+                fixture.delete_file(FEATURE);
+                fixture.write_file(SCRIPT, SECOND);
+                fixture.stage_and_commit("main rewrites the script").await;
+
+                fixture.switch_to(feature_branch, feature_rev).await;
+                fixture.write_file(SCRIPT, FIRST);
+                fixture.write_file(FEATURE, b"feature\n");
+
+                let script = fixture.repo_path.join(SCRIPT);
+                std::fs::set_permissions(script.as_path(), std::fs::Permissions::from_mode(0o755))
+                    .expect("Failed to set the executable bit");
+
+                merge_main_under_view(
+                    &fixture.repository,
+                    &fixture,
+                    main_branch,
+                    "merge main into feature",
+                )
+                .await;
+
+                assert_eq!(
+                    std::fs::read(script.as_path()).expect("The merged file must be readable"),
+                    SECOND,
+                    "the merge has to carry the content the incoming revision holds"
+                );
+                assert_ne!(
+                    std::fs::metadata(script.as_path())
+                        .expect("The merged file must be readable")
+                        .permissions()
+                        .mode()
+                        & 0o111,
+                    0,
+                    "the bit the user set has to survive the write the merge makes"
+                );
+            }))
+            .await
+            .expect("Test task failed");
     }
 
     /// Paths where the merged feature branch still differs from main, under a
@@ -622,7 +682,7 @@ mod tests {
         .expect("diff3_collect failed");
         diff.changes
             .iter()
-            .map(|change| change.path.as_str().to_string())
+            .map(|change| change.path().as_str().to_string())
             .collect()
     }
 
@@ -844,12 +904,8 @@ mod tests {
                     .view
                     .add_exclusion("*.bin")
                     .expect("view exclude");
-                let view_repo = Arc::new(
-                    fixture
-                        .repository
-                        .to_filter_context(Arc::new(view_filter))
-                        .with_write_token(fixture.write_token.share()),
-                );
+                let view_repo =
+                    Arc::new(fixture.repository.to_filter_context(Arc::new(view_filter)));
 
                 Box::pin(merge_main_under_view(
                     &view_repo,
@@ -1028,7 +1084,7 @@ mod tests {
                 let conflict_paths: Vec<_> = diff
                     .conflicts
                     .iter()
-                    .map(|(s, _)| s.path.as_str().to_string())
+                    .map(|(s, _)| s.path().as_str().to_string())
                     .collect();
                 assert!(
                     conflict_paths.iter().any(|p| p == "sub/conflicted.txt"),
@@ -1044,7 +1100,7 @@ mod tests {
                 // the directory's path; the overlap filter strips
                 // them when a conflict overlaps.
                 let dir_delete_in_changes = diff.changes.iter().any(|c| {
-                    c.path.as_str() == "sub" && c.action == FileAction::Delete
+                    c.path().as_str() == "sub" && c.action == FileAction::Delete
                 });
                 assert!(
                     !dir_delete_in_changes,
@@ -1056,7 +1112,7 @@ mod tests {
                 // still be present — it is not in conflict, so it is
                 // a clean delete and stays in changes.
                 let keep_deleted = diff.changes.iter().any(|c| {
-                    c.path.as_str() == "sub/keep.txt"
+                    c.path().as_str() == "sub/keep.txt"
                         && c.action == FileAction::Delete
                 });
                 assert!(
@@ -1151,7 +1207,7 @@ mod tests {
                     .conflicts
                     .iter()
                     .flat_map(|(s, t)| {
-                        vec![s.path.as_str().to_string(), t.path.as_str().to_string()]
+                        vec![s.path().as_str().to_string(), t.path().as_str().to_string()]
                     })
                     .collect();
                 let total_a_mentions = summary.iter().filter(|(p, _)| p == "a.txt").count()
@@ -1238,6 +1294,7 @@ mod tests {
                     target_branch,
                     lore_revision::branch::merge::MergeStartOptions {
                         message: "merge target into source".to_string(),
+                        link_messages: std::collections::HashMap::new(),
                         no_commit: false,
                         scope: lore_revision::branch::merge::MergeScope::MainOnly,
                         inherit_metadata: Default::default(),
@@ -1279,7 +1336,7 @@ mod tests {
                 let conflict_paths: Vec<_> = diff
                     .conflicts
                     .iter()
-                    .map(|(s, _)| s.path.as_str().to_string())
+                    .map(|(s, _)| s.path().as_str().to_string())
                     .collect();
                 assert!(
                     !conflict_paths.iter().any(|p| p == "shared.txt"),
@@ -1292,7 +1349,7 @@ mod tests {
                 let in_changes = diff
                     .changes
                     .iter()
-                    .any(|c| c.path.as_str() == "shared.txt");
+                    .any(|c| c.path().as_str() == "shared.txt");
                 assert!(
                     in_changes,
                     "shared.txt should appear in changes after history-walk resolution; got changes {:?}",

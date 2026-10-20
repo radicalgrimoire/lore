@@ -23,7 +23,6 @@ mod tests {
     use lore_revision::filter::FilterMode;
     use lore_revision::fs::filesystem_provider::FilesystemDiffIntent;
     use lore_revision::fs::filesystem_provider::FilesystemDiffTree;
-    use lore_revision::fs::filesystem_provider::InstanceOperation;
     use lore_revision::interface::ExecutionContext;
     use lore_revision::interface::LoreArray;
     use lore_revision::interface::LoreGlobalArgs;
@@ -48,8 +47,7 @@ mod tests {
             .begin_operation()
             .await
             .expect("Failed to start filesystem operation");
-        let mut changes = Vec::new();
-        state::diff_filesystem(
+        let changes = state::diff_filesystem(
             &operation,
             FilesystemDiffTree {
                 repository: repository.clone(),
@@ -63,18 +61,77 @@ mod tests {
             FilterMode::Full,
             FilesystemDiffIntent::Report,
             Arc::new(Vec::new()),
-            &mut changes,
         )
+        .await
+        .expect("Failed to diff filesystem")
+        .collect()
         .await
         .expect("Failed to diff filesystem");
         operation
-            .finalize(false)
+            .finalize()
             .await
             .expect("Failed to finish filesystem operation");
         changes
     }
 
     include!("helper.rs");
+
+    /// The repository's own directory is held nowhere, so a reset naming it, in any case and with
+    /// `--purge`, resets nothing and removes nothing. The path never reaches the walk that would
+    /// otherwise take a path the revision holds no node for as an untracked one and delete it.
+    #[tokio::test]
+    async fn reset_purge_of_the_control_directory_path_leaves_it_in_place() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let path = fixture.path.clone();
+
+                test_file_write(&path.join("kept.txt"), b"kept");
+                test_commit_tree(&fixture, "Initial").await;
+
+                let control = path.join(".lore");
+                assert!(
+                    control.join("id").is_file(),
+                    "the fixture's control directory holds the repository id"
+                );
+
+                for spelling in [".lore", ".LORE", ".Lore/id"] {
+                    reset::reset(
+                        repository.clone(),
+                        &fixture.write_token,
+                        LoreArray::from_vec(vec![LoreString::from(
+                            path.join(spelling).to_string_lossy().as_ref(),
+                        )]),
+                        LoreString::default(),
+                        ResetOptions {
+                            purge: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap_or_else(|err| {
+                        panic!("a reset naming {spelling} must succeed, got {err}")
+                    });
+                    assert!(
+                        control.join("id").is_file(),
+                        "{spelling}: the reset removed the control directory"
+                    );
+                }
+                assert!(
+                    path.join("kept.txt").is_file(),
+                    "the content was left alone"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
 
     fn create_file(path: &Path) -> File {
         let mut file = File::options()
@@ -208,10 +265,9 @@ mod tests {
                     layer_messages: std::collections::HashMap::new(),
                     layer: None,
                 };
-                let _signature =
-                    Box::pin(commit::commit(repository.clone(), &write_token, options))
-                        .await
-                        .expect("Failed to commit revision");
+                let _signature = commit::commit_boxed(repository.clone(), &write_token, options)
+                    .await
+                    .expect("Failed to commit revision");
 
                 // Create a new directory
                 // - dir_added
@@ -265,7 +321,7 @@ mod tests {
                 );
 
                 let (current_revision, _current_branch) =
-                    lore_revision::instance::load_current_anchor(&repository)
+                    lore_revision::instance::load_current_anchor_boxed(&repository)
                         .await
                         .expect("Failed to load current anchor");
 
@@ -371,8 +427,6 @@ mod tests {
                         .expect("Could not check the existence of root_file_ignored.txt"),
                     "root_file_ignored.txt was not force purged."
                 );
-
-                let _ = std::fs::remove_dir_all(path.as_path());
             }))
             .await
             .expect("Test task failed");
@@ -457,10 +511,9 @@ mod tests {
                     layer_messages: std::collections::HashMap::new(),
                     layer: None,
                 };
-                let _signature =
-                    Box::pin(commit::commit(repository.clone(), &write_token, options))
-                        .await
-                        .expect("Failed to commit revision");
+                let _signature = commit::commit_boxed(repository.clone(), &write_token, options)
+                    .await
+                    .expect("Failed to commit revision");
 
                 // Modify a file
                 // - dir_modified/modified/inner/file_modified.txt
@@ -483,7 +536,7 @@ mod tests {
                 );
 
                 let (current_revision, _current_branch) =
-                    lore_revision::instance::load_current_anchor(&repository)
+                    lore_revision::instance::load_current_anchor_boxed(&repository)
                         .await
                         .expect("Failed to load current anchor");
 
@@ -513,8 +566,6 @@ mod tests {
 
                 // We expect no changes
                 assert_eq!(changes.len(), 0);
-
-                let _ = std::fs::remove_dir_all(path.as_path());
             }))
             .await
             .expect("Test task failed");
@@ -599,10 +650,9 @@ mod tests {
                     layer_messages: std::collections::HashMap::new(),
                     layer: None,
                 };
-                let _signature =
-                    Box::pin(commit::commit(repository.clone(), &write_token, options))
-                        .await
-                        .expect("Failed to commit revision");
+                let _signature = commit::commit_boxed(repository.clone(), &write_token, options)
+                    .await
+                    .expect("Failed to commit revision");
 
                 // Modify a file
                 // - dir_modified/modified/inner/file_modified.txt
@@ -649,7 +699,7 @@ mod tests {
                 );
 
                 let (current_revision, _current_branch) =
-                    lore_revision::instance::load_current_anchor(&repository)
+                    lore_revision::instance::load_current_anchor_boxed(&repository)
                         .await
                         .expect("Failed to load current anchor");
 
@@ -662,8 +712,6 @@ mod tests {
 
                 // We expect one change
                 assert_eq!(changes.len(), 1);
-
-                let _ = std::fs::remove_dir_all(path.as_path());
             }))
             .await
             .expect("Test task failed");

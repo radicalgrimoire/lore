@@ -4,8 +4,8 @@
 ///
 /// These tests verify the `Authentication` trait's error handling patterns
 /// that the orchestration layer depends on for identity probing and
-/// authorization exchange. They use `MockAuthentication` registered in the
-/// global authentication registry.
+/// authorization exchange, and the `UserService` lookup beside it. They use
+/// `TestAuthentication` registered in the global scheme registries.
 ///
 /// The original `AuthExchange` trait tests (identity selection, domain
 /// filtering) operated on an in-memory mock of the token store. Those
@@ -21,11 +21,13 @@ mod tests {
     use lore_base::error::NotSupported;
     use lore_revision::lore::RepositoryId;
     use lore_transport::AuthSession;
+    use lore_transport::AuthSessionPoll;
     use lore_transport::Authentication;
     use lore_transport::AuthenticationToken;
     use lore_transport::AuthorizationToken;
     use lore_transport::ProtocolError;
     use lore_transport::ResolvedUser;
+    use lore_transport::UserService;
     use lore_transport::auth::authentication;
 
     struct TestAuthentication {
@@ -78,8 +80,8 @@ mod tests {
             _client_state: &str,
             _session_code: &str,
             _correlation_id: &str,
-        ) -> Result<Option<AuthenticationToken>, ProtocolError> {
-            Ok(None)
+        ) -> Result<AuthSessionPoll, ProtocolError> {
+            Ok(AuthSessionPoll::Pending)
         }
 
         async fn exchange_external_token(
@@ -124,10 +126,13 @@ mod tests {
         ) -> Result<AuthorizationToken, ProtocolError> {
             (self.exchange_result)(RepositoryId::default())
         }
+    }
 
+    #[async_trait]
+    impl UserService for TestAuthentication {
         async fn get_user_info(
             &self,
-            _auth_url: &str,
+            _user_url: &str,
             _authz_token: &str,
             _repository: RepositoryId,
             user_ids: &[String],
@@ -144,7 +149,7 @@ mod tests {
 
         async fn get_user_id(
             &self,
-            _auth_url: &str,
+            _user_url: &str,
             _authz_token: &str,
             _repository: RepositoryId,
             display_name: &str,
@@ -245,47 +250,6 @@ mod tests {
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().is_not_authenticated());
-    }
-
-    #[tokio::test]
-    async fn get_user_info_returns_resolved_users() {
-        let scheme = "test-userinfo";
-        authentication::add(scheme, Arc::new(TestAuthentication::always_succeed())).unwrap();
-
-        let auth = authentication::find(&format!("{scheme}://auth.test.com")).unwrap();
-        let users = auth
-            .get_user_info(
-                &format!("{scheme}://auth.test.com"),
-                "authz-tok",
-                RepositoryId::default(),
-                &["u1".into(), "u2".into()],
-                "corr",
-            )
-            .await
-            .unwrap();
-        assert_eq!(users.len(), 2);
-        assert_eq!(users[0].user_id, "u1");
-        assert_eq!(users[1].user_name, "User u2");
-    }
-
-    #[tokio::test]
-    async fn get_user_id_returns_resolved_user() {
-        let scheme = "test-userid";
-        authentication::add(scheme, Arc::new(TestAuthentication::always_succeed())).unwrap();
-
-        let auth = authentication::find(&format!("{scheme}://auth.test.com")).unwrap();
-        let user = auth
-            .get_user_id(
-                &format!("{scheme}://auth.test.com"),
-                "authz-tok",
-                RepositoryId::default(),
-                "Alice",
-                "corr",
-            )
-            .await
-            .unwrap();
-        assert!(user.is_some());
-        assert_eq!(user.unwrap().user_id, "id-for-Alice");
     }
 
     #[tokio::test]

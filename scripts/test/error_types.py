@@ -142,6 +142,9 @@ class NothingStagedError(LoreException): ...
 class LinkConflicts(LoreException): ...
 
 
+class UnresolvedConflictError(CommitFailed): ...
+
+
 class NotALinkError(LoreException): ...
 
 
@@ -181,6 +184,12 @@ class SwfsOutsideServiceError(LoreException): ...
 
 
 ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
+    # A refused revision specifier carries "Failed to find revision" on its
+    # trace, which a pattern below matches, so the refusal is named here by the
+    # one string only it carries rather than by the generic "Operation not
+    # supported" further down.
+    ("partial revision hash signature", NotSupportedError),
+    ("is still in conflict", UnresolvedConflictError),
     ("Unable to commit", CommitFailed),
     (
         "Target branch to merge into has a newer revision, merge target branch first",
@@ -248,6 +257,7 @@ ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
         "Attempting to create an SWFS instance outside the service",
         SwfsOutsideServiceError,
     ),
+    ("invalid arguments:", ImproperArgumentsError),
 ]
 
 

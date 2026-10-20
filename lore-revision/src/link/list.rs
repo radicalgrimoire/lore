@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 
 use super::LinkError;
@@ -62,19 +61,19 @@ async fn list_recursive(
             .await
             .forward::<LinkError>("Specified node is not a link node")?;
 
-        let link_context = Arc::new(repository.to_link_context(link_reference.repository).await);
+        let full_path = if path_prefix.is_empty() {
+            local_path
+        } else {
+            format!("{path_prefix}/{local_path}")
+        };
+
+        let link_context = repository.to_link_context(link_reference.repository).await;
 
         let resolved_branch = link_reference.resolve_branch(parent_branch);
 
         let described =
             super::describe_link(link_context.clone(), link_reference.signature, &local_node)
                 .await?;
-
-        let full_path = if path_prefix.is_empty() {
-            local_path
-        } else {
-            format!("{path_prefix}/{local_path}")
-        };
 
         event::LoreEvent::LinkEntry(LoreLinkEntryEventData {
             link: link_reference.repository,
@@ -108,7 +107,7 @@ async fn list_recursive(
 
 /// Data for an event describing a link that has staged changes.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLinkStagedEntryEventData {
     /// Path of the link within the parent repository.
@@ -189,7 +188,7 @@ async fn list_staged_recursive(
             format!("{path_prefix}/{local_path}")
         };
 
-        let link_repository = Arc::new(repository.to_link_context(link_ref.repository).await);
+        let link_repository = repository.to_link_context(link_ref.repository).await;
         let link_state = State::deserialize(link_repository.clone(), link_ref.signature)
             .await
             .forward::<LinkError>("Failed deserializing state node block")?;

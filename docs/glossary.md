@@ -37,6 +37,12 @@ A named, mutable pointer to its latest revision in the revision graph — Lore's
 
 Also see: latest, revision graph.
 
+### Branch point
+
+The revision a branch was created at, and the last one it shares with the branch it was created from. A branch point identifies the branch it was created on, and can also identify the child branch by naming that child branch.
+
+Also see: branch, revision identifier.
+
 ## C
 
 ### CDC
@@ -290,7 +296,7 @@ Also see: sync.
 
 ### Repository instance
 
-A local working directory of a repository, with its own working tree, view, and staged state, identified by a UUIDv7 in `.lore/instance`. Multiple instances can share one shared store on a machine while keeping independent state. Created by `lore clone`.
+A local working directory of a repository, with its own working tree, view, and staged state, identified by a UUIDv7 in `.lore/instance`. Multiple instances can share one shared store on a machine while keeping independent state. Created by `lore clone`. Closest Git analog: worktree, but every instance is a peer and none is a main repository; see [Run parallel instances over a shared store](how-to/run-parallel-instances-over-a-shared-store.md).
 
 Also see: shared store, working tree.
 
@@ -307,6 +313,16 @@ Also see: revision graph, merge revision.
 The directed acyclic graph (DAG) of revisions, in which every edge is a cryptographic parent link. Branches are named pointers into this graph; merge, rebase, and cherry-pick produce new nodes in it.
 
 Also see: revision, branch.
+
+### Revision identifier
+
+How a revision is named to a command or across the API: its whole 64-character hash signature, `[branch]@<number>`, `[branch]@LATEST`, or `<branch>@<hash>`. The `@` is optional, a target given without it applying to the branch the instance is on.
+
+A revision identifies the branch it was created on. A branch point can also identify the child branch by naming that child branch.
+
+A `~<count>` suffix walks that many parent revisions from the revision named. A partial hash signature is not an identifier.
+
+Also see: revision, branch, latest.
 
 ## S
 

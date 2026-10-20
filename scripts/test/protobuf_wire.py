@@ -50,6 +50,19 @@ def encode_bytes_field(field_number: int, value: bytes) -> bytes:
     )
 
 
+def encode_string_field(field_number: int, value: str) -> bytes:
+    """Encode one `string` field."""
+    return encode_bytes_field(field_number, value.encode("utf-8"))
+
+
+def encode_varint_field(field_number: int, value: int) -> bytes:
+    """Encode one varint field (int32/int64/bool/enum). Negative values use the
+    standard protobuf two's-complement 64-bit encoding."""
+    if value < 0:
+        value += 1 << 64
+    return _encode_varint(field_number << 3 | _WIRE_VARINT) + _encode_varint(value)
+
+
 def parse_fields(message: bytes) -> Fields:
     """Split a message into `{field_number: [values]}`, repeated fields in wire
     order. Varint and fixed-width fields decode to ints, length-delimited fields
@@ -79,6 +92,22 @@ def parse_fields(message: bytes) -> Fields:
     return fields
 
 
+def field_packed_ints(fields: Fields, field_number: int) -> list[int]:
+    """Values of a repeated varint field (int32/int64/enum), packed into one
+    length-delimited field, as proto3 writes it, or one field per value; absent
+    reads back as empty."""
+    values = []
+    for value in fields.get(field_number, []):
+        if isinstance(value, int):
+            values.append(value)
+            continue
+        pos = 0
+        while pos < len(value):
+            item, pos = _read_varint(value, pos)
+            values.append(item)
+    return values
+
+
 def field_int(fields: Fields, field_number: int) -> int:
     """Value of a varint field. A proto3 field carrying its type's default is
     not put on the wire, so an absent field reads back as 0."""
@@ -105,6 +134,19 @@ def field_bytes(fields: Fields, field_number: int) -> bytes:
     if not isinstance(value, bytes):
         raise TypeError(f"Field {field_number} is a varint, not bytes")
     return value
+
+
+def field_message(fields: Fields, field_number: int) -> Fields | None:
+    """Parsed fields of a nested message field, or None when it is absent. A
+    message field has no default to stand in for "unset", so a caller can tell
+    an unset field from one carrying a message of all defaults."""
+    values = fields.get(field_number)
+    if not values:
+        return None
+    value = values[-1]
+    if not isinstance(value, bytes):
+        raise TypeError(f"Field {field_number} is a varint, not a message")
+    return parse_fields(value)
 
 
 def field_string(fields: Fields, field_number: int) -> str:

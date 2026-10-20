@@ -132,7 +132,7 @@ impl CompareAndSwapCondition {
         //
         // The previous condition (`attribute_not_exists(pk) AND attribute_not_exists(sk)`)
         // only matched the first case. When E.G. `branch::create` is called for a default branch
-        // with no commits it writes {value=0000…} via compare_and_swap(expected=0, value=0),
+        // with no revisions it writes {value=0000…} via compare_and_swap(expected=0, value=0),
         // creating the row. Subsequent pushes then call compare_and_swap(expected=0, value=X)
         // and found the condition failing (row exists), DynamoDB returning the existing
         // {value=0000…} via AllOld, and the code incorrectly interpreting previous==expected
@@ -511,6 +511,16 @@ impl AwsMutableStore {
 
 #[async_trait]
 impl MutableStoreTrait for AwsMutableStore {
+    /// Nothing on disk to claim.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        Ok(None)
+    }
+
     #[lore_macro::lore_instrument]
     #[tracing::instrument(name= "AwsMutableStore::list" skip(self))]
     async fn list(

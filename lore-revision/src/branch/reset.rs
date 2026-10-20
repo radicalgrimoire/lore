@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 
 use crate::branch;
@@ -96,7 +95,7 @@ impl EventError for ResetError {
 
 /// Event data reported when a branch is reset to a revision.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchResetEventData {
     /// Branch identifier.
@@ -172,14 +171,14 @@ pub async fn reset(
         branch_stack[0].revision
     };
 
-    let revision = revision::resolve(
+    let resolved = revision::resolve_in_branch(
         repository.clone(),
         revision.as_str(),
-        global.search_limit(),
         global.search_location(),
     )
     .await
     .forward::<ResetError>("resolving revision")?;
+    let revision = resolved.revision;
 
     let state = state::State::deserialize(repository.clone(), revision)
         .await

@@ -9,13 +9,12 @@ use tracing::Span;
 use tracing::debug;
 
 use super::jwt::JwtVerifier;
-use super::jwt::verify_authorization;
 use crate::auth::jwt::AuthorizationToken;
-use crate::grpc::get_repository;
+use crate::authnz::repository_authorizer::RawToken;
 
 fn add_auth_fields_to_current_span(auth: &AuthorizationToken) {
     let span = Span::current();
-    span.record(USER_ID, auth.user_id.clone());
+    span.record(USER_ID, auth.identity().to_string());
 }
 
 /// Resolve the bearer token to an [`AuthorizationToken`]. The cached signing key serves the
@@ -42,15 +41,22 @@ fn authorize(verifier: &JwtVerifier, token: &str) -> Result<AuthorizationToken, 
     })
 }
 
+/// Authentication only: verifies the signature, parses the bearer token claims, and hands
+/// the verified halves to the handler as extensions ([`RawToken`] for the raw token
+/// string, and [`AuthorizationToken`] for the parsed claims).
+///
+/// With no verifier (no `[server.auth]`), every request passes through untouched: no
+/// bearer token is required, one that is present is not read, and no extension is
+/// inserted.
 #[derive(Clone)]
 pub struct JWTInterceptor {
-    jwt_verifier: JwtVerifier,
+    jwt_verifier: Option<JwtVerifier>,
 }
 
 impl JWTInterceptor {
-    pub fn new(jwt_verifier: &JwtVerifier) -> Self {
+    pub fn new(jwt_verifier: Option<&JwtVerifier>) -> Self {
         Self {
-            jwt_verifier: jwt_verifier.clone(),
+            jwt_verifier: jwt_verifier.cloned(),
         }
     }
 }
@@ -60,49 +66,18 @@ impl Interceptor for JWTInterceptor {
         &mut self,
         mut request: tonic::Request<()>,
     ) -> Result<tonic::Request<()>, tonic::Status> {
+        let Some(jwt_verifier) = &self.jwt_verifier else {
+            return Ok(request);
+        };
+
         let token = extract_bearer_token(request.metadata()).ok_or(
             tonic::Status::unauthenticated("authorization header required"),
         )?;
 
-        let authorization = authorize(&self.jwt_verifier, &token)?;
+        let authorization = authorize(jwt_verifier, &token)?;
         add_auth_fields_to_current_span(&authorization);
 
-        let repository = get_repository(request.metadata()).unwrap_or_default();
-        verify_authorization(&authorization, repository)
-            .map_err(|_err| crate::grpc::no_repository_access_status())?;
-
-        request.extensions_mut().insert(authorization);
-
-        Ok(request)
-    }
-}
-
-#[derive(Clone)]
-pub struct JWTAuthnInterceptor {
-    jwt_verifier: JwtVerifier,
-}
-
-impl JWTAuthnInterceptor {
-    pub fn new(jwt_verifier: &JwtVerifier) -> Self {
-        Self {
-            jwt_verifier: jwt_verifier.clone(),
-        }
-    }
-}
-
-impl Interceptor for JWTAuthnInterceptor {
-    fn call(
-        &mut self,
-        mut request: tonic::Request<()>,
-    ) -> Result<tonic::Request<()>, tonic::Status> {
-        let token = extract_bearer_token(request.metadata()).ok_or(
-            tonic::Status::unauthenticated("authorization header required"),
-        )?;
-
-        // TODO(UCS-13506): Placeholder authn verifier until separate authz flow for repository service is in place
-        let authorization = authorize(&self.jwt_verifier, &token)?;
-        add_auth_fields_to_current_span(&authorization);
-
+        request.extensions_mut().insert(RawToken(token));
         request.extensions_mut().insert(authorization);
 
         Ok(request)

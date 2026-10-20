@@ -5,7 +5,7 @@ authors:
   - Hannes Muurinen
 status: Approved
 created: 2026-08-20
-updated: 2026-09-01
+updated: 2026-10-15
 discussion: https://crowd.urc.internal.epicgames.net/epic/Lore/change-request/412
 ---
 
@@ -49,7 +49,7 @@ The most important changes from the current scheme:
 - **Migration is gradual and revertible.** The old and new paths run side by side through phased
   rollout, existing deployments keep working untouched, and the gRPC API retires only when its
   last client moves. While a server advertises both paths, a client-side flag picks which one a
-  caller takes, so a deployment can keep its fleet on the legacy path while individual users and CI
+  caller takes, so a deployment can keep its fleet on the gRPC path while individual users and CI
   jobs test the new one against the same server (D2).
 
 The rest of this document gives the technical design: the required OIDC provider capability profile
@@ -310,9 +310,10 @@ The tokens themselves need three properties:
   the `root_domains` claim (D5). An audience that already carries a domain suffix keeps working
   unchanged.
 
-The permission and directory RPCs do not move. `CheckUserPermission` and `LookupUserPermissions`
-stay behind `RepositoryAuthorizer` and `RepositoryDirectory` (D7, D8), and `GetUserInfo` and
-`GetUserId` behind `UserDirectory` (D7).
+The permission and directory RPCs do not move onto the OIDC endpoints. `CheckUserPermission`
+and `LookupUserPermissions` stay behind `RepositoryAuthorizer` and `RepositoryCatalog` (D7, D8),
+and `GetUserInfo` and `GetUserId` behind `UserService` (D7). The three directory RPCs are
+extracted out of `UrcAuthApi` into a gRPC API of their own, `lore.user.v1.UserService`.
 
 Both interfaces run side by side for the whole migration. The gRPC API keeps serving clients that
 have not moved, the standard endpoints serve the ones that have, and the gRPC API retires only
@@ -445,26 +446,32 @@ discriminates: deployments advertise `https://` URLs, and `https` is registered 
 fallback to `UcsAuthentication`, so an OIDC issuer, which is an `https://` URL by definition, cannot
 be told apart by scheme. Selection therefore keys on the presence of `oidc_issuer` below, gated
 during the migration by the opt-in described at the end of this section, and the scheme registry
-keeps serving the legacy path only.
+keeps serving the gRPC path only.
 
-`lore.environment.v1.Endpoint`
-([`environment.proto`](../../lore-proto/proto/lore/environment/v1/environment.proto)) gains fields,
-all additive. This is the message the current client reads, through
-[`environment_client.rs`](../../lore-transport/src/grpc/environment_client.rs). The server populates
-them from `[environment.endpoint]`, the same table that holds `auth_url` today, so these are what
-an operator advertises rather than what the server enforces. The enforcement settings are
-`[server.auth]` in D8.
+`lore.environment.v1.Environment`
+([`environment.proto`](../../lore-proto/proto/lore/environment/v1/environment.proto)) gains an
+`oidc` field carrying a new `Oidc` message, all additive. This is the message the current client
+reads, through [`environment_client.rs`](../../lore-transport/src/grpc/environment_client.rs).
+`Endpoint` keeps describing only where services live. The server builds the message at startup
+from `[server.auth]`, the settings it verifies tokens with (D8), and from the issuer's discovery
+document. What `[server.auth]` does not already hold is in a new `[server.auth.oidc]` table.
+The rest of this proposal calls the first four fields
+`oidc_issuer`, `oidc_client_id`, `oidc_scopes` and `oidc_preferred`.
 
-| Field | Meaning |
-| --- | --- |
-| `oidc_issuer` | Issuer URL. The client fetches `<issuer>/.well-known/openid-configuration`. |
-| `oidc_client_id` | The public client ID Lorelib presents. |
-| `oidc_scopes` | Default scopes to request. |
-| `oidc_preferred` | Whether a client that expresses no preference should take the OIDC path. Absent or false keeps it on `auth_url` while both are advertised. |
-| `resource_template` | How to name a partition as an [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) resource, for example `https://lore.example.com/partitions/{id}`. The standard form and the default. |
-| `scope_template` | How to name a partition as a scope value instead, for example `partition:{id}`. For providers that reject `resource` or never see it on the exchange grant. |
-| `token_exchange_issuer` | The [RFC 8693](https://www.rfc-editor.org/rfc/rfc8693) endpoint to exchange against, whether that is the provider itself or a separate token service. |
-| `identity_claim` | The claim clients record as the user identity, `sub` by default (D7). Advertised so every client records the same form. |
+| `Oidc` field | Source | Meaning |
+| --- | --- | --- |
+| `issuer` | The first `[server.auth] jwt_issuer` entry, once its discovery document names the same issuer | Issuer URL. The client fetches `<issuer>/.well-known/openid-configuration`. |
+| `client_id` | `[server.auth.oidc]` | The public client ID Lorelib presents. |
+| `scopes` | `[server.auth.oidc]` | Default scopes to request. |
+| `preferred` | `[server.auth.oidc]` | Whether a client that expresses no preference should take the OIDC path. Absent or false keeps it on `auth_url` while both are advertised. |
+| `resource_template` | `[server.auth.oidc]` | How to name a partition as an [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) resource, for example `https://lore.example.com/partitions/{id}`. The standard form and the default. |
+| `scope_template` | `[server.auth.oidc]` | How to name a partition as a scope value instead, for example `partition:{id}`. For providers that reject `resource` or never see it on the exchange grant. |
+| `token_exchange_issuer` | `[server.auth.oidc]` | The [RFC 8693](https://www.rfc-editor.org/rfc/rfc8693) endpoint to exchange against, whether that is the provider itself or a separate token service. |
+| `identity_claim` | none | Reserved: a deprecated field the server leaves empty and the client ignores. The identity is read from the token itself, its `identity` claim or else `sub` (D7). |
+
+`Endpoint` gains `user_url`, from `[environment.endpoint]`: the user directory clients resolve
+names at, over `lore.user.v1.UserService` (D7). Independent of the auth path, so an OIDC deployment can
+advertise a directory without a gRPC auth service.
 
 The list of hosts a token may be sent to is deliberately *not* advertised here: it comes from the
 issuer-signed token, because the environment response is served by the same party a stolen token
@@ -510,18 +517,18 @@ The Lore server runs the same fetch against `jwt_issuer` to resolve `jwks_uri`, 
 
 A server on phases 3 and 4 advertises `auth_url` and `oidc_issuer` at once. Taking the OIDC path
 just because it is advertised would move a whole fleet the moment an operator adds the field, so a
-client-side setting, `auth_mode`, chooses instead. It takes `legacy`, `oidc` or `auto`, and `auto`
+client-side setting, `auth_mode`, chooses instead. It takes `grpc`, `oidc` or `auto`, and `auto`
 follows the new `oidc_preferred` field in the environment response. An operator therefore leaves
-the default on the legacy path while a few people test the new one, then flips the whole fleet
+the default on the gRPC path while a few people test the new one, then flips the whole fleet
 without a client release. Asking for a path the server does not advertise is a configuration error
 rather than a silent fall back to the other one.
 
 `auth_mode` is a global CLI flag rather than a `lore login` flag, since every operation that
-touches auth needs it, and it reads from `LORE_AUTH_MODE` and the per-user `config.toml` as well,
-so a tester opts in once instead of per command. The library carries the same value in
-`LoreGlobalArgs`, which is what lets one CI job or one embedding move on its own. The token store
-keys entries by the endpoint that issued them, so a switch in either direction leaves the other
-path's credentials intact. The setting retires with the legacy path in phase 5.
+touches auth needs it, and it reads from `LORE_AUTH_MODE` as well, so a tester opts in once per
+shell instead of per command. The library carries the
+same value in `LoreGlobalArgs`, which is what lets one CI job or one embedding move on its own.
+The token store keys entries by the endpoint that issued them, so a switch in either direction
+leaves the other path's credentials intact. The setting retires with the gRPC path in phase 5.
 
 ### D3. Standard grants replace the custom RPCs
 
@@ -536,7 +543,7 @@ path's credentials intact. The setting retires with the legacy path in phase 5.
 | `RefreshAuthSession` | `refresh_token` grant. Fills in `Authentication::refresh_authentication`, which currently returns `NotSupported`. |
 | `GetUserInfo`, `GetUserId`, `GetProviderUserId` | Moves off the auth path entirely, see D7. `GetProviderUserId` maps an internal ID to the upstream provider's ID. With an external issuer the provider's `sub` *is* the ID, so it has no successor. |
 | `CheckUserPermission` | Stays as a `RepositoryAuthorizer` implementation rather than part of the standard set, see D8. |
-| `LookupUserPermissions` | A paginated search over a permission store, which no standard endpoint offers. Moves to the optional `RepositoryDirectory` trait, see D7. |
+| `LookupUserPermissions` | A paginated search over a permission store, which no standard endpoint offers. Moves to the optional `RepositoryCatalog` trait, see D7. |
 | `VerifyUser` | Asserts a user satisfies a named compliance requirement. No OAuth 2.0 equivalent, and no caller in this repository, so it gets no successor until one is needed. A deployment that needs it grants an action and checks it through `RepositoryAuthorizer`, the way `obliterate` works (D4, D8). |
 | `HealthCheck` | No successor needed. The provider's discovery document serves as the liveness probe. |
 | (new) | [RFC 7009](https://www.rfc-editor.org/rfc/rfc7009) revocation on `lore auth logout`. |
@@ -639,7 +646,7 @@ where a CI instance authenticates with a client id and secret.
 
 | Custom claim | Replacement |
 | --- | --- |
-| `resources: [{resource_id, permission}]` | A namespaced custom claim carrying `{resource, actions}` entries, the same structure under a name a provider can be configured to emit. `resource_claim` names the claim and `permission_claim` names the actions within it. The same two settings answer the Tier 1 case, where actions are read without a resource beside them (D8). See below. |
+| `resources: [{resource_id, permission}]` | A namespaced custom claim carrying `{resource, actions}` entries, the same structure under names a provider can be configured to emit. `resource_claim` names the claim, `resource_id_claim` names the resource field within an entry (`resource_id` by default) and `permission_claim` names the actions (`permission` by default). All three field names are configuration because some providers cannot change their entry shape — Keycloak's UMA `permissions` entries carry `rsname` and `scopes` — and configuring only some of the shape would be worse than configuring none of it. `permission_claim` also answers the Tier 1 case, where actions are read without a resource beside them (D8). See below. |
 | `is_service_account` | Dropped from the server's decision path. Every reader becomes an action check through `RepositoryAuthorizer` (D8), the way obliterate already works. See below. |
 | `name`, `preferred_username` | Already standard OIDC claims. Made optional (D6). |
 | `env` | Unused in any decision path. Dropped. |
@@ -669,8 +676,8 @@ a token without it keeps verifying (D6).
 The resource claim is Tier 2's mechanism, and Tier 1 reads no resource claim at all (D1). Both
 tiers answer the same *question*: `check_repository_access(token, repository, action)` is asked
 identically at every enforcement point, and the tier decides who answers it. Under Tier 2
-`TokenClaimsRepositoryAuthorizer` answers from this claim. Under Tier 1
-`TokenRolesRepositoryAuthorizer` answers the same question from a global action set read out of a
+`ResourceGrantsAuthorizer` answers from this claim. Under Tier 1
+`GlobalGrantsAuthorizer` answers the same question from a global action set read out of a
 role or group claim, ignoring which partition was asked about (D8). The action vocabulary is
 common to both tiers. What differs is whether an action is scoped to a partition or held
 everywhere.
@@ -804,13 +811,13 @@ grant space, or to resolve an identifier that is not the bearer's. Both therefor
 authentication path onto optional traits with a degraded default, rather than being forced into a
 mechanism that cannot hold them.
 
-#### The user directory
+#### The user service
 
 `GetUserInfo` resolves a batch of user IDs to display names, and `GetUserId` resolves the reverse.
 OIDC has no equivalent, because `/userinfo` describes only the bearer. Nothing in the standard set
 replaces these.
 
-The design moves them off the `Authentication` trait onto a separate optional `UserDirectory`
+The design moves them off the `Authentication` trait onto a separate optional `UserService`
 trait. The default implementation answers from the token's own `name` and `preferred_username`
 claims for the current user, and returns the raw ID for anyone else. The CLI already degrades to
 printing the ID when no name resolves
@@ -824,23 +831,44 @@ name (`created_by` and its siblings in
 be unmapped from a person without rewriting history.
 
 The directory lookup therefore stays a real dependency for any deployment that wants names, and
-OIDC does not supply one. Deployments with a directory can implement `UserDirectory` over it, SCIM
+OIDC does not supply one. Deployments with a directory can implement `UserService` over it, SCIM
 2.0 being the nearest standard, but out of scope for this change. Deployments without a
-`UserDirectory` implementation show identifiers.
+`UserService` implementation show identifiers.
 
-There is a third position for deployments that do not need the unmapping property: record a
-human-readable claim as the identity itself. Nothing in the protocol constrains what `created_by`
-holds, so a setting, `identity_claim`, names the claim used as the user identity, `sub` by
-default, `preferred_username` for a deployment that wants readable history with no directory at
-all. The server advertises the value in the environment response so every client records the
-same form (D2), and reads it from `[server.auth]` for its own creator and ownership comparisons
-(D8). The same setting serves providers whose `sub` is a poor durable identity, such as Entra ID,
-where `sub` is pairwise per client application and the stable identifier is `oid`. Choosing a
-human-readable claim is an explicit opt-in with two costs: names become permanent in history, and
-claims other than `sub` are not guaranteed unique or immutable, so a rename forks a user's
-identity and a reused username collides with its previous holder.
+The lookup runs on the client and bypasses the Lore server, which keeps personal information out
+of it. So the server advertises the directory on the endpoint, and the client picks the
+`UserService` implementation from what is advertised:
 
-#### The repository directory
+- `user_url` set: `lore.user.v1.UserService` at `user_url`.
+- Otherwise `auth_url` set: the legacy `GetUserInfo` and `GetUserId` RPCs at `auth_url`.
+- Neither: the token-only default above.
+
+The directory's host must be under a domain that is found in one of the token's `aud` names.
+
+The directory operations outlive the auth service, so they get a gRPC API of their own,
+`lore.user.v1.UserService`. It has `UserGet` (IDs to users), `UserFind` (a username or a display
+name to users) and `PartitionList` (the partitions the caller holds permissions on), in the
+vocabulary of the other `lore.*.v1` APIs.
+
+**The user identity is read from the token.** Lore records a user as one string, in `created_by`
+and wherever else an identity is compared. Client and server take that string from the token's
+claims by the same rule: the first of these names the token carries decides.
+
+1. `identity`.
+2. `https://lore.org/claims/identity`, the namespaced alias for providers that require
+   namespaced custom claims.
+3. `sub`.
+
+A provider whose `sub` is a good unique identity doesn't need any extra configuration. A provider
+whose `sub` is not useful as a user ID can map any value it wants into `identity` claim. Entra ID,
+whose `sub` differs per client application, can map the stable `oid` as `identity` by configuring
+a claim mapping rule. Also a deployment that wants readable history without a user directory can
+map `preferred_username` into `identity`. A deployment where no single claim is unique can map a
+composition such as `tid:oid`.
+
+Only the first name present is read. If its value is empty or not a string, the token is invalid.
+
+#### The repository catalog
 
 `lore repo list` resolves "which partitions may I see" through `LookupUserPermissions`, in both
 the [v0](../../lore-server/src/grpc/handlers/repository_list.rs) and
@@ -851,12 +879,24 @@ filter: it is a search over a permission store, not a question about the caller'
 No token can answer it. A Tier 2 access token contains one partition, because Lorelib
 requests exactly one resource per exchange (D1), and `lore repo list` has no partition
 to exchange for in the first place, since discovering them is the point of the
-call. Enumeration therefore requires its own optional trait, `RepositoryDirectory`.
+call. Enumeration therefore requires its own optional trait, `RepositoryCatalog`.
 
-The default implementation answers from `baseline_access` (D8): `reachable`, the default, lists
-every partition the server holds, and `denied` lists none. That setting exists for this trait
+The default implementation answers from `baseline_access` (D8): `denied`, the default, lists
+none, and `reachable` lists every partition the server holds. The secure option is the default
+so the disclosing one is an explicit choice. A server with no `[server.auth]` at all keeps
+listing everything it holds, as a local server does today. That setting exists for this trait
 alone and gates no access decision. A `UrcAuthApi` deployment gets an implementation that calls
 `LookupUserPermissions` and behaves exactly as today.
+
+The choice is not bound to the authorizer. `repository_catalog` in `[server.auth]` names the
+catalog (`baseline` or `auth_service`) and `repository_catalog_url` the endpoint the auth-service
+catalog asks; absent, the catalog follows `auth_url`, set meaning the auth service and unset the
+baseline. So a Tier 1 or Tier 2 deployment whose auth service accepts its tokens keeps the
+`LookupUserPermissions` catalog, and a `UrcAuthApi` deployment can list from the store instead.
+The catalog forwards the caller's own token, so the endpoint has to accept the tokens the server
+verifies. No client-side check is needed for that forwarding: the client's send-check (D5)
+already confines a token to servers under its `aud`, and the server it reaches holds the token
+in full either way.
 
 `reachable` enumerates through the path `lore repo list` already takes when no auth service is
 configured, `list_local` over `KeyType::RepositoryId`
@@ -909,13 +949,13 @@ that. So when `jwt_issuer` holds an https URL the server fetches
 `iss` against the same value. `[server.auth.jwk].endpoint` stays as the override for providers with
 non-standard discovery.
 
-`[server.auth]` therefore gains `permission_claim`, `baseline_access`, `resource_claim`,
-`resource_id_template`, `resource_wildcard` and `identity_claim` (D7, `sub` by default, compared
-wherever the server checks a recorded identity). `permission_claim` is exercised from phase 2
-onwards, because it is what Tier 1 runs on. `baseline_access` steers only what the default
-`RepositoryDirectory` lists (D7), never an access decision. The other three only matter
-once a per-partition claim is in play, so phase 4 for a new deployment and immediately for a
-`UrcAuthApi` one. There is no service-account setting, because D4 turned that check into two
+`[server.auth]` therefore gains `permission_claim`, `baseline_access`, `repository_catalog`,
+`repository_catalog_url`, `resource_claim`, `resource_id_claim`, `resource_id_template` and
+`resource_wildcard`.  `permission_claim` is
+exercised from phase 2 onwards, because it is what Tier 1 runs on. `baseline_access` steers only
+what the default `RepositoryCatalog` lists (D7), never an access decision. The other four only
+matter once a per-partition claim is in play, so phase 4 for a new deployment and immediately for
+a `UrcAuthApi` one. There is no service-account setting, because D4 turned that check into two
 ordinary actions.
 
 #### `RepositoryAuthorizer` answers every partition question
@@ -954,9 +994,9 @@ Two changes from today's `check_repository_access(authorization: Option<String>,
 
 The two implementations:
 
-- `TokenClaimsRepositoryAuthorizer` answers from the token's resource claim with no network call.
+- `ResourceGrantsAuthorizer` answers from the token's resource claim with no network call.
   **Tier 2 only.** It consumes the per-partition scoping that tier exists to produce.
-- `TokenRolesRepositoryAuthorizer` answers from a *global* action set read out of a role or group
+- `GlobalGrantsAuthorizer` answers from a *global* action set read out of a role or group
   claim, ignoring the repository parameter entirely. **This is Tier 1's authorizer.** Without it
   Tier 1 would fall through to `AllowAllRepositoryAuthorizer`, which is not an acceptable default
   for a tier meant for real deployments.
@@ -969,17 +1009,18 @@ flowchart TD
     A -- yes --> B{"legacy UrcAuthApi deployment?"}
     B -- yes --> AC["AuthClientAuthorizer<br/>online CheckUserPermission call per check"]
     B -- no --> C{"resource_claim set?"}
-    C -- "yes (Tier 2)" --> TC["TokenClaimsRepositoryAuthorizer<br/>per-partition grants read from the resource claim"]
-    C -- "no (Tier 1)" --> TR["TokenRolesRepositoryAuthorizer<br/>global actions read from permission_claim"]
+    C -- "yes (Tier 2)" --> TC["ResourceGrantsAuthorizer<br/>per-partition grants read from the resource claim"]
+    C -- "no (Tier 1)" --> TR["GlobalGrantsAuthorizer<br/>global actions read from permission_claim"]
 ```
 
 #### Tier 2 authorizes from the resource claim
 
 The decision rule is D4's claim model applied per call. `check_repository_access(token, p,
 action)` reads the claim named by `resource_claim` and looks for an entry matching partition
-`p`. An entry matches when its resource equals what `resource_id_template` renders for `p`, or
-equals the configured `resource_wildcard`. No matching entry means denied. When the call names
-an action, the matching entry's `permission_claim` values must also include that action.
+`p`. An entry matches when its resource — the entry field named by `resource_id_claim`,
+`resource_id` by default — equals what `resource_id_template` renders for `p`, or equals the
+configured `resource_wildcard`. No matching entry means denied. When the call names an action,
+the matching entries' `permission_claim` values, merged, must also include that action.
 
 Under Tier 2 access to all partitions needs to be allowed explicitly. A token with no entry
 for a partition cannot touch it, plain reads included. A client that has not exchanged for a
@@ -1009,7 +1050,9 @@ in `[server.auth]` but touches listing only:
 | --- | --- |
 | `permission_claim` | Dotted path to the actions claim, for example `realm_access.roles` on Keycloak or `groups` on Dex. Claim values are action names. |
 | `resource_claim` | Present means Tier 2, and actions are scoped by the resource beside them. Absent means the `permission_claim` actions are global, which is Tier 1. |
-| `baseline_access` | What the default `RepositoryDirectory` (D7) lists when no custom implementation is configured. `reachable`, the default, lists every repository the server holds, which is today's behavior. `denied` lists none. It gates no access decision. |
+| `baseline_access` | What the default `RepositoryCatalog` (D7) lists when no custom implementation is configured. `denied`, the default, lists none. `reachable` lists every repository the server holds. It gates no access decision. |
+| `repository_catalog` | Which catalog (D7) answers the listing: `baseline`, per `baseline_access`, or `auth_service`, a `UrcAuthApi` service's `LookupUserPermissions`. Absent, `auth_service` when `auth_url` is set and `baseline` otherwise. |
+| `repository_catalog_url` | The endpoint the `auth_service` catalog asks, `auth_url` by default. It receives the caller's token, so it must accept the tokens this server verifies. |
 
 A deployment that configures `[server.auth]` but no `permission_claim` leaves every authenticated
 principal with ordinary access and no admin actions at all. That fails closed on every privileged
@@ -1060,7 +1103,7 @@ Two of these cannot simply await an authorizer.
 `Arc<dyn Fn(RepositoryId) -> bool + Send + Sync>`
 ([`lore-revision/src/state.rs`](../../lore-revision/src/state.rs)), called during revision-graph
 traversal, potentially many times per request. Whatever answers it has to do so without awaiting
-anything. Both tiers can: `TokenRolesRepositoryAuthorizer` and `TokenClaimsRepositoryAuthorizer`
+anything. Both tiers can: `GlobalGrantsAuthorizer` and `ResourceGrantsAuthorizer`
 read a token the interceptor has already verified, so the answer is in memory and the closure needs
 no cache, no preload and no staleness bound.
 
@@ -1070,7 +1113,7 @@ land somewhere that can answer it without blocking. Two placements do, and picki
 be decided at the time of implementation:
 
 - **Keep the check in the interceptor**, against an authorizer that answers from the verified token
-  with no await. `TokenRolesRepositoryAuthorizer` and `TokenClaimsRepositoryAuthorizer` both do,
+  with no await. `GlobalGrantsAuthorizer` and `ResourceGrantsAuthorizer` both do,
   so the check is genuinely synchronous rather than an async block standing in place, and the
   `block_in_place` shape stays confined to the JWKS miss it already covers. The cost is that an
   online authorizer, `AuthClientAuthorizer` included, cannot be reached from here, so a legacy
@@ -1094,6 +1137,26 @@ request performs, so action checks such as `can_admin_lock` stay in handlers eit
 interceptor-resident check covers the plain reachability question only. What this proposal needs is
 that nothing in the current code rules out either placement, and nothing does.
 
+*Resolved 2026-09-15, a third way.* The check landed as an **async tower layer**
+([`partition_access.rs`](../../lore-server/src/grpc/tower/partition_access.rs)) mounted inside
+each partition-scoped service's JWT interceptor. The interceptor placement was only ruled out
+above for being synchronous. A tower `Service` can await, so the online authorizer is reachable
+from a pre-handler check after all, and every RPC of a wrapped service — including ones added
+later — is covered by its registration. The layer reads the partition from the request metadata,
+and does access control to check if the caller is authorized. If there are no partition/repository
+metadata for the call, the middleware doesn't do anything.
+
+Operation-specific permissions can be done in the gRPC handlers. To answer them without a second
+authorizer round trip, the middleware asks the authorizer to enumerate the caller's grants for
+the partition and exposes the enumeration to the handler as a request extension. An authorizer
+that cannot enumerate (a policy engine can answer only "may X do A?" without listing everything
+X may do) is asked the plain reachability question, and handlers fall back to per-action
+authorizer calls. The two constraints above still hold where they must: checks that read the
+request body stay in handlers. The generic handler requires the partition/repository to be
+defined in the headers in a standardized way. The lock action checks, and notification
+subscribe are the current exceptions that authorize calls through a partition declared in the
+request body.
+
 **Notification is the exception either way.** `NotificationService::subscribe`
 ([`notification_service.rs`](../../lore-server/src/grpc/notification_service.rs)) takes the
 partition from `SubscribeRequest.repository`, the request *body*, and registers the stream on that
@@ -1110,21 +1173,22 @@ than requiring a claim for a partition that does not exist.
 
 - **Wire format** — N/A. The QUIC `Authorize` frame's token field is length-prefixed opaque bytes
   and its layout does not change.
-- **Client/server protocols** — `lore.environment.v1.Endpoint` gains eight optional fields, and the
+- **Client/server protocols** — `lore.environment.v1.Environment` gains an optional `oidc`
+  message and `Endpoint` gains `user_url`, and the
   legacy `EnvironmentEndpoint` gains none, so a client on the legacy environment service is
   unaffected by shape as well as by behavior. A client on `v1` that predates the fields ignores
   them and reads `auth_url` as it does now, and a new client falls back to `auth_url` when
   `oidc_issuer` is absent or when the deployment has not made OIDC the default (D2).
   No `UrcAuthApi` method changes. The OIDC client stops calling them. A new
-  client against an old server sees no `oidc_issuer` and uses the legacy path. An old client
-  against a new server works as long as the server keeps its legacy `auth_url` advertised, which the
+  client against an old server sees no `oidc_issuer` and uses the gRPC path. An old client
+  against a new server works as long as the server keeps its gRPC `auth_url` advertised, which the
   migration phases require until the last phase. Two trait signatures change.
-- **What `lore repo list` shows** — A deployment with no `RepositoryDirectory` implementation lists
+- **What `lore repo list` shows** — A deployment with no `RepositoryCatalog` implementation lists
   every partition the server holds rather than the subset the caller was granted (D7). On Tier 1
   those are the same set. On Tier 2 they are not, so a deployment moving from `UrcAuthApi` to a
   stock provider sees the list widen unless it implements the enumeration trait. Operations on a listed
   partition still fail if the caller lacks the grant, so this changes what is visible, not what
-  is permitted. Limiting visibility requires a deployment-specific `RepositoryDirectory` implementation.
+  is permitted. Limiting visibility requires a deployment-specific `RepositoryCatalog` implementation.
   The default answers by enumerating the store, which D7 notes has to stay performant on the AWS
   backend.
 - **When an unauthorized gRPC request fails** — Today an unauthorized request is rejected in the
@@ -1142,12 +1206,12 @@ than requiring a claim for a partition that does not exist.
   it. The
   granted-scope field the refresh path wants is additive and `#[serde(default)]`. An existing
   `tokenstore.toml` parses unchanged, and entries written by the new client and read by an old one
-  lose only that field. Tokens on the legacy path keep working untouched, as does partition
+  lose only that field. Tokens on the gRPC path keep working untouched, as does partition
   data. The legacy `tokens.toml` is already left alone by the current code and stays that way.
 - **CLI and public API** — The CLI gains a global `--auth-mode` flag and the library an `auth_mode`
   field on `LoreGlobalArgs`, both optional and both defaulting to what the server advertises (D2).
   The field appends to `lore_global_args_t`, and a C caller that leaves it unset gets that same
-  default. Both retire with the legacy path in phase 5.
+  default. Both retire with the gRPC path in phase 5.
   `lore login` gains `--client-id` and `--client-secret`, the latter
   reading from an environment variable or stdin rather than taking a literal by default (see
   Security Considerations). No flag selects the grant in phase 3. The device grant serves both the
@@ -1208,8 +1272,8 @@ phase-3 client on Tier 1 reaches the interceptor's services on its first push, a
 query` reaches the repository-query handlers immediately after.
 
 **Phase 3, client OIDC provider, Tier 1.** The OIDC `Authentication` implementation, discovery, the
-device grant, client credentials, refresh, and revocation. Tokens on the legacy path are unaffected.
-The server starts advertising `oidc_issuer` alongside `auth_url`, with the legacy path still the
+device grant, client credentials, refresh, and revocation. Tokens on the gRPC path are unaffected.
+The server starts advertising `oidc_issuer` alongside `auth_url`, with the gRPC path still the
 default for clients that express no preference. Users and CI jobs opt into the new path with
 `auth_mode` (D2), which is how the new implementation gets exercised against a real deployment
 before anyone else moves, and the operator flips the default with `oidc_preferred` when it holds
@@ -1220,15 +1284,15 @@ in parallel for the whole phase, which is what makes rollback cheap: clear `oidc
 A deployment on the custom-issuer variant can advertise `oidc_issuer` only once its auth service
 serves discovery, the device grant and tokens whose `iss` is the issuer URL (D1). That work
 happens outside this repository and needs starting early. Until it lands the deployment stays on
-the legacy path, which this phase leaves fully working.
+the gRPC path, which this phase leaves fully working.
 
 **Phase 4, Tier 2.** Token exchange with resource indicators. Gated per deployment by
 `token_exchange_issuer` and one of the two partition-naming templates (D2), so a deployment that
 sets none of them stays on Tier 1 indefinitely. For a deployment on the custom-issuer variant this
 phase waits on that issuer's exchange grant (D1), and nothing regresses while it is pending: the
-deployment stays on the legacy path or on Tier 1 until the grant is live.
+deployment stays on the gRPC path or on Tier 1 until the grant is live.
 
-**Phase 5, retire the legacy client path.** Only once no supported deployment advertises a
+**Phase 5, retire the gRPC client path.** Only once no supported deployment advertises a
 non-OIDC `auth_url`, and `auth_mode` goes with it. For a deployment still serving
 `UrcAuthApi` the route to that state is the
 custom-issuer variant: the same service adds the standard endpoints (D1) and serves both
@@ -1251,7 +1315,7 @@ here and are the natural follow-up. A deployment that grants a wide suffix is ex
 as it is today.
 
 **Downgrade during migration.** For the duration of phases 3 and 4 a server advertises both a
-legacy `auth_url` and an OIDC issuer, so an attacker who can modify the environment response can
+gRPC `auth_url` and an OIDC issuer, so an attacker who can modify the environment response can
 steer a client to whichever is weaker. The environment endpoint is served over TLS and the client
 validates the certificate, so this needs a compromised transport, the same position from which the
 attacker could strip auth entirely today. An attacker cannot steer a client that pins `auth_mode`
@@ -1289,13 +1353,14 @@ The action parameter added to the interface also allows a hybrid approach, where
 are answered from the token with no network call, while writes, or only destructive actions such
 as `obliterate`, do online checks for every call.
 
-**The default partition listing discloses names to every authenticated caller.** Without a
-`RepositoryDirectory` implementation, `lore repo list` returns what the server holds rather than
-what the caller was granted (D7). That is correct under Tier 1, where reachability is global
-anyway, and an over-disclosure under Tier 2. It leaks partition identifiers and names, not
-contents: every operation on a listed partition still goes through `check_repository_access`. A
-deployment that treats the partition inventory as sensitive can implement the
-trait or set `baseline_access = "denied"`.
+**`baseline_access = "reachable"` discloses partition names to every authenticated caller.**
+With it set, `lore repo list` returns what the server holds rather than what the caller was
+granted (D7). That is correct under Tier 1, where reachability is global anyway, and an
+over-disclosure under Tier 2. It leaks partition identifiers and names, not contents: every
+operation on a listed partition still goes through `check_repository_access`. The default is
+`denied`, which lists nothing, so the disclosure is something a deployment opts into rather
+than something it has to notice and turn off. A deployment that wants per-caller listings
+implements the trait.
 
 ## Privacy Considerations
 
@@ -1306,9 +1371,10 @@ identifier. Today's tokens always carry a display name and username whether or n
 **The forgettable name mapping survives intact by default.** Revision history records a user
 identifier and not a name, so an operator can unmap that identifier from a person, on a departure
 or an erasure request, without rewriting history. Resolving names through a directory at read time
-is what makes that possible, and D7 keeps it that way. The identity-claim option in D7 trades the
-property away deliberately: a deployment that records `preferred_username` into history chooses
-readability over erasability, and the default stays `sub`. The `UserDirectory` default answers
+is what makes that possible, and D7 keeps it that way. The `identity` claim in D7 trades the
+property away deliberately: an issuer that copies `preferred_username` into it puts names into
+history, choosing readability over erasability, and a token without the claim stays on `sub`. The
+`UserService` default answers
 from the caller's own token rather than accumulating a local cache of other people's names.
 
 **Tokens stay out of logs.** The existing discipline holds: `set_sensitive` on the gRPC
@@ -1332,7 +1398,7 @@ endpoint's `body_excerpt`: bounded, and never echoing a credential.
   auth service, including serving discovery at a URL its tokens carry as `iss` (D1). This is work
   outside this repository, and for the deployment driving this proposal it is in hand.
   — *invalidated if:* an auth service cannot be extended, in which case that deployment stays on
-  the legacy path and phase 5 waits on it.
+  the gRPC path and phase 5 waits on it.
 
 **Risks**
 

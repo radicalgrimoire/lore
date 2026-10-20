@@ -1,12 +1,13 @@
-pub mod external_dir;
-
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+pub mod external_dir;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::path::PathBuf;
 
 use lore_base::directories::project_directory;
+use lore_base::env::GLOBAL_PATH_VAR;
 use lore_error_set::prelude::*;
 use serde::Deserialize;
 use serde::Serialize;
@@ -27,10 +28,8 @@ fn make_path_if_nonexistent(path: &PathBuf) -> Result<(), GlobalConfigError> {
     Ok(())
 }
 
-const LORE_GLOBAL_PATH_VAR: &str = "LORE_GLOBAL_PATH";
-
 pub fn get_global_config_dir() -> Result<PathBuf, GlobalConfigError> {
-    let path = if let Ok(override_dir) = std::env::var(LORE_GLOBAL_PATH_VAR) {
+    let path = if let Some(override_dir) = lore_base::env::var(GLOBAL_PATH_VAR) {
         PathBuf::from(override_dir).join("config")
     } else {
         project_directory()
@@ -43,7 +42,7 @@ pub fn get_global_config_dir() -> Result<PathBuf, GlobalConfigError> {
 }
 
 pub fn get_global_data_dir() -> Result<PathBuf, GlobalConfigError> {
-    let path = if let Ok(override_dir) = std::env::var(LORE_GLOBAL_PATH_VAR) {
+    let path = if let Some(override_dir) = lore_base::env::var(GLOBAL_PATH_VAR) {
         PathBuf::from(override_dir).join("data")
     } else {
         project_directory()
@@ -62,6 +61,28 @@ pub struct DefaultSharedStoreConfigValue {
     pub path_to_store: String,
 }
 
+/// Settings for the Lore service process, under `[service]`.
+#[derive(Serialize, Deserialize, Default, Debug, Clone)]
+#[serde(default)]
+pub struct ServiceConfig {
+    /// Executable started as the service, and the one a service is expected to
+    /// run from.
+    ///
+    /// Naming it here is what makes the choice deliberate rather than a race
+    /// between whichever client happens to start a service first. Clients of
+    /// different versions can share a machine, so the version that serves them
+    /// is a decision to be made once and written down, not an accident of
+    /// ordering. Unset resolves the executable from the running program.
+    pub executable: Option<String>,
+    /// Whether commands are carried out by the service rather than in the
+    /// process that was run.
+    ///
+    /// This is what turns the service on for a machine and leaves it on, which
+    /// is most of the point of having one. Unset is off.
+    pub use_automatically: Option<bool>,
+}
+
+#[lore_macro::test_pub]
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
 #[serde(default)]
 pub struct GlobalConfig {
@@ -69,6 +90,7 @@ pub struct GlobalConfig {
     default_shared_stores: BTreeMap<String, DefaultSharedStoreConfigValue>,
     #[serde(alias = "use_global_store_automatically")]
     pub use_shared_store_automatically: Option<bool>,
+    pub service: ServiceConfig,
 }
 
 impl GlobalConfig {
@@ -110,6 +132,22 @@ impl GlobalConfig {
     pub fn use_shared_store_automatically(&self) -> bool {
         self.use_shared_store_automatically.unwrap_or(false)
     }
+
+    /// The executable named under `[service]`, if one is named. A blank value
+    /// reads as unset, so that clearing the field is a way to stop pinning one,
+    /// and surrounding space is not part of a path.
+    pub fn service_executable(&self) -> Option<&str> {
+        self.service
+            .executable
+            .as_deref()
+            .map(str::trim)
+            .filter(|executable| !executable.is_empty())
+    }
+
+    /// Whether commands are carried out by the service. Unset is off.
+    pub fn use_service_automatically(&self) -> bool {
+        self.service.use_automatically.unwrap_or(false)
+    }
 }
 
 impl SaveableConfig for GlobalConfig {
@@ -119,7 +157,7 @@ impl SaveableConfig for GlobalConfig {
         get_global_config_dir().map(|path| path.join(CONFIG))
     }
 
-    async fn modify_on_load(mut self) -> Result<Self, Self::ErrorType> {
+    fn modify_on_load(mut self) -> Result<Self, Self::ErrorType> {
         let old = std::mem::take(&mut self.default_shared_stores);
         for (key, value) in old {
             let normalized = normalize_remote_url(&key).to_owned();

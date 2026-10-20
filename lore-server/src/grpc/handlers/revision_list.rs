@@ -169,10 +169,9 @@ async fn resolve_start(
                 (hash, RevisionListStrategy::HistoryStep)
             } else {
                 let signature = format!("{}@{}", branch, identifier.number);
-                let hash = revision::resolve(
+                let hash = revision::resolve_boxed(
                     repository.clone(),
                     signature,
-                    None,
                     ResolveSearchLocation::Local,
                 )
                 .await
@@ -182,7 +181,10 @@ async fn resolve_start(
                 (hash, RevisionListStrategy::FullIteration)
             }
         }
-        Start::Signature(signature) => (Hash::from(signature), RevisionListStrategy::Direct),
+        Start::Signature(signature) => (
+            crate::grpc::revision_signature(signature)?,
+            RevisionListStrategy::Direct,
+        ),
     };
 
     Ok(start_info)

@@ -5,10 +5,25 @@ use clap::CommandFactory;
 use clap::Parser;
 
 use crate::cli::LoreCli;
+use crate::cli::LoreCommands;
 use crate::cli::handle_lore_commands;
 use crate::cli::lore_globals_from_args;
+use crate::commands::service::ServiceCommands;
 use crate::config::setup_config;
 use crate::logging;
+
+/// Whether this command is the service rather than a client of one.
+///
+/// The service does the work its callers relay to it, so its pools are sized for
+/// working even on a machine whose clients relay. Sizing it for relaying would
+/// leave the process that does all the work with the pools of one that does none.
+#[lore_macro::test_pub]
+fn runs_the_service(command: &LoreCommands) -> bool {
+    matches!(
+        command,
+        LoreCommands::Service(service) if matches!(service.command, ServiceCommands::Run(_))
+    )
+}
 
 pub fn client_main() -> ExitCode {
     #[cfg(target_family = "windows")]
@@ -56,7 +71,20 @@ pub fn client_main() -> ExitCode {
         lore::set_thread_limit(max_threads);
     }
 
-    let mut globals = lore_globals_from_args(&cli);
+    // After the thread limit, which this reads, and before the first command: the
+    // handlers below build the runtime themselves and then call the async API, so
+    // by the time the library could decide this the runtime it would size exists.
+    if !runs_the_service(cli_command) {
+        lore::size_threads_for_relaying();
+    }
+
+    let mut globals = match lore_globals_from_args(&cli) {
+        Ok(globals) => globals,
+        Err(err) => {
+            crate::eprintln!("Error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
     if let Err(err) = globals.validate() {
         crate::eprintln!("Error: {err}");
         return ExitCode::FAILURE;

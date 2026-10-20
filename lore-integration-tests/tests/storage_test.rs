@@ -15,7 +15,6 @@ mod imports {
     use lore_base::types::Hash;
     use lore_base::types::Partition;
     use lore_revision::event::LoreBytes;
-    use lore_revision::event::LoreErrorCode;
     use lore_storage::StoreError;
     use lore_storage::store_types::StoreMatch;
 }
@@ -92,14 +91,11 @@ mod open_tests {
         assert_eq!(events[complete_ix], Captured::Complete(status));
     }
 
-    /// Create a `tempfile::TempDir` that auto-cleans on Drop. The `tag` becomes part of the
+    /// Create a `lore_base::test_util::TempDir` that auto-cleans on Drop. The `tag` becomes part of the
     /// directory's filename prefix so call sites retain a contextual hint visible in the
     /// working directory.
-    fn tempdir(tag: &str) -> tempfile::TempDir {
-        tempfile::Builder::new()
-            .prefix(&format!("lore-storage-open-{tag}-"))
-            .tempdir()
-            .expect("create tempdir")
+    fn tempdir(tag: &str) -> lore_base::test_util::TempDir {
+        lore_base::test_util::TempDir::new(&format!("lore-storage-open-{tag}-"))
     }
 
     /// Create a repository backed by its own store.
@@ -274,6 +270,150 @@ mod open_tests {
         assert_opened_before_complete(&events, 0);
     }
 
+    /// Whether this process holds the claim on one of a repository's own stores. A lock
+    /// opened on a store directory shares that directory's state with every other lock
+    /// in the process, so it reports what the command or handle under test holds.
+    fn store_held(repository: &Path, store: &str) -> bool {
+        lore_storage::local::store_lock::StoreLock::new(repository.join(".lore").join(store), false)
+            .expect("a repository store directory")
+            .is_held()
+    }
+
+    /// Waits for both of a repository's stores to be released, for up to five seconds.
+    async fn both_stores_released(repository: &Path) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while store_held(repository, "immutable") || store_held(repository, "mutable") {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        true
+    }
+
+    /// **A disk-backed handle claims both stores from open to close.** The handle is a
+    /// span of use: while it is open no other process may use the stores, and once it
+    /// closes, one may.
+    #[tokio::test]
+    async fn a_disk_backed_handle_claims_its_stores_until_it_closes() {
+        let repo_dir = tempdir("claims");
+        let repo_path = repo_dir.path();
+        create_repo(repo_path).await;
+        assert!(
+            both_stores_released(repo_path).await,
+            "creation let go of the stores"
+        );
+
+        let (sink, callback) = make_sink();
+        let status = open::open(
+            globals(),
+            LoreStorageOpenArgs {
+                repository_path: LoreString::from(repo_path.display().to_string().as_str()),
+                in_memory: 0,
+                ..Default::default()
+            },
+            callback,
+        )
+        .await;
+        assert_eq!(status, 0);
+        let id = take_opened(&sink.lock().unwrap()).expect("open emitted Opened");
+        assert!(
+            store_held(repo_path, "immutable") && store_held(repo_path, "mutable"),
+            "an open handle holds both stores"
+        );
+
+        let (_close_sink, close_callback) = make_sink();
+        let status = close_handle(
+            lore::storage::handle::LoreStore { handle_id: id },
+            close_callback,
+        )
+        .await;
+        assert_eq!(status, 0);
+        assert!(
+            both_stores_released(repo_path).await,
+            "closing the handle releases both stores"
+        );
+    }
+
+    /// **A repository command claims its stores before the repository lock.** Taken the
+    /// other way round, a command waiting on the repository lock would hold no store
+    /// claim, and a storage handle — which takes store claims and never a repository
+    /// lock — could wait on the command while the command waits on the handle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_repository_command_claims_its_stores_before_the_repository_lock() {
+        let repo_dir = tempdir("containment");
+        let repo_path = repo_dir.path().to_path_buf();
+        create_repo(&repo_path).await;
+        assert!(
+            both_stores_released(&repo_path).await,
+            "creation let go of the stores"
+        );
+
+        // A second open file description on the repository lock, which excludes the one
+        // the command takes.
+        let repository_lock =
+            lore_base::fs::lock::FSLock::acquire_directory_lock(repo_path.join(".lore"))
+                .await
+                .expect("takes the repository lock");
+        assert!(
+            !store_held(&repo_path, "immutable"),
+            "nothing holds the store before the command starts"
+        );
+
+        let command = {
+            let mut command_globals = globals();
+            command_globals.repository_path = repo_path.as_path().into();
+            command_globals.offline = 1;
+            command_globals.local = 1;
+            lore_spawn!(async move {
+                repository::status(
+                    command_globals,
+                    repository::LoreRepositoryStatusArgs {
+                        staged: 0,
+                        scan: 0,
+                        check_dirty: 0,
+                        reset: 0,
+                        sync_point: 0,
+                        revision_only: 1,
+                        count: 0,
+                        paths: lore_revision::interface::LoreArray::default(),
+                    },
+                    None,
+                )
+                .await
+            })
+        };
+
+        let both_held = || store_held(&repo_path, "immutable") && store_held(&repo_path, "mutable");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !both_held() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the command must claim both stores while it waits for the repository lock"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Long enough for a command that was not waiting on the repository lock to have
+        // finished, and for one that let its claims go while waiting to have done so.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(both_held(), "the command keeps both claims while it waits");
+        assert!(
+            !command.is_finished(),
+            "and it is still waiting on the repository lock"
+        );
+
+        drop(repository_lock);
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), command)
+            .await
+            .expect("the command finishes once the repository lock is free")
+            .expect("the command task completes");
+        assert_eq!(status, 0);
+        assert!(
+            both_stores_released(&repo_path).await,
+            "and releases both stores once it is done"
+        );
+    }
+
     async fn open_in_memory(callback: LoreEventCallback) -> i32 {
         open::open(
             globals(),
@@ -417,15 +557,12 @@ mod open_tests {
 
         let events = sink.lock().unwrap().clone();
         let complete = events.iter().find_map(|e| match e {
-            LoreEvent::StoragePutItemComplete(data) => Some(*data),
+            LoreEvent::StoragePutItemComplete(data) => Some(data.clone()),
             _ => None,
         });
         let complete = complete.expect("expected PUT_ITEM_COMPLETE event");
         assert_eq!(complete.id, 42);
-        assert_eq!(
-            complete.error_code,
-            lore_revision::event::LoreErrorCode::None,
-        );
+        assert_eq!(complete.error.error_code, 0,);
         // Address hash matches the content hash; context is preserved.
         let expected_hash = lore_storage::hash::hash_slice(b"hello, storage put");
         assert_eq!(complete.address.hash, expected_hash);
@@ -479,15 +616,12 @@ mod open_tests {
         let complete = events
             .iter()
             .find_map(|e| match e {
-                LoreEvent::StoragePutItemComplete(data) => Some(*data),
+                LoreEvent::StoragePutItemComplete(data) => Some(data.clone()),
                 _ => None,
             })
             .expect("expected PUT_ITEM_COMPLETE");
         assert_eq!(complete.id, 7);
-        assert_eq!(
-            complete.error_code,
-            lore_revision::event::LoreErrorCode::None
-        );
+        assert_eq!(complete.error.error_code, 0);
         assert_eq!(complete.address.hash, Hash::default());
         assert_eq!(complete.address.context, context);
     }
@@ -557,7 +691,7 @@ mod open_tests {
         let completes: Vec<_> = events
             .iter()
             .filter_map(|e| match e {
-                LoreEvent::StoragePutItemComplete(data) => Some(*data),
+                LoreEvent::StoragePutItemComplete(data) => Some(data.clone()),
                 _ => None,
             })
             .collect();
@@ -565,10 +699,10 @@ mod open_tests {
         let item_1 = completes.iter().find(|c| c.id == 1).unwrap();
         let item_2 = completes.iter().find(|c| c.id == 2).unwrap();
         assert_eq!(
-            item_1.error_code,
-            lore_revision::event::LoreErrorCode::InvalidArguments,
+            item_1.error.error_code,
+            lore_base::error::InvalidArguments::FFI_CODE,
         );
-        assert_eq!(item_2.error_code, lore_revision::event::LoreErrorCode::None,);
+        assert_eq!(item_2.error.error_code, 0,);
     }
 
     #[tokio::test]
@@ -650,14 +784,14 @@ mod open_tests {
         let complete = events
             .iter()
             .find_map(|e| match e {
-                LoreEvent::StoragePutItemComplete(data) => Some(*data),
+                LoreEvent::StoragePutItemComplete(data) => Some(data.clone()),
                 _ => None,
             })
             .expect("expected PUT_ITEM_COMPLETE");
         assert_eq!(complete.id, 99);
         assert_eq!(
-            complete.error_code,
-            lore_revision::event::LoreErrorCode::InvalidArguments,
+            complete.error.error_code,
+            lore_base::error::InvalidArguments::FFI_CODE,
         );
     }
 
@@ -723,15 +857,15 @@ mod open_tests {
         let completes: Vec<_> = events
             .iter()
             .filter_map(|e| match e {
-                LoreEvent::StoragePutItemComplete(data) => Some(*data),
+                LoreEvent::StoragePutItemComplete(data) => Some(data.clone()),
                 _ => None,
             })
             .collect();
         assert_eq!(completes.len(), 2, "every item must emit PUT_ITEM_COMPLETE");
         for c in &completes {
             assert_eq!(
-                c.error_code,
-                lore_revision::event::LoreErrorCode::InvalidArguments,
+                c.error.error_code,
+                lore_base::error::InvalidArguments::FFI_CODE,
             );
         }
     }
@@ -788,7 +922,10 @@ mod open_tests {
         ItemComplete {
             id: u64,
             address: lore_base::types::Address,
-            error_code: lore_revision::event::LoreErrorCode,
+            error_code: i32,
+            /// The failing error's own message, empty on success. Captured so a test can assert
+            /// that a failing item is diagnosable from its event alone.
+            message: String,
         },
         Error,
         Complete(i32),
@@ -824,7 +961,8 @@ mod open_tests {
                 LoreEvent::StorageGetItemComplete(d) => GetCaptured::ItemComplete {
                     id: d.id,
                     address: d.address,
-                    error_code: d.error_code,
+                    error_code: d.error.error_code,
+                    message: d.error.message.as_str().to_string(),
                 },
                 LoreEvent::Error(_) => GetCaptured::Error,
                 LoreEvent::Complete(d) => GetCaptured::Complete(d.status),
@@ -954,15 +1092,13 @@ mod open_tests {
                     id,
                     error_code,
                     address,
+                    ..
                 } => Some((*id, *error_code, *address)),
                 _ => None,
             })
             .expect("expected GET_ITEM_COMPLETE");
         assert_eq!(complete.0, 5);
-        assert_eq!(
-            complete.1,
-            lore_revision::event::LoreErrorCode::InvalidArguments,
-        );
+        assert_eq!(complete.1, lore_base::error::InvalidArguments::FFI_CODE,);
         // Errored items carry zero address.
         assert_eq!(complete.2, Address::default());
     }
@@ -1029,10 +1165,7 @@ mod open_tests {
             GetCaptured::ItemComplete { id, error_code, .. } => Some((*id, *error_code)),
             _ => None,
         });
-        assert_eq!(
-            complete,
-            Some((12, lore_revision::event::LoreErrorCode::None)),
-        );
+        assert_eq!(complete, Some((12, 0)),);
     }
 
     #[tokio::test]
@@ -1075,7 +1208,7 @@ mod open_tests {
             callback,
         )
         .await;
-        assert_eq!(status, -1);
+        assert_eq!(status, lore_base::error::AddressNotFound::FFI_CODE);
 
         let events = sink.lock().unwrap().clone();
         // No HEADER or DATA must appear for the missed read.
@@ -1096,16 +1229,21 @@ mod open_tests {
                     id,
                     error_code,
                     address,
-                } => Some((*id, *error_code, *address)),
+                    message,
+                } => Some((*id, *error_code, *address, message.clone())),
                 _ => None,
             })
             .expect("expected GET_ITEM_COMPLETE");
         assert_eq!(complete.0, 77);
-        assert_eq!(
-            complete.1,
-            lore_revision::event::LoreErrorCode::AddressNotFound,
-        );
+        assert_eq!(complete.1, lore_base::error::AddressNotFound::FFI_CODE,);
         assert_eq!(complete.2, Address::default());
+        // The point of carrying a detail rather than a code: the item event alone says what
+        // failed, with no companion event and no server log to consult.
+        assert!(
+            !complete.3.is_empty(),
+            "a failing item must carry its error's message, got {:?}",
+            complete.3
+        );
     }
 
     #[tokio::test]
@@ -1230,12 +1368,207 @@ mod open_tests {
             id,
             error_code,
             address: c_addr,
+            ..
         } = &events[complete_ix]
         {
             assert_eq!(*id, 100);
-            assert_eq!(*error_code, lore_revision::event::LoreErrorCode::None);
+            assert_eq!(*error_code, 0);
             assert_eq!(*c_addr, address);
         }
+    }
+
+    /// A writable buffer for `data_out`, alongside the vector that owns it.
+    fn caller_buffer(capacity: usize) -> (Vec<u8>, lore_revision::event::LoreBytesMut) {
+        let mut buffer = vec![0u8; capacity];
+        let data_out = lore_revision::event::LoreBytesMut {
+            ptr: buffer.as_mut_ptr().cast(),
+            len: buffer.len(),
+        };
+        (buffer, data_out)
+    }
+
+    /// With `data_out` supplied the content lands in the caller's buffer and no `GET_DATA` is
+    /// emitted for it, while `GET_HEADER` still reports the whole content's size.
+    #[tokio::test]
+    async fn get_data_out_fills_the_buffer_and_emits_no_data() {
+        use lore_base::types::Context;
+        use lore_base::types::Partition;
+
+        let (open_sink, open_cb) = make_sink();
+        assert_eq!(open_in_memory(open_cb).await, 0);
+        let id = take_opened(&open_sink.lock().unwrap()).unwrap();
+        let handle = lore::storage::handle::LoreStore { handle_id: id };
+
+        let payload = b"delivered straight into the caller's buffer".to_vec();
+        let partition = Partition::from([0x21u8; 16]);
+        let context = Context::from([0x22u8; 16]);
+        let address = put_once(handle, partition, context, &payload).await;
+
+        let (buffer, data_out) = caller_buffer(payload.len());
+        let item = lore::storage::get::LoreStorageGetItem {
+            id: 200,
+            partition,
+            address,
+            data_out,
+            ..Default::default()
+        };
+        let (sink, callback) = make_get_sink();
+        let status = lore::storage::get::get(
+            globals(),
+            lore::storage::get::LoreStorageGetArgs {
+                handle,
+                items: lore_revision::interface::LoreArray::from_vec(vec![item]),
+            },
+            callback,
+        )
+        .await;
+        assert_eq!(status, 0);
+        assert_eq!(buffer, payload, "the caller's buffer must hold the content");
+
+        let events = sink.lock().unwrap().clone();
+        assert!(
+            !events.iter().any(|e| matches!(e, GetCaptured::Data { .. })),
+            "an item delivering into its own buffer emits no GET_DATA, got {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                GetCaptured::Header { id: 200, size_content, .. }
+                    if *size_content == payload.len() as u64
+            )),
+            "GET_HEADER must report the content size, got {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                GetCaptured::ItemComplete {
+                    id: 200,
+                    error_code: 0,
+                    ..
+                }
+            )),
+            "the item must complete without error, got {events:?}"
+        );
+    }
+
+    /// The capacity `data_out` states is the limit: content that does not fit fails the item
+    /// rather than arriving truncated or falling back to `GET_DATA`.
+    #[tokio::test]
+    async fn get_data_out_shorter_than_the_content_fails_the_item() {
+        use lore_base::types::Context;
+        use lore_base::types::Partition;
+
+        let (open_sink, open_cb) = make_sink();
+        assert_eq!(open_in_memory(open_cb).await, 0);
+        let id = take_opened(&open_sink.lock().unwrap()).unwrap();
+        let handle = lore::storage::handle::LoreStore { handle_id: id };
+
+        let payload = b"longer than the buffer the caller offers".to_vec();
+        let partition = Partition::from([0x23u8; 16]);
+        let context = Context::from([0x24u8; 16]);
+        let address = put_once(handle, partition, context, &payload).await;
+
+        let (_buffer, data_out) = caller_buffer(payload.len() - 1);
+        let item = lore::storage::get::LoreStorageGetItem {
+            id: 201,
+            partition,
+            address,
+            data_out,
+            ..Default::default()
+        };
+        let (sink, callback) = make_get_sink();
+        lore::storage::get::get(
+            globals(),
+            lore::storage::get::LoreStorageGetArgs {
+                handle,
+                items: lore_revision::interface::LoreArray::from_vec(vec![item]),
+            },
+            callback,
+        )
+        .await;
+
+        let events = sink.lock().unwrap().clone();
+        assert!(
+            !events.iter().any(|e| matches!(e, GetCaptured::Data { .. })),
+            "a refused item must not fall back to GET_DATA, got {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                GetCaptured::ItemComplete {
+                    id: 201,
+                    error_code: lore_base::error::Oversized::FFI_CODE,
+                    ..
+                }
+            )),
+            "a buffer short of the content must fail the item, got {events:?}"
+        );
+    }
+
+    /// The zero-hash short-circuit is empty content, so an item delivering into its own buffer
+    /// completes without the empty `GET_DATA` a buffer-less item receives.
+    #[tokio::test]
+    async fn get_zero_hash_with_data_out_emits_no_data() {
+        use lore_base::types::Address;
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+
+        let (open_sink, open_cb) = make_sink();
+        assert_eq!(open_in_memory(open_cb).await, 0);
+        let id = take_opened(&open_sink.lock().unwrap()).unwrap();
+        let handle = lore::storage::handle::LoreStore { handle_id: id };
+
+        let (_buffer, data_out) = caller_buffer(8);
+        let item = lore::storage::get::LoreStorageGetItem {
+            id: 202,
+            partition: Partition::from([0x25u8; 16]),
+            address: Address {
+                hash: Hash::default(),
+                context: Context::from([0x26u8; 16]),
+            },
+            data_out,
+            ..Default::default()
+        };
+        let (sink, callback) = make_get_sink();
+        let status = lore::storage::get::get(
+            globals(),
+            lore::storage::get::LoreStorageGetArgs {
+                handle,
+                items: lore_revision::interface::LoreArray::from_vec(vec![item]),
+            },
+            callback,
+        )
+        .await;
+        assert_eq!(status, 0);
+
+        let events = sink.lock().unwrap().clone();
+        assert!(
+            !events.iter().any(|e| matches!(e, GetCaptured::Data { .. })),
+            "empty content must not arrive as an empty GET_DATA here, got {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                GetCaptured::Header {
+                    id: 202,
+                    size_content: 0,
+                    ..
+                }
+            )),
+            "GET_HEADER must report empty content, got {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                GetCaptured::ItemComplete {
+                    id: 202,
+                    error_code: 0,
+                    ..
+                }
+            )),
+            "the item must complete without error, got {events:?}"
+        );
     }
 
     /// `LoreBytes` on `GET_DATA` events is valid only for the callback's invocation. This
@@ -1351,7 +1684,7 @@ mod open_tests {
         let completes = events
             .iter()
             .filter_map(|e| match e {
-                LoreEvent::StoragePutItemComplete(d) => Some(*d),
+                LoreEvent::StoragePutItemComplete(d) => Some(d.clone()),
                 _ => None,
             })
             .collect();
@@ -1668,10 +2001,10 @@ mod open_tests {
         ];
         let (status, events) = get_items_capture(handle, items).await;
         // One item failed → call-level status is the internal code -1.
-        assert_eq!(status, -1);
+        assert_eq!(status, lore_base::error::AddressNotFound::FFI_CODE);
 
         // Per-item terminal events.
-        let collect_complete = |target_id: u64| -> Option<lore_revision::event::LoreErrorCode> {
+        let collect_complete = |target_id: u64| -> Option<i32> {
             events.iter().find_map(|e| match e {
                 GetCaptured::ItemComplete { id, error_code, .. } if *id == target_id => {
                     Some(*error_code)
@@ -1679,17 +2012,11 @@ mod open_tests {
                 _ => None,
             })
         };
-        assert_eq!(
-            collect_complete(1),
-            Some(lore_revision::event::LoreErrorCode::None),
-        );
-        assert_eq!(
-            collect_complete(2),
-            Some(lore_revision::event::LoreErrorCode::None),
-        );
+        assert_eq!(collect_complete(1), Some(0),);
+        assert_eq!(collect_complete(2), Some(0),);
         assert_eq!(
             collect_complete(3),
-            Some(lore_revision::event::LoreErrorCode::AddressNotFound),
+            Some(lore_base::error::AddressNotFound::FFI_CODE),
         );
 
         // Per-id ordering: per-id ordering HEADER → DATA → ITEM_COMPLETE
@@ -1878,11 +2205,9 @@ mod open_tests {
     }
 
     #[tokio::test]
-    async fn aggregate_call_error_uses_internal_when_only_address_not_found() {
-        // Without an InvalidArguments item, the call-level summary maps the
-        // dominant AddressNotFound aggregate to the internal error — the FFI
-        // surface has no AddressNotFound variant for batch ops. The enriched
-        // Complete carries the internal FFI code (-1).
+    async fn aggregate_call_error_reports_address_not_found_when_that_is_the_only_failure() {
+        // Without an InvalidArguments item, the dominant failure is AddressNotFound, and the
+        // call reports that error's own FFI code rather than collapsing it to internal.
         use lore_base::types::Address;
         use lore_base::types::Context;
         use lore_base::types::Hash;
@@ -1923,7 +2248,7 @@ mod open_tests {
             callback,
         )
         .await;
-        assert_eq!(status, -1);
+        assert_eq!(status, lore_base::error::AddressNotFound::FFI_CODE);
 
         let events = sink.lock().unwrap().clone();
         assert!(
@@ -1937,9 +2262,12 @@ mod open_tests {
                 _ => None,
             })
             .expect("expected Complete event");
-        // The aggregated AddressNotFound maps to the internal error, FFI code -1.
-        assert_eq!(complete.status, -1);
-        assert_eq!(complete.error.error_code, -1);
+        // The selected AddressNotFound carries its own FFI code through to the call.
+        assert_eq!(complete.status, lore_base::error::AddressNotFound::FFI_CODE);
+        assert_eq!(
+            complete.error.error_code,
+            lore_base::error::AddressNotFound::FFI_CODE
+        );
     }
 
     #[tokio::test]
@@ -1977,7 +2305,7 @@ mod open_tests {
         )
         .await;
         // Handle B never saw the write — read must miss.
-        assert_eq!(status, -1);
+        assert_eq!(status, lore_base::error::AddressNotFound::FFI_CODE);
         let complete = events
             .iter()
             .find_map(|e| match e {
@@ -1985,10 +2313,7 @@ mod open_tests {
                 _ => None,
             })
             .expect("expected GET_ITEM_COMPLETE");
-        assert_eq!(
-            complete,
-            (1, lore_revision::event::LoreErrorCode::AddressNotFound),
-        );
+        assert_eq!(complete, (1, lore_base::error::AddressNotFound::FFI_CODE),);
     }
 
     #[tokio::test]
@@ -2157,7 +2482,7 @@ mod open_tests {
             id: u64,
             address: lore_base::types::Address,
             fragment: lore_base::types::Fragment,
-            error_code: lore_revision::event::LoreErrorCode,
+            error_code: i32,
         },
         Error,
         CallComplete(i32),
@@ -2173,7 +2498,7 @@ mod open_tests {
                     id: d.id,
                     address: d.address,
                     fragment: d.fragment,
-                    error_code: d.error_code,
+                    error_code: d.error.error_code,
                 },
                 LoreEvent::Error(_) => GetMetadataCaptured::Error,
                 LoreEvent::Complete(d) => GetMetadataCaptured::CallComplete(d.status),
@@ -2241,7 +2566,7 @@ mod open_tests {
             })
             .expect("GET_METADATA_ITEM_COMPLETE missing");
         assert_eq!(complete.0, 1);
-        assert_eq!(complete.1, lore_revision::event::LoreErrorCode::None);
+        assert_eq!(complete.1, 0);
         assert_eq!(complete.2.size_content, payload.len() as u64);
         assert_eq!(complete.3, address);
     }
@@ -2274,7 +2599,7 @@ mod open_tests {
             }],
         )
         .await;
-        assert_eq!(status, -1);
+        assert_eq!(status, lore_base::error::AddressNotFound::FFI_CODE);
         let complete = events
             .iter()
             .find_map(|e| match e {
@@ -2282,10 +2607,7 @@ mod open_tests {
                 _ => None,
             })
             .expect("GET_METADATA_ITEM_COMPLETE missing");
-        assert_eq!(
-            complete,
-            (7, lore_revision::event::LoreErrorCode::AddressNotFound),
-        );
+        assert_eq!(complete, (7, lore_base::error::AddressNotFound::FFI_CODE),);
     }
 
     #[tokio::test]
@@ -2316,10 +2638,7 @@ mod open_tests {
                 _ => None,
             })
             .expect("GET_METADATA_ITEM_COMPLETE missing");
-        assert_eq!(
-            complete,
-            (5, lore_revision::event::LoreErrorCode::InvalidArguments),
-        );
+        assert_eq!(complete, (5, lore_base::error::InvalidArguments::FFI_CODE),);
     }
 
     #[tokio::test]
@@ -2351,7 +2670,7 @@ mod open_tests {
             remote_success: u8,
             local_skipped: u8,
             remote_skipped: u8,
-            error_code: lore_revision::event::LoreErrorCode,
+            error_code: i32,
         },
         Error,
         CallComplete(i32),
@@ -2370,7 +2689,7 @@ mod open_tests {
                     remote_success: d.remote_success,
                     local_skipped: d.local_skipped,
                     remote_skipped: d.remote_skipped,
-                    error_code: d.error_code,
+                    error_code: d.error.error_code,
                 },
                 LoreEvent::Error(_) => ObliterateCaptured::Error,
                 LoreEvent::Complete(d) => ObliterateCaptured::CallComplete(d.status),
@@ -2453,10 +2772,7 @@ mod open_tests {
             })
             .expect("OBLITERATE_ITEM_COMPLETE missing");
         // No remote_config: local leg ran (success=1), remote leg was skipped (skipped=1).
-        assert_eq!(
-            complete,
-            (1, 1, 0, 0, 1, lore_revision::event::LoreErrorCode::None),
-        );
+        assert_eq!(complete, (1, 1, 0, 0, 1, 0),);
 
         // Obliterated content matches nothing, through every path. The entry survives in the
         // index carrying its tombstone, but nothing describes it: `get_metadata` answers as it
@@ -2484,7 +2800,7 @@ mod open_tests {
             .expect("post-obliterate get_metadata event missing");
         assert_eq!(
             error_code,
-            lore_revision::event::LoreErrorCode::AddressNotFound,
+            lore_base::error::AddressNotFound::FFI_CODE,
             "an obliterated address must resolve to nothing, not to a tombstoned fragment",
         );
         assert_eq!(
@@ -2546,9 +2862,56 @@ mod open_tests {
             })
             .expect("OBLITERATE_ITEM_COMPLETE missing");
         // No remote_config: local-side absent-address is idempotent success; remote leg skipped.
+        assert_eq!(complete, (7, 1, 0, 0, 1, 0),);
+    }
+
+    #[tokio::test]
+    async fn obliterate_batch_reports_each_item_independently() {
+        use lore_base::types::Address;
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+
+        let handle = open_in_memory_handle().await;
+        let partition = Partition::from([0x2Au8; 16]);
+        let context = Context::from([0x2Bu8; 16]);
+        let payload = b"batched obliterate".to_vec();
+        let address = put_once(handle, partition, context, &payload).await;
+
+        let (status, events) = obliterate_items(
+            handle,
+            vec![
+                lore::storage::obliterate::LoreStorageObliterateItem {
+                    id: 1,
+                    partition,
+                    address,
+                },
+                lore::storage::obliterate::LoreStorageObliterateItem {
+                    id: 2,
+                    partition: Partition::default(),
+                    address: Address {
+                        hash: Hash::from([0x2Cu8; 32]),
+                        context,
+                    },
+                },
+            ],
+        )
+        .await;
+        assert_ne!(status, 0, "the rejected item fails the call");
+
+        // Items resolve concurrently, so the events are correlated by id rather than by position.
+        let code_for = |want: u64| {
+            events.iter().find_map(|e| match e {
+                ObliterateCaptured::Complete { id, error_code, .. } if *id == want => {
+                    Some(*error_code)
+                }
+                _ => None,
+            })
+        };
+        assert_eq!(code_for(1), Some(0));
         assert_eq!(
-            complete,
-            (7, 1, 0, 0, 1, lore_revision::event::LoreErrorCode::None),
+            code_for(2),
+            Some(lore_base::error::InvalidArguments::FFI_CODE),
         );
     }
 
@@ -2561,7 +2924,7 @@ mod open_tests {
             target_partition: lore_base::types::Partition,
             source_address: lore_base::types::Address,
             target_context: lore_base::types::Context,
-            error_code: lore_revision::event::LoreErrorCode,
+            error_code: i32,
         },
         Error,
         CallComplete(i32),
@@ -2579,7 +2942,7 @@ mod open_tests {
                     target_partition: d.target_partition,
                     source_address: d.source_address,
                     target_context: d.target_context,
-                    error_code: d.error_code,
+                    error_code: d.error.error_code,
                 },
                 LoreEvent::Error(_) => CopyCaptured::Error,
                 LoreEvent::Complete(d) => CopyCaptured::CallComplete(d.status),
@@ -2663,7 +3026,7 @@ mod open_tests {
             })
             .expect("COPY_ITEM_COMPLETE missing");
         assert_eq!(complete.0, 1);
-        assert_eq!(complete.1, lore_revision::event::LoreErrorCode::None);
+        assert_eq!(complete.1, 0);
         assert_eq!(complete.2, source_partition);
         assert_eq!(complete.3, target_partition);
         assert_eq!(complete.4, address);
@@ -2727,7 +3090,7 @@ mod open_tests {
             }],
         )
         .await;
-        assert_eq!(status, -1);
+        assert_eq!(status, lore_base::error::AddressNotFound::FFI_CODE);
         let complete = events
             .iter()
             .find_map(|e| match e {
@@ -2735,10 +3098,7 @@ mod open_tests {
                 _ => None,
             })
             .expect("COPY_ITEM_COMPLETE missing");
-        assert_eq!(
-            complete,
-            (7, lore_revision::event::LoreErrorCode::AddressNotFound),
-        );
+        assert_eq!(complete, (7, lore_base::error::AddressNotFound::FFI_CODE),);
     }
 
     #[tokio::test]
@@ -2778,7 +3138,7 @@ mod open_tests {
                 _ => None,
             })
             .expect("COPY_ITEM_COMPLETE missing");
-        assert_eq!(complete, (1, lore_revision::event::LoreErrorCode::None),);
+        assert_eq!(complete, (1, 0),);
     }
 
     #[tokio::test]
@@ -2832,7 +3192,7 @@ mod open_tests {
                 _ => None,
             })
             .expect("COPY_ITEM_COMPLETE for id=11 missing");
-        assert_eq!(echoed_target.0, lore_revision::event::LoreErrorCode::None);
+        assert_eq!(echoed_target.0, 0);
         assert_eq!(echoed_target.1, target_context);
 
         // Read against the destination tuple — must return the source's payload byte-for-byte.
@@ -2928,11 +3288,7 @@ mod open_tests {
         let mut succeeded: std::collections::HashSet<u64> = std::collections::HashSet::new();
         for event in &events {
             if let CopyCaptured::Complete { id, error_code, .. } = event {
-                assert_eq!(
-                    *error_code,
-                    lore_revision::event::LoreErrorCode::None,
-                    "item {id} must succeed",
-                );
+                assert_eq!(*error_code, 0, "item {id} must succeed",);
                 succeeded.insert(*id);
             }
         }
@@ -2980,10 +3336,7 @@ mod open_tests {
                 _ => None,
             })
             .expect("COPY_ITEM_COMPLETE missing");
-        assert_eq!(
-            complete,
-            (12, lore_revision::event::LoreErrorCode::InvalidArguments),
-        );
+        assert_eq!(complete, (12, lore_base::error::InvalidArguments::FFI_CODE),);
     }
 
     #[tokio::test]
@@ -3013,10 +3366,7 @@ mod open_tests {
                 _ => None,
             })
             .expect("OBLITERATE_ITEM_COMPLETE missing");
-        assert_eq!(
-            complete,
-            (5, lore_revision::event::LoreErrorCode::InvalidArguments),
-        );
+        assert_eq!(complete, (5, lore_base::error::InvalidArguments::FFI_CODE),);
     }
 
     #[tokio::test]
@@ -3186,7 +3536,7 @@ mod open_tests {
             .collect()
     }
 
-    fn item_code(events: &[GetCaptured]) -> Option<lore_revision::event::LoreErrorCode> {
+    fn item_code(events: &[GetCaptured]) -> Option<i32> {
         events.iter().find_map(|e| match e {
             GetCaptured::ItemComplete { error_code, .. } => Some(*error_code),
             _ => None,
@@ -3259,10 +3609,7 @@ mod open_tests {
 
         assert_eq!(header_size(&events), Some(payload.len() as u64));
         assert_eq!(data_chunks(&events), vec![(40, payload[40..100].to_vec())]);
-        assert_eq!(
-            item_code(&events),
-            Some(lore_revision::event::LoreErrorCode::None)
-        );
+        assert_eq!(item_code(&events), Some(0));
     }
 
     /// A zeroed pair is the whole content, which is what keeps every caller written before
@@ -3347,10 +3694,7 @@ mod open_tests {
         assert_eq!(status, 0);
         assert_eq!(header_size(&events), Some(200));
         assert_eq!(data_chunks(&events), vec![(180, payload[180..].to_vec())]);
-        assert_eq!(
-            item_code(&events),
-            Some(lore_revision::event::LoreErrorCode::None)
-        );
+        assert_eq!(item_code(&events), Some(0));
     }
 
     /// Reading from where nothing is is a caller mistake. Clamping it to empty would be
@@ -3382,7 +3726,7 @@ mod open_tests {
             assert_ne!(status, 0, "streaming={streaming}");
             assert_eq!(
                 item_code(&events),
-                Some(lore_revision::event::LoreErrorCode::InvalidArguments),
+                Some(lore_base::error::InvalidArguments::FFI_CODE),
                 "streaming={streaming}",
             );
             assert!(
@@ -3419,10 +3763,7 @@ mod open_tests {
         assert_eq!(status, 0);
         assert_eq!(header_size(&events), Some(200));
         assert_eq!(data_chunks(&events), vec![(200, Vec::new())]);
-        assert_eq!(
-            item_code(&events),
-            Some(lore_revision::event::LoreErrorCode::None)
-        );
+        assert_eq!(item_code(&events), Some(0));
     }
 
     /// The zero hash answers an empty buffer whatever range was asked for: there is no content
@@ -3456,10 +3797,7 @@ mod open_tests {
         .await;
         assert_eq!(status, 0);
         assert_eq!(header_size(&events), Some(0));
-        assert_eq!(
-            item_code(&events),
-            Some(lore_revision::event::LoreErrorCode::None)
-        );
+        assert_eq!(item_code(&events), Some(0));
     }
 
     /// Streaming a range out of multi-fragment content: chunks arrive in content order,
@@ -3493,10 +3831,7 @@ mod open_tests {
         )
         .await;
         assert_eq!(status, 0);
-        assert_eq!(
-            item_code(&events),
-            Some(lore_revision::event::LoreErrorCode::None)
-        );
+        assert_eq!(item_code(&events), Some(0));
 
         assert_eq!(header_size(&events), Some(len as u64));
 
@@ -3586,10 +3921,7 @@ mod open_tests {
         )
         .await;
         assert_eq!(status, 0);
-        assert_eq!(
-            item_code(&events),
-            Some(lore_revision::event::LoreErrorCode::None)
-        );
+        assert_eq!(item_code(&events), Some(0));
 
         let on_disk = std::fs::read(&target).unwrap();
         assert_eq!(on_disk, payload[40..100]);
@@ -3658,7 +3990,7 @@ mod open_tests {
         assert_ne!(status, 0);
         assert_eq!(
             item_code(&events),
-            Some(lore_revision::event::LoreErrorCode::InvalidArguments)
+            Some(lore_base::error::InvalidArguments::FFI_CODE)
         );
         assert_eq!(
             std::fs::read(&target).unwrap(),
@@ -3667,27 +3999,19 @@ mod open_tests {
         );
     }
 
-    /// Create a `tempfile::NamedTempFile` populated with `contents`. The returned guard
+    /// Create a temp file populated with `contents`. The returned guard
     /// auto-cleans the file on Drop (success or panic). Callers hold the guard for the test
     /// scope and pass `guard.path()` to the API.
-    fn write_temp_file(contents: &[u8], tag: &str) -> tempfile::NamedTempFile {
-        let mut file = tempfile::Builder::new()
-            .prefix(&format!("lore-put-file-{tag}-"))
-            .tempfile()
-            .expect("create tempfile");
-        std::io::Write::write_all(&mut file, contents).expect("write tempfile");
-        file
+    fn write_temp_file(contents: &[u8], tag: &str) -> lore_base::test_util::TempFile {
+        lore_base::test_util::TempFile::with_contents(&format!("lore-put-file-{tag}-"), contents)
     }
 
     /// Create a path inside a fresh `TempDir` for tests that need a destination file location
     /// (e.g. `get_file` target). The directory cleans up its entire tree on Drop, so the
     /// resulting file — whether the test creates it, the API creates it, or it never exists —
     /// is removed on both success and panic paths.
-    fn temp_file_path(tag: &str) -> (tempfile::TempDir, PathBuf) {
-        let dir = tempfile::Builder::new()
-            .prefix(&format!("lore-storage-{tag}-"))
-            .tempdir()
-            .expect("create tempdir");
+    fn temp_file_path(tag: &str) -> (lore_base::test_util::TempDir, PathBuf) {
+        let dir = lore_base::test_util::TempDir::new(&format!("lore-storage-{tag}-"));
         let path = dir.path().join("target");
         (dir, path)
     }
@@ -3717,11 +4041,68 @@ mod open_tests {
         let completes = events
             .iter()
             .filter_map(|e| match e {
-                LoreEvent::StoragePutItemComplete(d) => Some(*d),
+                LoreEvent::StoragePutItemComplete(d) => Some(d.clone()),
                 _ => None,
             })
             .collect();
         (status, completes)
+    }
+
+    #[tokio::test]
+    async fn put_file_batch_reports_each_item_independently() {
+        use lore_base::types::Context;
+        use lore_base::types::Partition;
+
+        let handle = open_in_memory_handle().await;
+        let payload = b"batched put_file contents".to_vec();
+        let file = write_temp_file(&payload, "batch");
+        let partition = Partition::from([0x72u8; 16]);
+        let context = Context::from([0x82u8; 16]);
+
+        let (status, completes) = put_file_items(
+            handle,
+            vec![
+                lore::storage::put_file::LoreStoragePutFileItem {
+                    id: 1,
+                    partition,
+                    context,
+                    path: LoreString::from(file.path().display().to_string().as_str()),
+                    remote_write: 0,
+                    local_cache: 0,
+                    fixed_size_chunk: 0,
+                },
+                lore::storage::put_file::LoreStoragePutFileItem {
+                    id: 2,
+                    partition,
+                    context,
+                    path: LoreString::default(),
+                    remote_write: 0,
+                    local_cache: 0,
+                    fixed_size_chunk: 0,
+                },
+            ],
+        )
+        .await;
+        assert_ne!(status, 0, "the empty path fails the call");
+
+        // Items resolve concurrently, so the events are correlated by id rather than by position.
+        let stored = completes
+            .iter()
+            .find(|c| c.id == 1)
+            .expect("stored item complete missing");
+        assert_eq!(stored.error.error_code, 0);
+        assert_eq!(
+            stored.address.hash,
+            lore_storage::hash_slice(payload.as_slice()),
+        );
+        let rejected = completes
+            .iter()
+            .find(|c| c.id == 2)
+            .expect("rejected item complete missing");
+        assert_eq!(
+            rejected.error.error_code,
+            lore_base::error::InvalidArguments::FFI_CODE,
+        );
     }
 
     #[tokio::test]
@@ -3754,10 +4135,7 @@ mod open_tests {
         let (status, completes) = put_file_items(handle, vec![item]).await;
         assert_eq!(status, 0);
         let address = completes.iter().find(|c| c.id == 1).unwrap().address;
-        assert_eq!(
-            completes[0].error_code,
-            lore_revision::event::LoreErrorCode::None
-        );
+        assert_eq!(completes[0].error.error_code, 0);
 
         let (g_status, events) = get_items_capture(
             handle,
@@ -3813,10 +4191,7 @@ mod open_tests {
         .await;
         assert_eq!(status, 0);
         let complete = completes.iter().find(|c| c.id == 9).unwrap();
-        assert_eq!(
-            complete.error_code,
-            lore_revision::event::LoreErrorCode::None
-        );
+        assert_eq!(complete.error.error_code, 0);
         assert_eq!(complete.address.hash, Hash::default());
         assert_eq!(complete.address.context, context);
     }
@@ -3850,8 +4225,8 @@ mod open_tests {
         assert_ne!(status, 0);
         let complete = completes.iter().find(|c| c.id == 1).unwrap();
         assert_eq!(
-            complete.error_code,
-            lore_revision::event::LoreErrorCode::InvalidArguments
+            complete.error.error_code,
+            lore_base::error::InvalidArguments::FFI_CODE
         );
     }
 
@@ -3882,8 +4257,8 @@ mod open_tests {
         assert_ne!(status, 0);
         let complete = completes.iter().find(|c| c.id == 5).unwrap();
         assert_eq!(
-            complete.error_code,
-            lore_revision::event::LoreErrorCode::InvalidArguments
+            complete.error.error_code,
+            lore_base::error::InvalidArguments::FFI_CODE
         );
     }
 
@@ -3965,6 +4340,57 @@ mod open_tests {
     }
 
     #[tokio::test]
+    async fn get_file_batch_reports_each_item_independently() {
+        use lore_base::types::Context;
+        use lore_base::types::Partition;
+
+        let handle = open_in_memory_handle().await;
+        let partition = Partition::from([0xC5u8; 16]);
+        let context = Context::from([0xC6u8; 16]);
+        let first_payload = b"first batched destination".to_vec();
+        let second_payload = b"second batched destination".to_vec();
+        let first_address = put_once(handle, partition, context, &first_payload).await;
+        let second_address = put_once(handle, partition, context, &second_payload).await;
+
+        let (_first_guard, first_path) = temp_file_path("get-file-batch-1");
+        let (_second_guard, second_path) = temp_file_path("get-file-batch-2");
+        let (status, events) = get_file_items(
+            handle,
+            vec![
+                lore::storage::get_file::LoreStorageGetFileItem {
+                    id: 1,
+                    partition,
+                    address: first_address,
+                    path: LoreString::from(first_path.display().to_string().as_str()),
+                    ..Default::default()
+                },
+                lore::storage::get_file::LoreStorageGetFileItem {
+                    id: 2,
+                    partition,
+                    address: second_address,
+                    path: LoreString::from(second_path.display().to_string().as_str()),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await;
+        assert_eq!(status, 0);
+        assert_eq!(std::fs::read(&first_path).unwrap(), first_payload);
+        assert_eq!(std::fs::read(&second_path).unwrap(), second_payload);
+
+        // Items resolve concurrently, so the events are correlated by id rather than by position.
+        let mut codes: Vec<(u64, i32)> = events
+            .iter()
+            .filter_map(|e| match e {
+                GetCaptured::ItemComplete { id, error_code, .. } => Some((*id, *error_code)),
+                _ => None,
+            })
+            .collect();
+        codes.sort_by_key(|(id, _)| *id);
+        assert_eq!(codes, vec![(1, 0), (2, 0),], "one terminal event per item",);
+    }
+
+    #[tokio::test]
     async fn get_file_writes_payload_to_disk() {
         // get_file behavior: get_file writes the reassembled bytes and
         // emits only GET_ITEM_COMPLETE — no HEADER, no DATA.
@@ -4010,10 +4436,7 @@ mod open_tests {
             GetCaptured::ItemComplete { id, error_code, .. } => Some((*id, *error_code)),
             _ => None,
         });
-        assert_eq!(
-            complete,
-            Some((1, lore_revision::event::LoreErrorCode::None)),
-        );
+        assert_eq!(complete, Some((1, 0)),);
     }
 
     #[tokio::test]
@@ -4085,14 +4508,14 @@ mod open_tests {
             }],
         )
         .await;
-        assert_eq!(status, -1);
+        assert_eq!(status, lore_base::error::AddressNotFound::FFI_CODE);
         let complete = events.iter().find_map(|e| match e {
             GetCaptured::ItemComplete { id, error_code, .. } => Some((*id, *error_code)),
             _ => None,
         });
         assert_eq!(
             complete,
-            Some((7, lore_revision::event::LoreErrorCode::AddressNotFound)),
+            Some((7, lore_base::error::AddressNotFound::FFI_CODE)),
         );
     }
 
@@ -4126,7 +4549,7 @@ mod open_tests {
         });
         assert_eq!(
             complete,
-            Some((5, lore_revision::event::LoreErrorCode::InvalidArguments)),
+            Some((5, lore_base::error::InvalidArguments::FFI_CODE)),
         );
     }
 
@@ -4164,7 +4587,7 @@ mod open_tests {
         let completes = events
             .iter()
             .filter_map(|e| match e {
-                LoreEvent::StoragePutItemComplete(d) => Some(*d),
+                LoreEvent::StoragePutItemComplete(d) => Some(d.clone()),
                 _ => None,
             })
             .collect();
@@ -4227,15 +4650,104 @@ mod open_tests {
         .await;
         assert_eq!(status, 0, "publishing the fixture file must succeed");
         assert_eq!(completes.len(), 1);
-        assert_eq!(
-            completes[0].error_code,
-            lore_revision::event::LoreErrorCode::None
-        );
+        assert_eq!(completes[0].error.error_code, 0);
         completes[0].address
     }
 
     /// The content never exists as a buffer on either side: it goes from one file into the store
     /// under a key, and out of the store into another file by that key alone.
+    #[tokio::test]
+    async fn file_resolved_batches_report_each_item_independently() {
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+
+        let handle = open_in_memory_handle().await;
+        let partition = Partition::from([0x4Au8; 16]);
+        let context = Context::from([0x4Bu8; 16]);
+        let first_payload = b"first batched key contents".to_vec();
+        let second_payload = b"second batched key contents".to_vec();
+        let first_key = Hash::hash_buffer(b"file-resolved-batch-1");
+        let second_key = Hash::hash_buffer(b"file-resolved-batch-2");
+        let first_source = write_temp_file(&first_payload, "batch-publish-1");
+        let second_source = write_temp_file(&second_payload, "batch-publish-2");
+
+        let (put_status, mut put_completes) = put_file_resolved_items(
+            handle,
+            vec![
+                lore::storage::put_file_resolved::LoreStoragePutFileResolvedItem {
+                    id: 1,
+                    partition,
+                    key: first_key,
+                    context,
+                    path: LoreString::from(first_source.path().display().to_string().as_str()),
+                    ..Default::default()
+                },
+                lore::storage::put_file_resolved::LoreStoragePutFileResolvedItem {
+                    id: 2,
+                    partition,
+                    key: second_key,
+                    context,
+                    path: LoreString::from(second_source.path().display().to_string().as_str()),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await;
+        assert_eq!(put_status, 0);
+        // Items resolve concurrently, so the events are correlated by id rather than by position.
+        put_completes.sort_by_key(|c| c.id);
+        assert_eq!(
+            put_completes.len(),
+            2,
+            "one terminal event per published item"
+        );
+        assert_eq!(
+            put_completes[0].address.hash,
+            lore_storage::hash_slice(first_payload.as_slice()),
+        );
+        assert_eq!(
+            put_completes[1].address.hash,
+            lore_storage::hash_slice(second_payload.as_slice()),
+        );
+
+        let (_first_guard, first_path) = temp_file_path("get-file-resolved-batch-1");
+        let (_second_guard, second_path) = temp_file_path("get-file-resolved-batch-2");
+        let (get_status, events) = get_file_resolved_items(
+            handle,
+            vec![
+                lore::storage::get_file_resolved::LoreStorageGetFileResolvedItem {
+                    id: 3,
+                    partition,
+                    key: first_key,
+                    context,
+                    path: LoreString::from(first_path.display().to_string().as_str()),
+                    ..Default::default()
+                },
+                lore::storage::get_file_resolved::LoreStorageGetFileResolvedItem {
+                    id: 4,
+                    partition,
+                    key: second_key,
+                    context,
+                    path: LoreString::from(second_path.display().to_string().as_str()),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await;
+        assert_eq!(get_status, 0);
+        assert_eq!(std::fs::read(&first_path).unwrap(), first_payload);
+        assert_eq!(std::fs::read(&second_path).unwrap(), second_payload);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, GetCaptured::ItemComplete { .. }))
+                .count(),
+            2,
+            "one terminal event per read item",
+        );
+    }
+
     #[tokio::test]
     async fn put_file_resolved_then_get_file_resolved_round_trips_through_files() {
         use lore_base::types::Context;
@@ -4287,12 +4799,13 @@ mod open_tests {
                 id,
                 address,
                 error_code,
+                ..
             } => Some((*id, *address, *error_code)),
             _ => None,
         });
         assert_eq!(
             complete,
-            Some((2, published, lore_revision::event::LoreErrorCode::None)),
+            Some((2, published, 0)),
             "the terminal event must report the resolved address, so the caller learns the mapping"
         );
     }
@@ -4413,7 +4926,7 @@ mod open_tests {
         assert_ne!(status, 0);
         assert_eq!(
             item_code(&events),
-            Some(lore_revision::event::LoreErrorCode::InvalidArguments)
+            Some(lore_base::error::InvalidArguments::FFI_CODE)
         );
     }
 
@@ -4457,7 +4970,7 @@ mod open_tests {
         assert_ne!(status, 0);
         assert_eq!(
             item_code(&events),
-            Some(lore_revision::event::LoreErrorCode::InvalidArguments)
+            Some(lore_base::error::InvalidArguments::FFI_CODE)
         );
         assert_eq!(
             std::fs::read(&target).unwrap(),
@@ -4503,7 +5016,7 @@ mod open_tests {
         assert_ne!(status, 0);
         assert_eq!(
             item_code(&events),
-            Some(lore_revision::event::LoreErrorCode::InvalidArguments)
+            Some(lore_base::error::InvalidArguments::FFI_CODE)
         );
         assert_eq!(
             std::fs::read(&target).unwrap(),
@@ -4554,11 +5067,7 @@ mod open_tests {
             )
             .await;
             assert_eq!(status, 0, "{tag}");
-            assert_eq!(
-                item_code(&events),
-                Some(lore_revision::event::LoreErrorCode::None),
-                "{tag}"
-            );
+            assert_eq!(item_code(&events), Some(0), "{tag}");
             assert!(
                 std::fs::read(&target).unwrap().is_empty(),
                 "{tag}: an empty selection at the end of the content still writes the file"
@@ -4599,10 +5108,7 @@ mod open_tests {
         .await;
         assert_eq!(status, 0);
         assert_eq!(completes.len(), 1);
-        assert_eq!(
-            completes[0].error_code,
-            lore_revision::event::LoreErrorCode::None
-        );
+        assert_eq!(completes[0].error.error_code, 0);
         assert_eq!(
             completes[0].address.hash,
             Hash::default(),
@@ -4628,7 +5134,7 @@ mod open_tests {
         assert_ne!(status, 0);
         assert_eq!(
             item_code(&events),
-            Some(lore_revision::event::LoreErrorCode::AddressNotFound)
+            Some(lore_base::error::AddressNotFound::FFI_CODE)
         );
         assert!(
             !target.exists(),
@@ -4660,10 +5166,10 @@ mod open_tests {
             ],
         )
         .await;
-        assert_eq!(status, -1);
+        assert_eq!(status, lore_base::error::AddressNotFound::FFI_CODE);
         assert_eq!(
             item_code(&events),
-            Some(lore_revision::event::LoreErrorCode::AddressNotFound)
+            Some(lore_base::error::AddressNotFound::FFI_CODE)
         );
         assert_eq!(
             std::fs::read(&target).unwrap(),
@@ -4705,8 +5211,8 @@ mod open_tests {
         assert_ne!(status, 0);
         assert_eq!(completes.len(), 1);
         assert_eq!(
-            completes[0].error_code,
-            lore_revision::event::LoreErrorCode::InvalidArguments
+            completes[0].error.error_code,
+            lore_base::error::InvalidArguments::FFI_CODE
         );
 
         let (_target_guard, target) = temp_file_path("get-file-resolved-survives");
@@ -4767,8 +5273,8 @@ mod open_tests {
         .await;
         assert_ne!(status, 0);
         assert_eq!(
-            completes[0].error_code,
-            lore_revision::event::LoreErrorCode::InvalidArguments
+            completes[0].error.error_code,
+            lore_base::error::InvalidArguments::FFI_CODE
         );
 
         let (_target_guard, target) = temp_file_path("get-file-resolved-directory-survives");
@@ -4817,8 +5323,8 @@ mod open_tests {
         .await;
         assert_ne!(status, 0);
         assert_eq!(
-            completes[0].error_code,
-            lore_revision::event::LoreErrorCode::InvalidArguments
+            completes[0].error.error_code,
+            lore_base::error::InvalidArguments::FFI_CODE
         );
     }
 
@@ -4850,8 +5356,8 @@ mod open_tests {
         .await;
         assert_ne!(status, 0);
         assert_eq!(
-            completes[0].error_code,
-            lore_revision::event::LoreErrorCode::InvalidArguments
+            completes[0].error.error_code,
+            lore_base::error::InvalidArguments::FFI_CODE
         );
         assert!(
             started.elapsed() < std::time::Duration::from_secs(3),
@@ -4886,8 +5392,8 @@ mod open_tests {
         assert_ne!(status, 0);
         assert_eq!(completes.len(), 1);
         assert_eq!(
-            completes[0].error_code,
-            lore_revision::event::LoreErrorCode::InvalidArguments
+            completes[0].error.error_code,
+            lore_base::error::InvalidArguments::FFI_CODE
         );
     }
 
@@ -4917,8 +5423,8 @@ mod open_tests {
         assert_ne!(status, 0);
         assert_eq!(completes.len(), 1);
         assert_eq!(
-            completes[0].error_code,
-            lore_revision::event::LoreErrorCode::InvalidArguments
+            completes[0].error.error_code,
+            lore_base::error::InvalidArguments::FFI_CODE
         );
     }
 
@@ -4948,7 +5454,7 @@ mod open_tests {
         assert_ne!(status, 0);
         assert_eq!(
             item_code(&events),
-            Some(lore_revision::event::LoreErrorCode::InvalidArguments)
+            Some(lore_base::error::InvalidArguments::FFI_CODE)
         );
     }
 
@@ -4983,11 +5489,11 @@ mod open_tests {
         assert_eq!(completes.len(), 1);
         assert_eq!(
             (
-                completes[0].error_code,
+                completes[0].error.error_code,
                 completes[0].stored_local,
                 completes[0].stored_remote
             ),
-            (lore_revision::event::LoreErrorCode::None, 1, 0),
+            (0, 1, 0),
         );
     }
 
@@ -5430,10 +5936,7 @@ mod open_tests {
             drop(payload);
             (
                 "put",
-                status == 0
-                    && completes
-                        .iter()
-                        .all(|c| c.error_code == lore_revision::event::LoreErrorCode::None),
+                status == 0 && completes.iter().all(|c| c.error.error_code == 0),
             )
         });
 

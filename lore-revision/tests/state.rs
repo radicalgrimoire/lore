@@ -6,16 +6,22 @@ mod tests {
 
     use std::sync::Arc;
 
+    use bytes::Bytes;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
     use lore_base::types::Address;
     use lore_base::types::CloneHeapAlloc;
+    use lore_base::types::Context;
+    use lore_base::types::Hash;
     use lore_base::types::ZeroHeapAlloc;
+    use lore_revision::lore::RepositoryId;
+    use lore_revision::metadata::Metadata;
     use lore_revision::node::*;
     use lore_revision::repository::RepositoryContext;
     use lore_revision::state::State;
     use lore_revision::state::StateData;
     use lore_revision::state::collect_new_fragments;
+    use lore_revision::util::request_tracker::StoreRequestTracker;
     use lore_storage::hash::hash_string;
     use lore_storage::local::immutable_store::LocalImmutableStore;
     use zerocopy::IntoBytes;
@@ -83,7 +89,7 @@ mod tests {
                     .with_write_token(write_token.share()),
                 );
 
-                let state = Arc::new(State::new());
+                let state = State::new();
                 state
                     .node_add(
                         repository.clone(),
@@ -177,7 +183,7 @@ mod tests {
                     .with_write_token(write_token.share()),
                 );
 
-                let state = Arc::new(State::new());
+                let state = State::new();
                 state
                     .node_add(
                         repository.clone(),
@@ -232,6 +238,74 @@ mod tests {
             .expect("Task failed");
     }
 
+    /// A state that rehashes its node names rewrites its blocks unchanged. `force_rehash_names`
+    /// takes the path of a state read in a format before `LowerCaseHash`.
+    #[tokio::test]
+    async fn a_state_rehashing_its_node_names_rewrites_its_blocks_unchanged() {
+        let (_immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let tempdir = generate_tempdir();
+                let path = tempdir.to_path_buf();
+                let immutable_store = LocalImmutableStore::new(
+                    None,
+                    lore_storage::local::immutable_store::ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("Failed to create store");
+                let write_token =
+                    lore_revision::repository::RepositoryWriteToken::acquire(path.as_path()).await;
+                let repository = Arc::new(
+                    RepositoryContext::new(
+                        default_repository_creation_args(
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(&path),
+                    )
+                    .with_write_token(write_token.share()),
+                );
+
+                let state = State::new();
+                state
+                    .node_add(
+                        repository.clone(),
+                        ROOT_NODE,
+                        Node {
+                            name_hash: hash_string("only"),
+                            ..Default::default()
+                        },
+                        "only",
+                    )
+                    .await
+                    .expect("Failed to add the node");
+                let signature = state
+                    .serialize(repository.clone(), &write_token)
+                    .await
+                    .expect("Failed to serialize");
+
+                let rehashing = State::deserialize(repository.clone(), signature)
+                    .await
+                    .expect("Failed to deserialize");
+                rehashing.force_rehash_names();
+                rehashing.mark_dirty();
+                let rehashed = rehashing
+                    .serialize(repository, &write_token)
+                    .await
+                    .expect("Failed to serialize while rehashing");
+
+                assert_eq!(
+                    rehashed, signature,
+                    "rewriting the blocks unchanged must give the same signature"
+                );
+            }))
+            .await
+            .expect("Task failed");
+    }
+
     #[tokio::test]
     async fn collect_new_name_fragments() {
         let (_immutable_store, mutable_store, execution) =
@@ -264,7 +338,7 @@ mod tests {
                     .with_write_token(write_token.share()),
                 );
 
-                let state_from = Arc::new(State::new());
+                let state_from = State::new();
 
                 let name = "test-node";
                 let node = Node {
@@ -294,6 +368,7 @@ mod tests {
                     state_from.clone(),
                     state_to.clone(),
                     true,
+                    Arc::new(StoreRequestTracker::default()),
                 )
                 .await
                 .expect("Failed to collect fragments");
@@ -327,6 +402,7 @@ mod tests {
                     state_from.clone(),
                     state_to.clone(),
                     true,
+                    Arc::new(StoreRequestTracker::default()),
                 )
                 .await
                 .expect("Failed to collect fragments");
@@ -352,6 +428,7 @@ mod tests {
                     state_from.clone(),
                     state_to.clone(),
                     true,
+                    Arc::new(StoreRequestTracker::default()),
                 )
                 .await
                 .expect("Failed to collect fragments");
@@ -372,6 +449,7 @@ mod tests {
                     state_from.clone(),
                     state_to.clone(),
                     true,
+                    Arc::new(StoreRequestTracker::default()),
                 )
                 .await
                 .expect("Failed to collect fragments");
@@ -380,6 +458,286 @@ mod tests {
                     fragments.contains(&name_address),
                     "Name table not collected as new fragment after marked as not durably stored"
                 );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A revision metadata value of type Address names a payload held in a
+    /// fragment of its own, which the walk collects so the payload reaches the
+    /// peer with the revision it belongs to.
+    ///
+    /// The payload is written before the value names it, so the first collection
+    /// pins that a blob the metadata does not name stays out: without it the
+    /// assertion that follows would hold for a walk that collected everything in
+    /// the store.
+    #[tokio::test]
+    async fn collect_new_revision_metadata_fragments() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let write_token = &fixture.write_token;
+
+                let payload = lore_revision::immutable::write(
+                    repository.clone(),
+                    Context::default(),
+                    Bytes::from_static(b"revision metadata payload"),
+                    lore_revision::immutable::write_options_from_repository(repository.clone()),
+                )
+                .await
+                .expect("Failed to write the metadata payload");
+
+                let state_from = State::new();
+                state_from
+                    .serialize(repository.clone(), write_token)
+                    .await
+                    .expect("Failed to serialize from state");
+
+                let state_to = State::new();
+                state_to
+                    .serialize(repository.clone(), write_token)
+                    .await
+                    .expect("Failed to serialize to state");
+
+                let fragments = collect_new_fragments(
+                    repository.clone(),
+                    state_from.clone(),
+                    state_to.clone(),
+                    true,
+                    Arc::new(StoreRequestTracker::default()),
+                )
+                .await
+                .expect("Failed to collect fragments");
+
+                assert!(
+                    !fragments.contains(&payload),
+                    "A payload no metadata names was collected"
+                );
+
+                let mut metadata = Metadata::new();
+                metadata
+                    .set_address("build-artifact", payload)
+                    .expect("Failed to set the metadata address");
+                let metadata_hash = metadata
+                    .serialize(repository.clone())
+                    .await
+                    .expect("Failed to serialize the metadata");
+
+                state_to.set_metadata_hash(metadata_hash);
+                state_to
+                    .serialize(repository.clone(), write_token)
+                    .await
+                    .expect("Failed to serialize to state");
+
+                let fragments = collect_new_fragments(
+                    repository.clone(),
+                    state_from.clone(),
+                    state_to.clone(),
+                    true,
+                    Arc::new(StoreRequestTracker::default()),
+                )
+                .await
+                .expect("Failed to collect fragments");
+
+                assert!(
+                    fragments.contains(&Address::zero_context_hash(metadata_hash)),
+                    "The blob holding the revision metadata was not collected"
+                );
+                assert!(
+                    fragments.contains(&payload),
+                    "The payload the revision metadata names was not collected"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    fn file_content(hash: u64) -> Address {
+        Address {
+            hash: Hash::from_u64(hash),
+            context: Context::default(),
+        }
+    }
+
+    fn file_node(name: &str, content: Address) -> Node {
+        Node {
+            flags: NodeFlags::File.bits(),
+            mode: 0o644,
+            size: 10,
+            address: content,
+            name_hash: hash_string(name),
+            ..Default::default()
+        }
+    }
+
+    /// Each file of the new revision is paired with the file of the same name in the old one,
+    /// whatever order the two sibling chains hold them in, so only content the old revision
+    /// does not name at that path is collected.
+    ///
+    /// No content is in the store, so an unpaired file would be collected. That is what makes
+    /// the absence of every unchanged file's content a check of the pairing.
+    #[tokio::test]
+    async fn collect_new_fragments_pairs_files_by_name() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let write_token = &fixture.write_token;
+
+                const FILE_COUNT: u64 = 64;
+                let state_from = State::new();
+                let mut file_ids = vec![];
+                for index in 0..FILE_COUNT {
+                    let name = format!("file-{index:03}");
+                    let file_id = state_from
+                        .node_add(
+                            repository.clone(),
+                            ROOT_NODE,
+                            file_node(&name, file_content(1000 + index)),
+                            &name,
+                        )
+                        .await
+                        .expect("Failed to add a file");
+                    file_ids.push(file_id);
+                }
+                let signature_from = state_from
+                    .serialize(repository.clone(), write_token)
+                    .await
+                    .expect("Failed to serialize from state");
+
+                let state_to = State::deserialize(repository.clone(), signature_from)
+                    .await
+                    .expect("Failed to deserialize state");
+                state_to
+                    .node_modify(repository.clone(), file_ids[10], 0o644, 10, file_content(2000))
+                    .await
+                    .expect("Failed to modify a file");
+                state_to
+                    .node_delete(repository.clone(), file_ids[20])
+                    .await
+                    .expect("Failed to delete a file");
+                for (name, content) in [("added-a", 3000), ("added-b", 3001)] {
+                    state_to
+                        .node_add(
+                            repository.clone(),
+                            ROOT_NODE,
+                            file_node(name, file_content(content)),
+                            name,
+                        )
+                        .await
+                        .expect("Failed to add a file");
+                }
+                let signature_to = state_to
+                    .serialize(repository.clone(), write_token)
+                    .await
+                    .expect("Failed to serialize to state");
+                let state_to = State::deserialize(repository.clone(), signature_to)
+                    .await
+                    .expect("Failed to deserialize state");
+
+                let fragments = collect_new_fragments(
+                    repository.clone(),
+                    state_from.clone(),
+                    state_to.clone(),
+                    true,
+                    Arc::new(StoreRequestTracker::default()),
+                )
+                .await
+                .expect("Failed to collect fragments");
+
+                for content in [2000, 3000, 3001] {
+                    assert!(
+                        fragments.contains(&file_content(content)),
+                        "Content {content} of a modified or added file was not collected"
+                    );
+                }
+                for index in 0..FILE_COUNT {
+                    assert!(
+                        !fragments.contains(&file_content(1000 + index)),
+                        "Content of file-{index:03} was collected, which the old revision already names"
+                    );
+                }
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// Every content fragment a collection looks up in the store is counted by the tracker it
+    /// is given, so each added file adds at least one request.
+    #[tokio::test]
+    async fn collect_new_fragments_counts_its_store_reads() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let write_token = &fixture.write_token;
+
+                let state_from = State::new();
+                let signature_from = state_from
+                    .serialize(repository.clone(), write_token)
+                    .await
+                    .expect("Failed to serialize from state");
+
+                let state_to = State::deserialize(repository.clone(), signature_from)
+                    .await
+                    .expect("Failed to deserialize state");
+                const ADDED: u64 = 8;
+                for index in 0..ADDED {
+                    let name = format!("added-{index}");
+                    state_to
+                        .node_add(
+                            repository.clone(),
+                            ROOT_NODE,
+                            file_node(&name, file_content(4000 + index)),
+                            &name,
+                        )
+                        .await
+                        .expect("Failed to add a file");
+                }
+                let signature_to = state_to
+                    .serialize(repository.clone(), write_token)
+                    .await
+                    .expect("Failed to serialize to state");
+                let state_to = State::deserialize(repository.clone(), signature_to)
+                    .await
+                    .expect("Failed to deserialize state");
+
+                let tracker = Arc::new(StoreRequestTracker::default());
+                collect_new_fragments(
+                    repository.clone(),
+                    state_from.clone(),
+                    state_to.clone(),
+                    true,
+                    tracker.clone(),
+                )
+                .await
+                .expect("Failed to collect fragments");
+
+                assert!(
+                    tracker.requests() >= ADDED,
+                    "{} requests counted for {ADDED} added files",
+                    tracker.requests()
+                );
+                assert!(tracker.peak_in_flight() >= 1);
             }))
             .await
             .expect("Test task failed");
@@ -394,76 +752,67 @@ mod tests {
     }
 
     use lore_revision::change;
-    use lore_revision::change::FileAction;
     use lore_revision::state::compute_change_flags;
 
     #[test]
-    fn returns_none_for_default_node_with_valid_to() {
+    fn returns_none_for_a_node_carrying_no_flags() {
         let node = Node::default();
-        let flags = compute_change_flags(&node, FileAction::Keep, true);
+        let flags = compute_change_flags(&node);
         assert_eq!(flags, change::Flags::None);
     }
 
+    /// A modification is what a walk measured against its to state, which no node states about
+    /// itself, so the walk joins it onto the flags the node carries.
     #[test]
-    fn sets_modify_flag_for_keep_action_with_invalid_to_node() {
-        let node = Node::default();
-        let flags = compute_change_flags(&node, FileAction::Keep, false);
-        assert!(flags.contains(change::Flags::Modify));
-    }
-
-    #[test]
-    fn does_not_set_modify_flag_for_add_action_with_invalid_to_node() {
-        let node = Node::default();
-        let flags = compute_change_flags(&node, FileAction::Add, false);
-        assert!(!flags.contains(change::Flags::Modify));
-    }
-
-    #[test]
-    fn does_not_set_modify_flag_for_delete_action_with_invalid_to_node() {
-        let node = Node::default();
-        let flags = compute_change_flags(&node, FileAction::Delete, false);
-        assert!(!flags.contains(change::Flags::Modify));
+    fn a_nodes_flags_never_state_a_modification() {
+        for node in [
+            Node::default(),
+            node_with_flags(NodeFlags::Staged.bits()),
+            node_with_flags(NodeFlags::StagedMergeConflict.bits()),
+        ] {
+            assert!(!compute_change_flags(&node).contains(change::Flags::Modify));
+        }
     }
 
     #[test]
     fn sets_staged_flag_when_node_is_staged() {
         let node = node_with_flags(NodeFlags::Staged.bits());
-        let flags = compute_change_flags(&node, FileAction::Keep, true);
+        let flags = compute_change_flags(&node);
         assert!(flags.contains(change::Flags::Staged));
     }
 
     #[test]
     fn sets_merge_flag_when_node_is_staged_merge() {
         let node = node_with_flags(NodeFlags::StagedMerge.bits());
-        let flags = compute_change_flags(&node, FileAction::Keep, true);
+        let flags = compute_change_flags(&node);
         assert!(flags.contains(change::Flags::Merge));
     }
 
     #[test]
     fn sets_conflict_flag_when_node_is_merge_conflict() {
         let node = node_with_flags(NodeFlags::StagedMergeConflict.bits());
-        let flags = compute_change_flags(&node, FileAction::Keep, true);
+        let flags = compute_change_flags(&node);
         assert!(flags.contains(change::Flags::Conflict));
     }
 
     #[test]
     fn sets_conflict_resolved_flag_when_node_is_merge_resolved() {
         let node = node_with_flags(NodeFlags::StagedMergeResolved.bits());
-        let flags = compute_change_flags(&node, FileAction::Keep, true);
+        let flags = compute_change_flags(&node);
         assert!(flags.contains(change::Flags::ConflictResolved));
     }
 
     #[test]
     fn sets_conflict_mine_flag_when_node_is_merge_mine() {
         let node = node_with_flags(NodeFlags::StagedMergeMine.bits());
-        let flags = compute_change_flags(&node, FileAction::Keep, true);
+        let flags = compute_change_flags(&node);
         assert!(flags.contains(change::Flags::ConflictMine));
     }
 
     #[test]
     fn sets_conflict_theirs_flag_when_node_is_merge_theirs() {
         let node = node_with_flags(NodeFlags::StagedMergeTheirs.bits());
-        let flags = compute_change_flags(&node, FileAction::Keep, true);
+        let flags = compute_change_flags(&node);
         assert!(flags.contains(change::Flags::ConflictTheirs));
     }
 
@@ -471,9 +820,7 @@ mod tests {
     fn combines_multiple_flags() {
         // Node that is staged and also a merge conflict
         let node = node_with_flags(NodeFlags::StagedMergeConflict.bits());
-        let flags = compute_change_flags(&node, FileAction::Keep, false);
-        // Should have Modify (from invalid to), Staged, Merge, and Conflict
-        assert!(flags.contains(change::Flags::Modify));
+        let flags = compute_change_flags(&node);
         assert!(flags.contains(change::Flags::Staged));
         assert!(flags.contains(change::Flags::Merge));
         assert!(flags.contains(change::Flags::Conflict));
@@ -541,7 +888,7 @@ mod tests {
                 let repository = Arc::new(RepositoryContext::new(
                     default_repository_creation_args(immutable_store, mutable_store),
                 ));
-                body(repository, Arc::new(State::new())).await;
+                body(repository, State::new()).await;
             }))
             .await
             .expect("Test task failed");
@@ -1229,11 +1576,20 @@ mod single_file_compare_result_tests {
         );
     }
 
-    fn make_change_state(repository: Arc<RepositoryContext>, context: Context) -> NodeChangeState {
+    fn make_change_state(
+        repository: Arc<RepositoryContext>,
+        context: Context,
+        path: &str,
+    ) -> NodeChangeState {
         NodeChangeState {
-            repository,
-            state: Arc::new(State::new()),
-            node: INVALID_NODE,
+            mapping: lore_revision::state::NodeMapping {
+                repository,
+                state: State::new(),
+                path: RelativePath::new_from_initial_path(path).unwrap_or_default(),
+                node: INVALID_NODE,
+            },
+            observed: None,
+            mode: 0,
             flags: NodeFlags::NoFlags,
             address: Address {
                 hash: Hash::default(),
@@ -1242,6 +1598,8 @@ mod single_file_compare_result_tests {
         }
     }
 
+    /// Both sides stand where the change does, as a walk leaves them: coalescing a delete and an
+    /// add into a move carries the delete side across, and the source it reports comes from there.
     fn make_change(
         repository: Arc<RepositoryContext>,
         action: FileAction,
@@ -1252,12 +1610,38 @@ mod single_file_compare_result_tests {
         NodeChange {
             action,
             flags: change::Flags::None,
-            from: make_change_state(repository.clone(), from_context),
-            to: make_change_state(repository, to_context),
-            path: RelativePath::new_from_initial_path(path).unwrap_or_default(),
-            from_path: None,
-            observed: None,
+            from: make_change_state(repository.clone(), from_context, path),
+            to: make_change_state(repository, to_context, path),
         }
+    }
+
+    /// A mount of the repository `link_repository` names, added or deleted at `path`.
+    fn make_link_change(
+        repository: Arc<RepositoryContext>,
+        action: FileAction,
+        path: &str,
+        link_repository: Context,
+    ) -> NodeChange {
+        let mut change = if action == FileAction::Delete {
+            make_change(
+                repository,
+                action,
+                path,
+                link_repository,
+                Context::default(),
+            )
+        } else {
+            make_change(
+                repository,
+                action,
+                path,
+                Context::default(),
+                link_repository,
+            )
+        };
+        change.from.flags = NodeFlags::Link;
+        change.to.flags = NodeFlags::Link;
+        change
     }
 
     /// Create a Context from a u128 value for testing
@@ -1310,7 +1694,7 @@ mod single_file_compare_result_tests {
 
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].action, FileAction::Add);
-        assert_eq!(changes[0].path.as_str(), "new_file.txt");
+        assert_eq!(changes[0].path().as_str(), "new_file.txt");
     }
 
     #[tokio::test]
@@ -1329,7 +1713,7 @@ mod single_file_compare_result_tests {
 
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].action, FileAction::Delete);
-        assert_eq!(changes[0].path.as_str(), "deleted_file.txt");
+        assert_eq!(changes[0].path().as_str(), "deleted_file.txt");
     }
 
     #[tokio::test]
@@ -1359,11 +1743,36 @@ mod single_file_compare_result_tests {
         // Should have exactly one move change
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].action, FileAction::Move);
-        assert_eq!(changes[0].path.as_str(), "new/path.txt");
+        assert_eq!(changes[0].path().as_str(), "new/path.txt");
         assert_eq!(
-            changes[0].from_path.as_ref().map(|p| p.as_str()),
+            changes[0].move_source().map(|p| p.as_str()),
             Some("old/path.txt")
         );
+    }
+
+    #[tokio::test]
+    async fn mounts_of_one_repository_stay_separate_add_and_delete() {
+        let repo = new_test_context().await;
+        let link_repository = context_from_u128(42);
+
+        let mut changes = vec![
+            make_link_change(
+                repo.clone(),
+                FileAction::Delete,
+                "vendor/part",
+                link_repository,
+            ),
+            make_link_change(repo, FileAction::Add, "vendor/whole", link_repository),
+        ];
+
+        detect_and_coalesce_moves(&mut changes);
+
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].action, FileAction::Delete);
+        assert_eq!(changes[0].path().as_str(), "vendor/part");
+        assert_eq!(changes[1].action, FileAction::Add);
+        assert_eq!(changes[1].path().as_str(), "vendor/whole");
+        assert!(changes.iter().all(|change| change.move_source().is_none()));
     }
 
     #[tokio::test]
@@ -1412,7 +1821,7 @@ mod single_file_compare_result_tests {
         assert!(changes.iter().all(|c| c.action == FileAction::Move));
 
         // Both should have from_path set
-        assert!(changes.iter().all(|c| c.from_path.is_some()));
+        assert!(changes.iter().all(|c| c.move_source().is_some()));
     }
 
     #[tokio::test]
@@ -1584,10 +1993,61 @@ mod single_file_compare_result_tests {
             .iter()
             .find(|c| c.action == FileAction::Move)
             .unwrap();
-        assert_eq!(move_change.path.as_str(), "moved_to.txt");
+        assert_eq!(move_change.path().as_str(), "moved_to.txt");
         assert_eq!(
-            move_change.from_path.as_ref().map(|p| p.as_str()),
+            move_change.move_source().map(|p| p.as_str()),
             Some("moved_from.txt")
+        );
+    }
+
+    /// Dropping the folded delete leaves the changes around it where they were, which a caller
+    /// that does not sort afterwards reports in the order the walk found them.
+    #[tokio::test]
+    async fn changes_not_folded_into_a_move_keep_their_order() {
+        let repo = new_test_context().await;
+        let moved = context_from_u128(1);
+        let kept_first = context_from_u128(2);
+        let kept_last = context_from_u128(3);
+
+        let mut changes = vec![
+            make_change(
+                repo.clone(),
+                FileAction::Keep,
+                "first.txt",
+                kept_first,
+                kept_first,
+            ),
+            make_change(
+                repo.clone(),
+                FileAction::Delete,
+                "moved_from.txt",
+                moved,
+                Context::default(),
+            ),
+            make_change(
+                repo.clone(),
+                FileAction::Keep,
+                "last.txt",
+                kept_last,
+                kept_last,
+            ),
+            make_change(
+                repo,
+                FileAction::Add,
+                "moved_to.txt",
+                Context::default(),
+                moved,
+            ),
+        ];
+
+        detect_and_coalesce_moves(&mut changes);
+
+        assert_eq!(
+            changes
+                .iter()
+                .map(|c| c.path().as_str())
+                .collect::<Vec<_>>(),
+            vec!["first.txt", "last.txt", "moved_to.txt"],
         );
     }
 
@@ -1626,6 +2086,100 @@ mod single_file_compare_result_tests {
         assert_eq!(changes[0].from.address.hash, Hash::from_u64(12345));
         // Also verify the file_id (context) is preserved in the from state
         assert_eq!(changes[0].from.address.context, file_id);
+    }
+
+    /// A move states what became of the content as well as of the location, so one standing at
+    /// content its source did not hold states a modification and one standing at the same content
+    /// states none.
+    #[tokio::test]
+    async fn a_coalesced_move_states_whether_the_content_changed() {
+        let repo = new_test_context().await;
+        let file_id = context_from_u128(43);
+
+        let mut carried = vec![
+            make_change(
+                repo.clone(),
+                FileAction::Delete,
+                "old.txt",
+                file_id,
+                Context::default(),
+            ),
+            make_change(
+                repo.clone(),
+                FileAction::Add,
+                "new.txt",
+                Context::default(),
+                file_id,
+            ),
+        ];
+        detect_and_coalesce_moves(&mut carried);
+        assert_eq!(carried.len(), 1);
+        assert_eq!(carried[0].action, FileAction::Move);
+        assert!(
+            !carried[0].flags.contains(change::Flags::Modify),
+            "a move carrying the content its source held states no modification"
+        );
+
+        let mut edited = vec![
+            make_change(
+                repo.clone(),
+                FileAction::Delete,
+                "old.txt",
+                file_id,
+                Context::default(),
+            ),
+            make_change(
+                repo,
+                FileAction::Add,
+                "new.txt",
+                Context::default(),
+                file_id,
+            ),
+        ];
+        edited[1].to.address.hash = Hash::from_u64(99);
+        detect_and_coalesce_moves(&mut edited);
+        assert_eq!(edited.len(), 1);
+        assert_eq!(edited[0].action, FileAction::Move);
+        assert!(
+            edited[0].flags.contains(change::Flags::Modify),
+            "a move carrying content its source did not hold states a modification"
+        );
+    }
+
+    /// The executable bit is part of what a file is, so a move that changes it is a modification
+    /// even where every byte of the content stands, as a paired walk reports one.
+    #[tokio::test]
+    async fn a_coalesced_move_states_a_mode_change_as_a_modification() {
+        let repo = new_test_context().await;
+        let file_id = context_from_u128(44);
+
+        let mut changes = vec![
+            make_change(
+                repo.clone(),
+                FileAction::Delete,
+                "old.txt",
+                file_id,
+                Context::default(),
+            ),
+            make_change(
+                repo,
+                FileAction::Add,
+                "new.txt",
+                Context::default(),
+                file_id,
+            ),
+        ];
+        changes[1].to.mode = lore_revision::node::NodeFileMode::Executable.bits();
+
+        detect_and_coalesce_moves(&mut changes);
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].action, FileAction::Move);
+        assert_eq!(
+            changes[0].from.address.hash, changes[0].to.address.hash,
+            "the content is meant to stand, so only the mode answers for the modification"
+        );
+        assert!(changes[0].flags.contains(change::Flags::Modify));
     }
 }
 
@@ -1735,6 +2289,23 @@ mod is_file_modified_chunking_compat {
     /// execution context the store operations read.
     ///
     /// The directory outlives `body`, which is what lets it write the files to hash.
+    /// The content a file the test wrote holds, for exercising the storage comparison directly.
+    /// Logic outside the provider names no file; these tests are the comparison's own.
+    fn file_content(path: &std::path::Path) -> lore_storage::ContentSource<'_> {
+        lore_storage::ContentSource::file(path)
+    }
+
+    /// An operation on the repository, which is what every caller compares a file through.
+    async fn working_operation(
+        repository: &Arc<RepositoryContext>,
+    ) -> Arc<lore_revision::fs::filesystem_provider::InstanceOperationImpl> {
+        repository
+            .file_system()
+            .begin_operation()
+            .await
+            .expect("beginning an operation")
+    }
+
     async fn on_a_repository<Body, Run>(body: Body)
     where
         Body: FnOnce(Arc<RepositoryContext>, PathBuf, Context) -> Run,
@@ -1789,7 +2360,8 @@ mod is_file_modified_chunking_compat {
                     repository.clone(),
                     address,
                     Some(size),
-                    &lore_storage::ContentHashMemo::new(path.as_path()),
+                    &file_content(&path),
+                    &lore_storage::ContentHashes::default(),
                 )
                 .await
                 .expect("Failed to compare small file"),
@@ -1819,7 +2391,8 @@ mod is_file_modified_chunking_compat {
                     repository.clone(),
                     address,
                     Some(size),
-                    &lore_storage::ContentHashMemo::new(path.as_path()),
+                    &file_content(&path),
+                    &lore_storage::ContentHashes::default(),
                 )
                 .await
                 .expect("Failed to compare small file"),
@@ -1842,7 +2415,7 @@ mod is_file_modified_chunking_compat {
 
             let (address, _) = immutable::write_from_file(
                 repository.clone(),
-                path.as_path(),
+                &lore_storage::ContentSource::file(path.as_path()),
                 context,
                 lore_storage::WriteOptions::default().no_remote_write(),
             )
@@ -1862,7 +2435,8 @@ mod is_file_modified_chunking_compat {
                     empty,
                     address,
                     Some(size),
-                    &lore_storage::ContentHashMemo::new(path.as_path()),
+                    &file_content(&path),
+                    &lore_storage::ContentHashes::default(),
                 )
                 .await
                 .expect("Failed to compare large file"),
@@ -1892,7 +2466,8 @@ mod is_file_modified_chunking_compat {
                     repository.clone(),
                     address,
                     Some(size),
-                    &lore_storage::ContentHashMemo::new(path.as_path()),
+                    &file_content(&path),
+                    &lore_storage::ContentHashes::default(),
                 )
                 .await
                 .expect("Failed to compare large file"),
@@ -1932,7 +2507,8 @@ mod is_file_modified_chunking_compat {
                 file_size,
                 &RelativePath::new_from_initial_path("large.bin").unwrap(),
                 true,
-                None,
+                working_operation(&repository).await.as_ref(),
+                &lore_storage::ContentHashes::default(),
             )
             .await
             .expect("file_modification failed")
@@ -1975,7 +2551,8 @@ mod is_file_modified_chunking_compat {
                     size,
                     &relative_path,
                     true,
-                    None,
+                    working_operation(&repository).await.as_ref(),
+                &lore_storage::ContentHashes::default(),
                 )
                     .await
                     .expect("file_modification failed")
@@ -2020,7 +2597,8 @@ mod is_file_modified_chunking_compat {
                     size,
                     &relative_path,
                     true,
-                    None,
+                    working_operation(&repository).await.as_ref(),
+                &lore_storage::ContentHashes::default(),
                 )
                     .await
                     .expect("file_modification failed")
@@ -2052,15 +2630,22 @@ mod block_single_flight {
     use lore_base::types::Partition;
     use lore_base::types::TypedBytes;
     use lore_revision::immutable;
+    use lore_revision::immutable::ReadFromImmutable;
     use lore_revision::interface::ExecutionContext;
+    use lore_revision::nametable::NameTable;
+    use lore_revision::node::BLOCK_NODE_COUNT;
     use lore_revision::node::Node;
+    use lore_revision::node::NodeBlock;
     use lore_revision::node::NodeFileMetadata;
     use lore_revision::node::NodeFileMetadataBlock;
     use lore_revision::node::ROOT_NODE;
     use lore_revision::node::node_to_file_metadata;
     use lore_revision::repository::RepositoryContext;
     use lore_revision::repository::RepositoryWriteToken;
+    use lore_revision::state::MAX_CHECKED_FILE_METADATA_BLOCKS;
     use lore_revision::state::State;
+    use lore_revision::state::StateData;
+    use lore_revision::state::Tree;
     use lore_storage::ImmutableStore;
     use lore_storage::MutableStore;
     use lore_storage::StoreError;
@@ -2068,12 +2653,14 @@ mod block_single_flight {
     use lore_storage::StoreMatchResult;
     use lore_storage::StoreObliterateStats;
     use lore_storage::hash::hash_string;
+    use lore_storage::immutable_store::CopyBehavior;
     use lore_storage::local::immutable_store::LocalImmutableStore;
 
     use crate::tests::RepositoryContextCreationArgsExt;
     use crate::tests::TempDir;
     use crate::tests::default_repository_creation_args;
     use crate::tests::generate_tempdir;
+    use crate::tests::setup_test_execution;
     use crate::tests::test_store_create;
 
     /// Tasks per burst. Large enough that a store read per task is unmistakable
@@ -2084,6 +2671,10 @@ mod block_single_flight {
     /// inside this window, so a state that does not gate its block reads does
     /// them all, rather than losing a race it would usually win by accident.
     const READ_DELAY: Duration = Duration::from_millis(50);
+
+    /// The most a block lookup's future may hold: the resident check and the box its load is in.
+    /// A load held inline takes kilobytes.
+    const LOOKUP_FUTURE_BUDGET: usize = 256;
 
     /// Counts the payload reads reaching the store underneath, per address, and
     /// paces them.
@@ -2106,6 +2697,16 @@ mod block_single_flight {
 
     #[async_trait]
     impl ImmutableStore for CountingStore {
+        /// Joins the claim of the store this one wraps.
+        async fn hold_for_command(
+            self: std::sync::Arc<Self>,
+        ) -> std::result::Result<
+            Option<lore_storage::local::store_lock::StoreGuard>,
+            lore_storage::StoreError,
+        > {
+            lore_storage::ImmutableStore::hold_for_command(self.inner.clone()).await
+        }
+
         async fn get(
             self: Arc<Self>,
             partition: Partition,
@@ -2214,7 +2815,7 @@ mod block_single_flight {
             source_address: Address,
             destination_partition: Partition,
             destination_context: Context,
-            durable: bool,
+            behavior: CopyBehavior,
         ) -> Result<(), StoreError> {
             self.inner
                 .clone()
@@ -2223,7 +2824,7 @@ mod block_single_flight {
                     source_address,
                     destination_partition,
                     destination_context,
-                    durable,
+                    behavior,
                 )
                 .await
         }
@@ -2243,6 +2844,8 @@ mod block_single_flight {
         node_block: Address,
         /// Store address of the file metadata block.
         metadata_block: Address,
+        /// Store address of the file metadata block address list.
+        metadata_list: Address,
     }
 
     /// Store address of block `block_index` in the address list rooted at `list`.
@@ -2327,6 +2930,7 @@ mod block_single_flight {
         Seed {
             node_block: block_address(&repository, tree.hash_node, block_index).await,
             metadata_block: block_address(&repository, tree.hash_file_metadata, block_index).await,
+            metadata_list: Address::zero_context_hash(tree.hash_file_metadata),
             _tempdir: tempdir,
             store,
             repository,
@@ -2422,6 +3026,11 @@ mod block_single_flight {
                     reads.values().all(|&count| count == 1),
                     "the burst must read nothing twice, got {reads:?}"
                 );
+                assert!(
+                    !reads.contains_key(&seed.metadata_list)
+                        && !reads.contains_key(&seed.metadata_block),
+                    "a node block load reads no file metadata, got {reads:?}"
+                );
             }))
             .await
             .expect("Test task failed");
@@ -2461,6 +3070,496 @@ mod block_single_flight {
                 assert!(
                     reads.values().all(|&count| count == 1),
                     "the burst must read nothing twice, got {reads:?}"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// Every add asks for its block's file metadata block, to clear what a recycled slot may
+    /// still carry, and lets go of it when the slot is clear. A run of adds into one block must
+    /// still cost the store one read of it.
+    #[tokio::test]
+    async fn adds_into_a_block_with_stored_metadata_read_it_once() {
+        let (_, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let seed = Box::pin(seeded_repository(mutable_store)).await;
+                let state = State::deserialize(seed.repository.clone(), seed.signature)
+                    .await
+                    .expect("Failed to deserialize state");
+                seed.store.take_reads();
+
+                for index in 0..BURST {
+                    let name = format!("added{index}");
+                    let node = state
+                        .node_add(
+                            seed.repository.clone(),
+                            ROOT_NODE,
+                            Node {
+                                name_hash: hash_string(&name),
+                                ..Default::default()
+                            },
+                            &name,
+                        )
+                        .await
+                        .expect("Failed to add a node");
+                    assert_eq!(
+                        NodeFileMetadataBlock::index(node_to_file_metadata(node)),
+                        seed.block_index,
+                        "every add lands in the block whose file metadata is stored"
+                    );
+                }
+
+                let reads = seed.store.take_reads();
+                assert_eq!(
+                    reads.get(&seed.metadata_block).copied(),
+                    Some(1),
+                    "{BURST} adds into one block must read its file metadata block once"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// An add into a block with no file metadata stored is answered by the address list once
+    /// it is read. Keeping the zeroed block the first such add is handed would hold 65,568 bytes
+    /// for nothing.
+    #[tokio::test]
+    async fn a_state_keeps_no_metadata_block_with_nothing_stored() {
+        let (_, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let seed = Box::pin(seeded_repository(mutable_store)).await;
+                let state = State::deserialize(seed.repository.clone(), seed.signature)
+                    .await
+                    .expect("Failed to deserialize state");
+
+                let mut appended = None;
+                for index in 0..=BLOCK_NODE_COUNT {
+                    let name = format!("added{index}");
+                    let node = state
+                        .node_add(
+                            seed.repository.clone(),
+                            ROOT_NODE,
+                            Node {
+                                name_hash: hash_string(&name),
+                                ..Default::default()
+                            },
+                            &name,
+                        )
+                        .await
+                        .expect("Failed to add a node");
+                    let block_index = NodeFileMetadataBlock::index(node_to_file_metadata(node));
+                    if block_index != seed.block_index {
+                        appended = Some(block_index);
+                        break;
+                    }
+                }
+                let block_index = appended.expect("The adds fill the seeded block");
+
+                let kept = state
+                    .try_block_file_metadata_existing(seed.repository.clone(), block_index)
+                    .await
+                    .expect("Failed to check the file metadata block");
+                assert!(
+                    kept.is_none(),
+                    "a block with nothing stored stays out of memory"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// The stored file metadata blocks a state checks are kept, but no more of them than the
+    /// limit: past it, the block kept longest is let go of first. The tree holds a node carrying
+    /// metadata in each of one block more than the limit.
+    #[tokio::test]
+    async fn a_state_keeps_the_metadata_blocks_it_checks_up_to_a_limit() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let tempdir = generate_tempdir();
+                let path = tempdir.to_path_buf();
+                let write_token = RepositoryWriteToken::acquire(path.as_path()).await;
+                let repository = Arc::new(
+                    RepositoryContext::new(
+                        default_repository_creation_args(immutable_store, mutable_store)
+                            .with_path(&path),
+                    )
+                    .with_write_token(write_token.share()),
+                );
+
+                let blocks = MAX_CHECKED_FILE_METADATA_BLOCKS + 1;
+                let state = State::new();
+                let mut stored = Vec::with_capacity(blocks);
+                let mut index = 0;
+                while stored.len() < blocks {
+                    let name = format!("node{index}");
+                    index += 1;
+                    let node = state
+                        .node_add(
+                            repository.clone(),
+                            ROOT_NODE,
+                            Node {
+                                name_hash: hash_string(&name),
+                                ..Default::default()
+                            },
+                            &name,
+                        )
+                        .await
+                        .expect("Failed to add a node");
+                    let metadata_node = node_to_file_metadata(node);
+                    let block_index = NodeFileMetadataBlock::index(metadata_node);
+                    if stored.last() == Some(&block_index) {
+                        continue;
+                    }
+                    let metadata_block = state
+                        .block_file_metadata(repository.clone(), block_index)
+                        .await
+                        .expect("Failed to read the file metadata block");
+                    {
+                        let mut writer = metadata_block.write();
+                        writer.node(NodeFileMetadata::index(metadata_node)).metadata =
+                            Hash::from_u64(9);
+                        writer.mark_dirty();
+                    }
+                    state.block_file_metadata_modified(metadata_block, block_index);
+                    stored.push(block_index);
+                }
+                state.mark_dirty();
+                let signature = state
+                    .serialize(repository.clone(), &write_token)
+                    .await
+                    .expect("Failed to serialize");
+
+                let state = State::deserialize(repository.clone(), signature)
+                    .await
+                    .expect("Failed to deserialize state");
+                let mut read = Vec::with_capacity(blocks);
+                for &block_index in &stored {
+                    let metadata_block = state
+                        .try_block_file_metadata_existing(repository.clone(), block_index)
+                        .await
+                        .expect("Failed to read the file metadata block")
+                        .expect("Every block has metadata stored");
+                    read.push(Arc::downgrade(&metadata_block));
+                }
+
+                assert!(
+                    read[0].upgrade().is_none(),
+                    "the block read first is let go of once {blocks} have been read"
+                );
+                assert!(
+                    read[1..].iter().all(|block| block.upgrade().is_some()),
+                    "the {MAX_CHECKED_FILE_METADATA_BLOCKS} blocks read last stay in memory"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A block added since the file metadata address list was read stores nothing, which the
+    /// list read already answers: adds spilling into two new blocks, and lookups of those
+    /// blocks, read the list once and find nothing to clear in them. The seeded block is held
+    /// throughout, so the adds into it read nothing.
+    #[tokio::test]
+    async fn new_blocks_read_the_file_metadata_address_list_once() {
+        let (_, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let seed = Box::pin(seeded_repository(mutable_store)).await;
+                let state = State::deserialize(seed.repository.clone(), seed.signature)
+                    .await
+                    .expect("Failed to deserialize state");
+                seed.store.take_reads();
+                let _seeded = state
+                    .block_file_metadata(seed.repository.clone(), seed.block_index)
+                    .await
+                    .expect("Failed to read the file metadata block");
+
+                let mut added = Vec::with_capacity(2);
+                let mut index = 0;
+                while added.len() < 2 {
+                    let name = format!("added{index}");
+                    index += 1;
+                    let node = state
+                        .node_add(
+                            seed.repository.clone(),
+                            ROOT_NODE,
+                            Node {
+                                name_hash: hash_string(&name),
+                                ..Default::default()
+                            },
+                            &name,
+                        )
+                        .await
+                        .expect("Failed to add a node");
+                    let block_index = NodeFileMetadataBlock::index(node_to_file_metadata(node));
+                    if block_index != seed.block_index && added.last() != Some(&block_index) {
+                        added.push(block_index);
+                    }
+                }
+
+                for &block_index in &added {
+                    let existing = state
+                        .try_block_file_metadata_existing(seed.repository.clone(), block_index)
+                        .await
+                        .expect("Failed to check the file metadata block");
+                    assert!(existing.is_none(), "block {block_index} stores nothing");
+                    state
+                        .block_file_metadata(seed.repository.clone(), block_index)
+                        .await
+                        .expect("Failed to read the file metadata block");
+                }
+
+                let reads = seed.store.take_reads();
+                assert_eq!(
+                    reads.get(&seed.metadata_list).copied(),
+                    Some(1),
+                    "the address list is read once, got {reads:?}"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// Every future awaiting a lookup holds the lookup's future, whether or not the lookup loads,
+    /// so the load stays in a box of its own.
+    #[tokio::test]
+    async fn block_lookups_keep_their_load_out_of_their_future() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let (immutable_store, mutable_store, _execution) =
+                    test_store_create().await.expect("Failed to create stores");
+                let repository = Arc::new(RepositoryContext::new_null_context(
+                    immutable_store,
+                    mutable_store,
+                ));
+                let state = State::new();
+
+                let node_block = state.block(repository.clone(), 0);
+                let metadata_block = state.block_file_metadata(repository, 0);
+
+                assert!(
+                    size_of_val(&node_block) <= LOOKUP_FUTURE_BUDGET,
+                    "a node block lookup holds {} bytes",
+                    size_of_val(&node_block)
+                );
+                assert!(
+                    size_of_val(&metadata_block) <= LOOKUP_FUTURE_BUDGET,
+                    "a file metadata block lookup holds {} bytes",
+                    size_of_val(&metadata_block)
+                );
+            })
+            .await;
+    }
+
+    /// Futures awaiting a tree, a state or the deprecated name table hold the lookup's or the
+    /// load's future, so the store read each may make stays in a box of its own.
+    #[tokio::test]
+    async fn tree_state_and_name_table_loads_keep_their_read_out_of_their_future() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let (immutable_store, mutable_store, _execution) =
+                    test_store_create().await.expect("Failed to create stores");
+                let repository = Arc::new(RepositoryContext::new_null_context(
+                    immutable_store,
+                    mutable_store,
+                ));
+                let state = State::new();
+                let options = immutable::read_options_from_repository(&repository);
+
+                let tree = state.tree(repository.clone());
+                let tree_read =
+                    Tree::read_from_immutable(repository.clone(), Address::default(), options);
+                let state_load = State::deserialize(repository.clone(), Hash::default());
+                let state_read =
+                    StateData::read_from_immutable(repository.clone(), Address::default(), options);
+                let name_table = state.nametable(repository.clone());
+                let name_table_read = NameTable::deserialize(repository, Hash::default());
+
+                assert!(
+                    size_of_val(&tree) < size_of_val(&tree_read),
+                    "a tree lookup holds {} bytes, its read {}",
+                    size_of_val(&tree),
+                    size_of_val(&tree_read)
+                );
+                assert!(
+                    size_of_val(&state_load) < size_of_val(&state_read),
+                    "a state load holds {} bytes, its read {}",
+                    size_of_val(&state_load),
+                    size_of_val(&state_read)
+                );
+                assert!(
+                    size_of_val(&name_table) < size_of_val(&name_table_read),
+                    "a name table lookup holds {} bytes, its read {}",
+                    size_of_val(&name_table),
+                    size_of_val(&name_table_read)
+                );
+            })
+            .await;
+    }
+
+    /// A node block read holds its read of the current format, and the fallback to the older
+    /// formats, which holds a read as large and the conversion, stays in a box of its own.
+    #[tokio::test]
+    async fn a_node_block_read_keeps_the_older_formats_out_of_its_future() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let (immutable_store, mutable_store, _execution) =
+                    test_store_create().await.expect("Failed to create stores");
+                let repository = Arc::new(RepositoryContext::new_null_context(
+                    immutable_store,
+                    mutable_store,
+                ));
+                let state = State::new();
+
+                let read = NodeBlock::deserialize(repository.clone(), &state, Address::default());
+                let fallback =
+                    NodeBlock::deserialize_other_version(repository, &state, Address::default());
+
+                assert!(
+                    size_of_val(&read) < size_of_val(&fallback),
+                    "a node block read holds {} bytes, the older formats' fallback {}",
+                    size_of_val(&read),
+                    size_of_val(&fallback)
+                );
+            })
+            .await;
+    }
+
+    /// An add into a recycled slot whose name the name table refuses fails before it clears the
+    /// metadata the slot still carries; the next add that takes the slot clears it.
+    #[tokio::test]
+    async fn an_add_refusing_its_name_leaves_the_recycled_slots_metadata() {
+        let (_, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let seed = Box::pin(seeded_repository(mutable_store)).await;
+                let repository = seed.repository.clone();
+                let state = State::deserialize(repository.clone(), seed.signature)
+                    .await
+                    .expect("Failed to deserialize state");
+                let first = state
+                    .find_subnode(repository.clone(), ROOT_NODE, hash_string("first"))
+                    .await
+                    .expect("the seeded node");
+                lore_revision::state::node_discard_patch(
+                    state.clone(),
+                    repository.clone(),
+                    first,
+                    |_, _| {},
+                )
+                .await
+                .expect("Failed to discard the seeded node");
+                let slot_metadata = || {
+                    let state = state.clone();
+                    let repository = repository.clone();
+                    async move {
+                        let metadata_node = node_to_file_metadata(first);
+                        let block = state
+                            .block_file_metadata(
+                                repository,
+                                NodeFileMetadataBlock::index(metadata_node),
+                            )
+                            .await
+                            .expect("Failed to read the file metadata block");
+                        block
+                            .read()
+                            .node(NodeFileMetadata::index(metadata_node))
+                            .metadata
+                    }
+                };
+                let add = |name: &'static str| {
+                    state.node_add(
+                        repository.clone(),
+                        ROOT_NODE,
+                        Node {
+                            name_hash: hash_string(name),
+                            ..Default::default()
+                        },
+                        name,
+                    )
+                };
+
+                assert!(add("..").await.is_err(), "the name table refuses `..`");
+                assert_eq!(
+                    slot_metadata().await,
+                    Hash::from_u64(9),
+                    "the refused add cleared the recycled slot's metadata"
+                );
+
+                let added = add("second").await.expect("Failed to add a node");
+                assert_eq!(added, first, "the add takes the recycled slot");
+                assert!(
+                    slot_metadata().await.is_zero(),
+                    "the add that took the slot cleared its metadata"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// An add whose slot's file metadata block cannot be read fails before the node is
+    /// published: the parent's chain keeps only the children it had.
+    #[tokio::test]
+    async fn an_add_that_cannot_clear_its_slots_metadata_publishes_nothing() {
+        let (_, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let seed = Box::pin(seeded_repository(mutable_store)).await;
+                let state = State::deserialize(seed.repository.clone(), seed.signature)
+                    .await
+                    .expect("Failed to deserialize state");
+                seed.store
+                    .clone()
+                    .obliterate(seed.repository.id, seed.metadata_block, Arc::default())
+                    .await
+                    .expect("Failed to obliterate the file metadata block");
+
+                let added = state
+                    .node_add(
+                        seed.repository.clone(),
+                        ROOT_NODE,
+                        Node {
+                            name_hash: hash_string("second"),
+                            ..Default::default()
+                        },
+                        "second",
+                    )
+                    .await;
+
+                assert!(
+                    added.is_err(),
+                    "the add cannot clear the slot's file metadata"
+                );
+                let children = state
+                    .node_children(seed.repository.clone(), ROOT_NODE)
+                    .await
+                    .expect("the root's children");
+                assert_eq!(
+                    children.len(),
+                    1,
+                    "the root holds only the node it held: {children:?}"
                 );
             }))
             .await

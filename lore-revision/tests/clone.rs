@@ -17,8 +17,8 @@ mod tests {
     use lore_revision::repository::clone::CloneStats;
     use lore_revision::repository::clone::CloneWorkItem;
     use lore_revision::repository::clone::clone_execute;
+    use lore_revision::state::State;
     use lore_revision::util::path::RelativePath;
-    use lore_revision::util::path::RepositoryPath;
     use lore_storage::local::immutable_store;
     use lore_storage::local::mutable_store;
     use tokio::sync::Semaphore;
@@ -55,7 +55,7 @@ mod tests {
         CloneContext {
             operation: repository.file_system().begin_operation().await.unwrap(),
             repository,
-            state: Arc::default(),
+            state: State::new(),
             options: Arc::default(),
             stats: Arc::default(),
             modified_times: Arc::default(),
@@ -83,11 +83,8 @@ mod tests {
         CloneWorkItem {
             repository: repository.clone(),
             node: zero_size_file_node(),
-            repository_path: RepositoryPath::from_relative(
-                repository,
-                RelativePath::new_from_initial_path(name).expect("valid relative path"),
-            )
-            .expect("valid repository path"),
+            repository_path: RelativePath::new_from_initial_path(name)
+                .expect("valid relative path"),
         }
     }
 

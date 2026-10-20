@@ -15,6 +15,7 @@ mod tests {
     use lore_revision::revision;
     use lore_revision::revision::ResolveSearchLocation;
     use lore_revision::revision::diff::LoreRevisionDiffFileEventData;
+    use lore_revision::state::NodeMapping;
     use lore_revision::state::State;
     use lore_revision::util::path::RelativePathBuf;
 
@@ -36,10 +37,9 @@ mod tests {
         LORE_CONTEXT
             .scope(execution, async move {
                 let repository = make_repo_context().await;
-                let err = revision::resolve(
+                let err = revision::resolve_boxed(
                     repository,
                     "no-such-branch@5",
-                    None,
                     ResolveSearchLocation::Local,
                 )
                 .await
@@ -63,7 +63,7 @@ mod tests {
                 let repository = make_repo_context().await;
                 let signature = format!("{}@5", uuid::Uuid::now_v7());
                 let err =
-                    revision::resolve(repository, signature, None, ResolveSearchLocation::Local)
+                    revision::resolve_boxed(repository, signature, ResolveSearchLocation::Local)
                         .await
                         .expect_err("resolve should fail for unknown revision number");
                 assert!(
@@ -84,14 +84,91 @@ mod tests {
         LORE_CONTEXT
             .scope(execution, async move {
                 let repository = make_repo_context().await;
-                let err = revision::resolve(
+                let err = revision::resolve_boxed(
                     repository,
                     "not-a-hash-and-no-at",
-                    None,
                     ResolveSearchLocation::Local,
                 )
                 .await
                 .expect_err("resolve should fail for malformed signature");
+                assert!(
+                    err.is_revision_not_found(),
+                    "expected RevisionNotFound, got {err:?}"
+                );
+                assert!(!err.is_internal());
+            })
+            .await;
+    }
+
+    // A partial hash signature is a form that is not supported rather than a
+    // revision that could not be found: reporting it as missing would send the
+    // user looking for a revision they never named.
+    #[tokio::test]
+    async fn resolve_partial_hash_signature_is_not_supported() {
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let repository = make_repo_context().await;
+                let err =
+                    revision::resolve_boxed(repository, "abc123", ResolveSearchLocation::Local)
+                        .await
+                        .expect_err("resolve should refuse a partial hash signature");
+                assert!(err.is_not_supported(), "expected NotSupported, got {err:?}");
+                assert!(!err.is_internal());
+            })
+            .await;
+    }
+
+    // The same refusal after the `@`, where a branch is named but the signature
+    // is still only part of one.
+    #[tokio::test]
+    async fn resolve_partial_hash_signature_on_a_branch_is_not_supported() {
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let repository = make_repo_context().await;
+                let signature = format!("{}@abc123", uuid::Uuid::now_v7());
+                let err =
+                    revision::resolve_boxed(repository, signature, ResolveSearchLocation::Local)
+                        .await
+                        .expect_err("resolve should refuse a partial hash signature");
+                assert!(err.is_not_supported(), "expected NotSupported, got {err:?}");
+                assert!(!err.is_internal());
+            })
+            .await;
+    }
+
+    // Digits are a revision number at every length but one: at the full hash
+    // length they are a signature, which resolves to itself without a lookup.
+    #[tokio::test]
+    async fn resolve_reads_hash_length_digits_as_a_signature() {
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let repository = make_repo_context().await;
+                let signature = "1".repeat(lore_base::types::HASH_STRING_LENGTH);
+                let revision =
+                    revision::resolve_boxed(repository, &signature, ResolveSearchLocation::Local)
+                        .await
+                        .expect("a whole signature resolves to itself");
+                assert_eq!(revision.to_string(), signature);
+            })
+            .await;
+    }
+
+    // Revision numbering starts at one, so zero names no revision. Refused
+    // before any lookup rather than after walking the whole history.
+    #[tokio::test]
+    async fn resolve_revision_number_zero_returns_revision_not_found() {
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let repository = make_repo_context().await;
+                let signature = format!("{}@0", uuid::Uuid::now_v7());
+                let err =
+                    revision::resolve_boxed(repository, signature, ResolveSearchLocation::Local)
+                        .await
+                        .expect_err("resolve should fail for revision number zero");
                 assert!(
                     err.is_revision_not_found(),
                     "expected RevisionNotFound, got {err:?}"
@@ -113,7 +190,7 @@ mod tests {
                 let repository = make_repo_context().await;
                 let signature = format!("{}@LATEST", uuid::Uuid::now_v7());
                 let err =
-                    revision::resolve(repository, signature, None, ResolveSearchLocation::Local)
+                    revision::resolve_boxed(repository, signature, ResolveSearchLocation::Local)
                         .await
                         .expect_err("resolve should fail for unknown branch latest");
                 assert!(
@@ -171,21 +248,23 @@ mod tests {
         path: &str,
         from_path: Option<&str>,
     ) -> NodeChange {
-        let side = |node| NodeChangeState {
-            repository: repository.clone(),
-            state: state.clone(),
-            node,
+        let side = |node, side_path: &str| NodeChangeState {
+            mapping: NodeMapping {
+                repository: repository.clone(),
+                state: state.clone(),
+                path: RelativePathBuf::new().push_and_freeze(side_path),
+                node,
+            },
+            observed: None,
+            mode: 0,
             flags: NodeFlags::NoFlags,
             address: Address::default(),
         };
         NodeChange {
             action,
             flags: change::Flags::None,
-            from: side(1),
-            to: side(2),
-            path: RelativePathBuf::new().push_and_freeze(path),
-            from_path: from_path.map(|path| RelativePathBuf::new().push_and_freeze(path)),
-            observed: None,
+            from: side(1, from_path.unwrap_or_default()),
+            to: side(2, path),
         }
     }
 
@@ -197,7 +276,7 @@ mod tests {
         LORE_CONTEXT
             .scope(execution, async move {
                 let repository = make_repo_context().await;
-                let state = Arc::new(State::new());
+                let state = State::new();
                 let change = diff_change(
                     &repository,
                     &state,
@@ -222,7 +301,7 @@ mod tests {
         LORE_CONTEXT
             .scope(execution, async move {
                 let repository = make_repo_context().await;
-                let state = Arc::new(State::new());
+                let state = State::new();
                 let change = diff_change(
                     &repository,
                     &state,

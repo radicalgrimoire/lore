@@ -1,9 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+pub mod caller_buffer;
 pub mod chunker;
 pub mod compress;
 pub mod concurrency;
 pub mod conformance;
+pub mod content;
 pub mod defragment;
 pub mod error;
 pub mod errors;
@@ -25,15 +27,22 @@ pub mod mutable_store;
 pub mod options;
 pub mod packstore;
 pub mod read;
+#[cfg(not(feature = "test-util"))]
+mod read_flight;
+#[cfg(feature = "test-util")]
+pub mod read_flight;
 pub mod store_types;
-#[cfg(test)]
-pub(crate) mod test_util;
+#[cfg(feature = "test-util")]
+pub mod test_util;
 pub(crate) mod typed_bytes;
 pub(crate) mod types;
 pub mod write;
 pub mod write_stats;
 pub mod write_tracker;
 
+pub use caller_buffer::CallerBuffer;
+pub use caller_buffer::Lender;
+pub use caller_buffer::Loan;
 // Re-export compress types
 pub use compress::COMPRESSION_MODE;
 pub use compress::CompressionMode;
@@ -43,6 +52,9 @@ pub use compress::FragmentError;
 pub use compress::compress;
 pub use compress::decompress;
 pub use compress::decompress_into_slice;
+pub use compress::set_compression_level;
+pub use compress::suggest_compression_mode;
+pub use compress::writable_compression_mode;
 // Re-export concurrency primitives
 pub use concurrency::FILE_COUNT_LIMIT_DEFAULT;
 pub use concurrency::FRAGMENT_BUDGET_KIB;
@@ -57,6 +69,9 @@ pub use concurrency::file_count_limit_acquire;
 pub use concurrency::file_count_limiter;
 pub use concurrency::fragment_limiter;
 pub use concurrency::fragment_permit_count;
+pub use content::ContentHandle;
+pub use content::ContentSource;
+pub use content::WindowRead;
 // Re-export new read/write/defragment types
 pub use defragment::DefragmentSink;
 pub use error::StorageError;
@@ -85,6 +100,8 @@ pub use hash::hash_string_bytes;
 // Re-export store traits
 pub use immutable_store::ImmutableStore;
 pub use immutable_store::StoreError;
+pub(crate) use immutable_store::payload_is_content;
+pub(crate) use immutable_store::validate_buffer_capacity;
 pub use immutable_store::validate_fragment_list;
 pub use immutable_store::validate_fragment_metadata;
 pub use immutable_store::validate_fragment_payload;
@@ -114,23 +131,28 @@ pub use options::WriteOptions;
 pub use packstore::PackStore;
 pub use packstore::PackStoreRef;
 pub use packstore::PackfileError;
+pub use packstore::PackfileSize;
 pub use read::REMOTE_FETCH_INFLIGHT;
-pub use read::decompress_and_verify;
+pub use read::check_payload_sizes;
+pub use read::expand_payload;
 pub use read::load_fragment;
-pub use read::load_raw_local;
 pub use read::read;
 pub use read::read_into;
+pub use read::read_into_buffer;
 pub use read::read_into_file;
 pub use read::read_raw;
 pub use read::read_resolved;
+pub use read::read_resolved_into_buffer;
 pub use read::read_resolved_into_file;
 pub use read::read_resolved_stream;
 pub use read::read_stream;
+pub use read::remote_fetch_bytes;
 pub use read::remote_fetch_inflight;
 pub use read::write_all_to_file;
 // Re-export store types
 pub use store_types::KeyType;
 pub use store_types::KeyValueStream;
+pub use store_types::PayloadRead;
 pub use store_types::StoreGetData;
 pub use store_types::StoreMatch;
 pub use store_types::StoreMatchResult;
@@ -153,7 +175,7 @@ pub use types::deserialize_context;
 pub use types::deserialize_hash;
 /// Serde field-level helpers for hex encoding. Use with `#[serde(serialize_with = "...")]`.
 pub use types::serialize_hex;
-pub use write::ContentHashMemo;
+pub use write::ContentHashes;
 pub use write::FileMatch;
 pub use write::FusedPublish;
 pub use write::StoreResult;
@@ -168,6 +190,7 @@ pub use write::store_fragment;
 pub use write::store_raw_local;
 pub use write::stored_in_flight;
 pub use write::write_content;
+pub use write::write_content_borrowed;
 pub use write::write_from_file;
 pub use write::write_raw;
 pub use write::write_resolved;

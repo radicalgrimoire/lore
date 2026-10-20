@@ -4,6 +4,10 @@
 //! `LocalMutableStore`. Verifies the headline file-count win for client stores: cloning a 100k-file
 //! repository keeps every group at level 1, so the on-disk artifact count is bounded by 256
 //! per-group bucket files + 256 marker files (mutable) or +256 packfiles (immutable).
+//!
+//! A test holds a span over a store it writes through or runs many operations on, as a command
+//! does: `LocalImmutableStore::store` takes no claim of its own, and an operation outside any span
+//! claims the store afresh, reloading it, whenever nothing unflushed kept the flock.
 
 #[cfg(test)]
 mod tests {
@@ -12,6 +16,8 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
 
+    use lore_base::test_util::TempDir;
+    use lore_storage::ImmutableStore;
     use lore_storage::ImmutableStoreSettings;
     use lore_storage::MutableStoreSettings;
     use lore_storage::local::fan_out::FAN_OUT_THRESHOLD_DEFAULT;
@@ -19,15 +25,8 @@ mod tests {
     use rand::SeedableRng;
     use rand::rngs::StdRng;
 
-    fn temp_dir() -> PathBuf {
-        let name = format!("store_fan_out_test_{}", rand::random::<u64>());
-        let path = std::env::temp_dir().join(name);
-        std::fs::create_dir_all(&path).expect("Failed to create temp dir");
-        path
-    }
-
-    fn cleanup(path: &Path) {
-        let _ = std::fs::remove_dir_all(path);
+    fn temp_dir() -> TempDir {
+        TempDir::new("store-fan-out-test-")
     }
 
     /// Generate a deterministic 32-byte hash from a seeded RNG, evenly distributed across the hash
@@ -83,6 +82,11 @@ mod tests {
 
         let mutable = Arc::new(mutable);
         let store: Arc<dyn lore_storage::MutableStore> = mutable.clone();
+        let _span = store
+            .clone()
+            .hold_for_command()
+            .await
+            .expect("claims the store");
 
         let partition = lore_storage::Partition::default();
         let mut rng = StdRng::seed_from_u64(0xDEADBEEFCAFEBABE);
@@ -130,8 +134,6 @@ mod tests {
             total_files <= 512,
             "expected ≤512 on-disk files for level-1 mutable store, got {total_files} (every group at level 1 should write at most 1 bucket file + 1 marker file)"
         );
-
-        cleanup(&store_path);
     }
 
     /// REQ-F-1 acceptance: a fresh client `LocalImmutableStore` at level 1, after writing 100,000
@@ -141,7 +143,7 @@ mod tests {
     async fn immutable_store_at_level_one_writes_at_most_768_files_for_100k_entries() {
         let store_path = temp_dir();
         let store = lore_storage::LocalImmutableStore::new(
-            Some(store_path.clone()),
+            Some(store_path.path().to_path_buf()),
             ImmutableStoreSettings {
                 initial_fan_out_level: 1,
                 fan_out_threshold: FAN_OUT_THRESHOLD_DEFAULT,
@@ -150,6 +152,11 @@ mod tests {
         )
         .await
         .expect("Failed to create immutable store");
+        let _span = store
+            .clone()
+            .hold_for_command()
+            .await
+            .expect("claims the store");
 
         let partition = lore_storage::Partition::default();
         let mut rng = StdRng::seed_from_u64(0xDEADBEEFCAFEBABE);
@@ -194,7 +201,11 @@ mod tests {
         // All 100k addresses must be findable.
         for address in &addresses {
             let result = store
-                .find(partition, *address)
+                .find(
+                    partition,
+                    *address,
+                    lore_storage::local::immutable_store::Lookup::Read,
+                )
                 .await
                 .expect("find returned an error");
             assert_eq!(
@@ -211,8 +222,6 @@ mod tests {
             total_files <= 768,
             "expected ≤768 on-disk files for level-1 immutable store, got {total_files} (every group at level 1 should write at most 1 bucket + 1 marker + 1 packfile)"
         );
-
-        cleanup(&store_path);
     }
 
     /// Open a `LocalMutableStore` at `store_path` over a throwaway in-memory immutable store.
@@ -307,8 +316,6 @@ mod tests {
                 .expect("Lookup failed for written key");
             assert_eq!(loaded, value, "Loaded value did not match stored value");
         }
-
-        cleanup(&store_path);
     }
 
     /// The immutable store makes the same decision the same way; see
@@ -339,9 +346,17 @@ mod tests {
             context: lore_storage::Context::default(),
         };
 
-        let store = lore_storage::LocalImmutableStore::new(Some(store_path.clone()), settings())
+        let store = lore_storage::LocalImmutableStore::new(
+            Some(store_path.path().to_path_buf()),
+            settings(),
+        )
+        .await
+        .expect("Failed to create immutable store");
+        let _span = store
+            .clone()
+            .hold_for_command()
             .await
-            .expect("Failed to create immutable store");
+            .expect("claims the store");
         store
             .clone()
             .store(partition, written, fragment, Some(payload.clone()), false)
@@ -350,13 +365,21 @@ mod tests {
         let store: Arc<dyn lore_storage::ImmutableStore> = store;
         store.flush(true).await.expect("Failed to flush");
 
-        let store = lore_storage::LocalImmutableStore::new(Some(store_path.clone()), settings())
-            .await
-            .expect("Failed to reopen immutable store");
+        let store = lore_storage::LocalImmutableStore::new(
+            Some(store_path.path().to_path_buf()),
+            settings(),
+        )
+        .await
+        .expect("Failed to reopen immutable store");
         for (idx, group) in store.group.iter().enumerate() {
             let count = group.bucket_count.load(Ordering::Relaxed);
             assert_eq!(count, 1, "Group {idx} must reopen at the initial level 1");
         }
+        let _span = store
+            .clone()
+            .hold_for_command()
+            .await
+            .expect("claims the store");
         store
             .clone()
             .store(partition, untouched, fragment, Some(payload.clone()), false)
@@ -365,9 +388,12 @@ mod tests {
         let store: Arc<dyn lore_storage::ImmutableStore> = store;
         store.flush(true).await.expect("Failed to flush");
 
-        let store = lore_storage::LocalImmutableStore::new(Some(store_path.clone()), settings())
-            .await
-            .expect("Failed to reopen immutable store");
+        let store = lore_storage::LocalImmutableStore::new(
+            Some(store_path.path().to_path_buf()),
+            settings(),
+        )
+        .await
+        .expect("Failed to reopen immutable store");
         assert_eq!(
             store.group[0x42].bucket_count.load(Ordering::Relaxed),
             1,
@@ -375,7 +401,11 @@ mod tests {
         );
         for address in [written, untouched] {
             let result = store
-                .find(partition, address)
+                .find(
+                    partition,
+                    address,
+                    lore_storage::local::immutable_store::Lookup::Read,
+                )
                 .await
                 .expect("find returned an error");
             assert_eq!(
@@ -385,8 +415,6 @@ mod tests {
                 result.matching
             );
         }
-
-        cleanup(&store_path);
     }
 
     /// Per-group `bucket_count` must remain at the configured initial level when the workload
@@ -448,8 +476,6 @@ mod tests {
             }
         }
         assert!(found_marker, "Expected at least one group marker file");
-
-        cleanup(&store_path);
     }
 
     /// Server-mode default (`initial_fan_out_level` = 256) on a FRESH disk goes to fan-out-aware
@@ -514,21 +540,21 @@ mod tests {
             found_marker_at_256,
             "Expected marker file recording level 256 in at least one group"
         );
-
-        cleanup(&store_path);
     }
 
     /// REQ-F-5 acceptance: every maintenance function iterates per-group bucket arrays at the
     /// actual `bucket_count` (not a hard-coded `BUCKET_COUNT`) and leaves the store consistent.
     /// We force three groups to levels 1, 32, and 256 by setting `bucket_count` directly, populate
     /// each, then exercise (a) `flush`, (b) `evict_oldest`, and (c) `compact` — the last
-    /// dispatches to `compact_packfiles` → `compact_group_packfiles` → `evict_group_sized`,
-    /// covering the four maintenance ops the plan named.
+    /// dispatches to `compact_packfiles` → `compact_group_packfiles` → `evict_group_sized`.
+    /// Two of each group's fragments are durable, so compaction run step by step over every
+    /// group evicts them and rewrites each forced group's packfile down to its three local
+    /// fragments.
     #[tokio::test]
     async fn mixed_level_maintenance_is_consistent() {
         let store_path = temp_dir();
         let store = lore_storage::LocalImmutableStore::new(
-            Some(store_path.clone()),
+            Some(store_path.path().to_path_buf()),
             ImmutableStoreSettings {
                 initial_fan_out_level: 1,
                 ..Default::default()
@@ -536,6 +562,11 @@ mod tests {
         )
         .await
         .unwrap();
+        let _span = store
+            .clone()
+            .hold_for_command()
+            .await
+            .expect("claims the store");
 
         // Force specific groups to specific levels by setting bucket_count directly.
         store.group[0].bucket_count.store(1, Ordering::Relaxed);
@@ -546,7 +577,7 @@ mod tests {
         // under that group's level. This validates `bucket_index_for` consistency.
         let mut rng = StdRng::seed_from_u64(0xCAFE);
         for &group_idx in &[0usize, 1usize, 100usize] {
-            for _ in 0..5 {
+            for index in 0..5 {
                 let mut hash = make_hash(&mut rng);
                 hash.data_mut()[0] = group_idx as u8;
                 // Force key.data()[1] = 0 so it routes to bucket 0 under any level.
@@ -557,7 +588,11 @@ mod tests {
                 };
                 let payload = bytes::Bytes::from_static(b"test payload data");
                 let fragment = lore_storage::Fragment {
-                    flags: 0,
+                    flags: if index < 2 {
+                        lore_storage::FragmentFlags::PayloadStoredDurable.bits()
+                    } else {
+                        0
+                    },
                     size_payload: payload.len() as u32,
                     size_content: payload.len() as u64,
                 };
@@ -581,19 +616,30 @@ mod tests {
         // evict_oldest with generous capacity: no actual eviction, but the bucket-iteration path runs at every level.
         let _evicted = store.evict_oldest(1_000_000_000, None).await;
 
-        // compact with small max_size: forces compact_packfiles → compact_group_packfiles → evict_group_sized to iterate per-group bucket arrays at the actual bucket_count. We don't care whether it evicts anything; we only care that all three paths complete without error or panic at every group level.
-        let _compact_step = store_dyn
-            .clone()
-            .compact(1, None, false, None)
-            .await
-            .expect("compact must complete without error at mixed bucket levels");
+        let mut at = None;
+        for _ in 0..=lore_storage::local::immutable_store::GROUP_COUNT {
+            at = store_dyn
+                .clone()
+                .compact(1, at, false, None)
+                .await
+                .expect("compact must complete without error at mixed bucket levels");
+            if at.is_none() {
+                break;
+            }
+        }
+        assert_eq!(at, None, "compaction finishes within one step per group");
+        for &group_idx in &[0usize, 1usize, 100usize] {
+            assert_eq!(
+                store.group[group_idx].packstore.total_size().await.unwrap(),
+                3 * b"test payload data".len(),
+                "group {group_idx} is rewritten down to its three local fragments"
+            );
+        }
 
         // Maintenance ops never alter bucket_count (only fan-out does). All three forced levels survive.
         assert_eq!(store.group[0].bucket_count.load(Ordering::Relaxed), 1);
         assert_eq!(store.group[1].bucket_count.load(Ordering::Relaxed), 32);
         assert_eq!(store.group[100].bucket_count.load(Ordering::Relaxed), 256);
-
-        cleanup(&store_path);
     }
 
     /// REQ-F-3 / REQ-NF-3 acceptance: a v2-format mutable store synthesised inline (mimicking what
@@ -666,8 +712,6 @@ mod tests {
             snapshot_before, snapshot_after,
             "On-disk DATA state must be byte-identical after a read-only session (lock files excluded)"
         );
-
-        cleanup(&store_path);
     }
 
     /// REQ-F-3 / REQ-NF-3 acceptance under Decision 8: a v2-format mutable store opened for
@@ -794,8 +838,6 @@ mod tests {
             .await
             .expect("Lookup failed for written key");
         assert_eq!(loaded, value);
-
-        cleanup(&store_path);
     }
 
     /// Walks `dir` recursively, returning a map of every file `PATH→CONTENT`. Skips infrastructure
@@ -893,7 +935,6 @@ mod tests {
             }
         }
         assert!(found_v3, "No bucket files found to inspect");
-        cleanup(&store_path);
     }
 
     /// REQ-F-6 / T9(a) acceptance for `LocalMutableStore`: 5,000 entries to a single group at level
@@ -926,6 +967,11 @@ mod tests {
         .unwrap();
         let mutable = Arc::new(mutable);
         let store: Arc<dyn lore_storage::MutableStore> = mutable.clone();
+        let _span = store
+            .clone()
+            .hold_for_command()
+            .await
+            .expect("claims the store");
 
         // Pin every write to group 0x10 by fixing the first hash byte.
         let group_index: u8 = 0x10;
@@ -981,8 +1027,6 @@ mod tests {
                 .expect("Lookup failed after fan-out");
             assert_eq!(loaded, *value);
         }
-
-        cleanup(&store_path);
     }
 
     /// REQ-F-6 / T9(a) acceptance for `LocalImmutableStore`: same direct-jump fan-out semantics as
@@ -992,7 +1036,7 @@ mod tests {
     async fn immutable_5000_entries_in_one_group_fans_out_to_level_32() {
         let store_path = temp_dir();
         let store = lore_storage::LocalImmutableStore::new(
-            Some(store_path.clone()),
+            Some(store_path.path().to_path_buf()),
             ImmutableStoreSettings {
                 initial_fan_out_level: 1,
                 fan_out_threshold: FAN_OUT_THRESHOLD_DEFAULT,
@@ -1001,6 +1045,11 @@ mod tests {
         )
         .await
         .unwrap();
+        let _span = store
+            .clone()
+            .hold_for_command()
+            .await
+            .expect("claims the store");
 
         let group_index: u8 = 0x10;
         let n = 5000;
@@ -1049,15 +1098,20 @@ mod tests {
         assert_eq!(marker_level, 32, "Marker level mismatches in-memory level");
 
         for address in &addresses {
-            let result = store.find(partition, *address).await.unwrap();
+            let result = store
+                .find(
+                    partition,
+                    *address,
+                    lore_storage::local::immutable_store::Lookup::Read,
+                )
+                .await
+                .unwrap();
             assert_eq!(
                 result.matching,
                 lore_storage::StoreMatch::MatchFull,
                 "Address not findable after fan-out"
             );
         }
-
-        cleanup(&store_path);
     }
 
     /// T9(b) acceptance: load an existing on-disk store with entries spread across all level-32
@@ -1151,6 +1205,11 @@ mod tests {
                 .unwrap(),
             );
             let store: Arc<dyn lore_storage::MutableStore> = mutable.clone();
+            let _span = store
+                .clone()
+                .hold_for_command()
+                .await
+                .expect("claims the store");
             assert_eq!(
                 mutable.group[group_index as usize]
                     .bucket_count
@@ -1205,8 +1264,6 @@ mod tests {
                 );
             }
         }
-
-        cleanup(&store_path);
     }
 
     /// T9(c)+(d) acceptance: 100 concurrent writer tasks against a single group while flushes run
@@ -1238,6 +1295,11 @@ mod tests {
             .unwrap(),
         );
         let store: Arc<dyn lore_storage::MutableStore> = mutable.clone();
+        let _span = store
+            .clone()
+            .hold_for_command()
+            .await
+            .expect("claims the store");
         let group_index: u8 = 0x10;
         let partition = lore_storage::Partition::default();
 
@@ -1319,8 +1381,6 @@ mod tests {
                 "Value mismatch for concurrently-written key (CAS-retry regression)"
             );
         }
-
-        cleanup(&store_path);
     }
 
     /// REQ-F-2 / REQ-NF-2: smoke-grade latency check at level 256. Pre-populates a server-mode
@@ -1395,7 +1455,6 @@ mod tests {
             median < 1_000_000,
             "median lookup latency {median}ns is implausibly slow (>1ms)"
         );
-        cleanup(&store_path);
     }
 
     /// Reload a fan-out-aware store written by an earlier session and confirm `bucket_count` is
@@ -1475,8 +1534,6 @@ mod tests {
                 "Expected at least one group restored to bucket_count = 1 from marker"
             );
         }
-
-        cleanup(&store_path);
     }
 
     /// Helper: create a mutable store at `initial_fan_out_level=1`, write enough entries pinned
@@ -1491,7 +1548,9 @@ mod tests {
         seed: u64,
         threshold: usize,
     ) -> (
-        PathBuf,
+        // The guard, not just its path: the directory lives as long as this
+        // value, and the caller reads it after this returns.
+        TempDir,
         PathBuf,
         Vec<(lore_storage::Hash, lore_storage::Hash)>,
     ) {
@@ -1618,8 +1677,6 @@ mod tests {
         );
 
         verify_all_keys_findable_and_drop(&store_path, &keys).await;
-
-        cleanup(&store_path);
     }
 
     /// T10 crash point 2: `level.pending` written, all `.new` files in place, no renames done
@@ -1638,7 +1695,7 @@ mod tests {
                 std::fs::copy(&path, &new_path).unwrap();
             }
         }
-        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false)
+        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false, None)
             .await
             .unwrap();
 
@@ -1664,8 +1721,6 @@ mod tests {
                 .unwrap(),
             Some(32)
         );
-
-        cleanup(&store_path);
     }
 
     /// T10 crash point 3a: mid-renames. Some `.new` already renamed to final, some still as
@@ -1690,7 +1745,7 @@ mod tests {
                 }
             }
         }
-        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false)
+        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false, None)
             .await
             .unwrap();
 
@@ -1716,8 +1771,6 @@ mod tests {
                 .unwrap(),
             Some(32)
         );
-
-        cleanup(&store_path);
     }
 
     /// T10 crash points 4 and 5: all renames done, marker may or may not be written, pending
@@ -1729,7 +1782,7 @@ mod tests {
         let (store_path, group_dir, keys) = setup_post_fan_out_to_level_32(0xAA04, 200).await;
 
         // Construct: write pending=32, leave everything else alone (final files at level-32, marker=32).
-        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false)
+        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false, None)
             .await
             .unwrap();
 
@@ -1747,8 +1800,6 @@ mod tests {
                 .unwrap(),
             Some(32)
         );
-
-        cleanup(&store_path);
     }
 
     /// REQ-NF-5 / Decision 8: an existing immutable store at the current pre-fan-out version
@@ -1768,7 +1819,7 @@ mod tests {
         std::fs::write(group_dir.join("index_00"), &bucket_bytes).unwrap();
 
         let store = lore_storage::LocalImmutableStore::new(
-            Some(store_path.clone()),
+            Some(store_path.path().to_path_buf()),
             ImmutableStoreSettings::default(),
         )
         .await
@@ -1780,8 +1831,6 @@ mod tests {
             lore_storage::local::immutable_store::ImmutableStoreVersion::LastAccessInEntry as u32,
             "Current v4 store should stay at LastAccessInEntry, got {v}"
         );
-
-        cleanup(&store_path);
     }
 
     /// REQ-NF-5 / Decision 8: an existing immutable store at an older version (v1-v3) gets
@@ -1802,7 +1851,7 @@ mod tests {
         std::fs::write(group_dir.join("index_00"), &bucket_bytes).unwrap();
 
         let store = lore_storage::LocalImmutableStore::new(
-            Some(store_path.clone()),
+            Some(store_path.path().to_path_buf()),
             ImmutableStoreSettings::default(),
         )
         .await
@@ -1814,8 +1863,6 @@ mod tests {
             lore_storage::local::immutable_store::ImmutableStoreVersion::LazyFanOut as u32,
             "Older v3 store should upgrade to LazyFanOut (v5), got {v}"
         );
-
-        cleanup(&store_path);
     }
 
     /// T10 idempotency: running recovery twice (open → drop → open) leaves the store in the
@@ -1834,7 +1881,7 @@ mod tests {
                 std::fs::copy(&path, &new_path).unwrap();
             }
         }
-        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false)
+        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false, None)
             .await
             .unwrap();
 
@@ -1842,8 +1889,6 @@ mod tests {
         verify_all_keys_findable_and_drop(&store_path, &keys).await;
         // Second open: recovery is a no-op (no pending), keys still findable.
         verify_all_keys_findable_and_drop(&store_path, &keys).await;
-
-        cleanup(&store_path);
     }
 
     /// A fan-out redistributes entries in memory while the layout on disk is still the
@@ -1863,6 +1908,11 @@ mod tests {
         )
         .await;
         let store: Arc<dyn lore_storage::MutableStore> = mutable.clone();
+        let _span = store
+            .clone()
+            .hold_for_command()
+            .await
+            .expect("claims the store");
         let partition = lore_storage::Partition::default();
         let mut rng = StdRng::seed_from_u64(0xFA0_0002);
         let mut keys = Vec::with_capacity(5000);
@@ -1912,7 +1962,6 @@ mod tests {
                 _ => missing += 1,
             }
         }
-        cleanup(&store_path);
         assert_eq!(
             missing,
             0,
@@ -1927,7 +1976,7 @@ mod tests {
     async fn immutable_reads_during_a_fan_out_flush_lose_no_fragments() {
         let store_path = temp_dir();
         let store = lore_storage::LocalImmutableStore::new(
-            Some(store_path.clone()),
+            Some(store_path.path().to_path_buf()),
             ImmutableStoreSettings {
                 initial_fan_out_level: 1,
                 fan_out_threshold: FAN_OUT_THRESHOLD_DEFAULT,
@@ -1936,6 +1985,11 @@ mod tests {
         )
         .await
         .expect("Failed to create immutable store");
+        let _span = store
+            .clone()
+            .hold_for_command()
+            .await
+            .expect("claims the store");
 
         let partition = lore_storage::Partition::default();
         let payload = bytes::Bytes::from_static(b"test fragment payload data 30!");
@@ -1967,7 +2021,13 @@ mod tests {
         let reader = lore_base::lore_spawn!(async move {
             for _ in 0..40 {
                 for address in &reader_addresses {
-                    let _ = reader_store.find(partition, *address).await;
+                    let _ = reader_store
+                        .find(
+                            partition,
+                            *address,
+                            lore_storage::local::immutable_store::Lookup::Read,
+                        )
+                        .await;
                 }
             }
         });
@@ -1988,14 +2048,17 @@ mod tests {
         let mut missing = 0usize;
         for address in &addresses {
             let result = store
-                .find(partition, *address)
+                .find(
+                    partition,
+                    *address,
+                    lore_storage::local::immutable_store::Lookup::Read,
+                )
                 .await
                 .expect("find returned an error");
             if result.matching != lore_storage::StoreMatch::MatchFull {
                 missing += 1;
             }
         }
-        cleanup(&store_path);
         assert_eq!(
             missing,
             0,
@@ -2033,7 +2096,7 @@ mod tests {
         };
 
         let store = lore_storage::LocalImmutableStore::new(
-            Some(store_path.clone()),
+            Some(store_path.path().to_path_buf()),
             ImmutableStoreSettings::default(),
         )
         .await
@@ -2043,6 +2106,11 @@ mod tests {
             lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX,
             "Untouched group of a legacy store must open at the legacy level"
         );
+        let _span = store
+            .clone()
+            .hold_for_command()
+            .await
+            .expect("claims the store");
         store
             .clone()
             .store(partition, address, fragment, Some(payload.clone()), false)
@@ -2062,13 +2130,17 @@ mod tests {
         );
 
         let store = lore_storage::LocalImmutableStore::new(
-            Some(store_path.clone()),
+            Some(store_path.path().to_path_buf()),
             ImmutableStoreSettings::default(),
         )
         .await
         .expect("Failed to reopen immutable store");
         let result = store
-            .find(partition, address)
+            .find(
+                partition,
+                address,
+                lore_storage::local::immutable_store::Lookup::Read,
+            )
             .await
             .expect("find returned an error");
         assert_eq!(
@@ -2076,8 +2148,6 @@ mod tests {
             lore_storage::StoreMatch::MatchFull,
             "Fragment written to an untouched group of a legacy store must survive a reopen"
         );
-
-        cleanup(&store_path);
     }
 
     /// The mutable store makes the same decision the same way; see
@@ -2127,7 +2197,5 @@ mod tests {
             loaded, value,
             "Entry written to an untouched group of a legacy store must survive a reopen"
         );
-
-        cleanup(&store_path);
     }
 }

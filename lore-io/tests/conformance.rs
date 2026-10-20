@@ -2,43 +2,13 @@
 // SPDX-License-Identifier: MIT
 //! Backend conformance suite. Every backend must pass these tests with
 //! identical observable semantics; new backends join the [`drivers`] list.
-use std::path::PathBuf;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use futures::future::join_all;
+use lore_base::test_util::TempDir;
 use lore_io::BackendKind;
 use lore_io::IoDriver;
 use lore_io::OpenOptions;
-
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new(name: &str) -> TempDir {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "lore-io-test-{}-{}-{}",
-            std::process::id(),
-            name,
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&path).expect("failed to create temp dir");
-        TempDir { path }
-    }
-
-    fn file(&self, name: &str) -> PathBuf {
-        self.path.join(name)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
 
 /// Every backend this build has, skipping one the machine cannot run. A kernel without
 /// `io_uring`, or a container that blocks `io_uring_setup`, must not fail the suite — but the
@@ -73,8 +43,8 @@ fn pattern(len: usize, seed: u8) -> Vec<u8> {
 #[tokio::test]
 async fn write_read_roundtrip() {
     for driver in drivers() {
-        let dir = TempDir::new("roundtrip");
-        let file = driver.open(dir.file("data"), &rw_create()).await.unwrap();
+        let dir = TempDir::new("lore-io-roundtrip-");
+        let file = driver.open(dir.child("data"), &rw_create()).await.unwrap();
         let data = pattern(192 * 1024, 7);
         file.write_all_at(Bytes::from(data.clone()), 0)
             .await
@@ -84,11 +54,36 @@ async fn write_read_roundtrip() {
     }
 }
 
+/// A file opened with `std` writes, syncs its data and syncs it all through every backend.
+#[tokio::test]
+async fn an_open_std_file_writes_and_syncs_through_every_backend() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-from-std-");
+        let std_file = lore_io::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .to_std()
+            .open(dir.child("f"))
+            .expect("std open");
+        // Safety: the file moves into the wrap, and nothing else holds a handle to it.
+        let file = unsafe { lore_io::IoFile::from_std(&driver, std::sync::Arc::new(std_file)) }
+            .expect("from_std");
+        let data = pattern(4096, 5);
+        file.write_all_at(data.clone(), 0).await.expect("write");
+        file.sync_data().await.expect("sync_data");
+        file.sync_all().await.expect("sync_all");
+        let read = file.read_exact_at(data.len(), 0).await.expect("read");
+        assert_eq!(&read[..], &data[..], "{}", driver.backend_name());
+    }
+}
+
 #[tokio::test]
 async fn positional_reads_have_no_cursor() {
     for driver in drivers() {
-        let dir = TempDir::new("positional");
-        let file = driver.open(dir.file("data"), &rw_create()).await.unwrap();
+        let dir = TempDir::new("lore-io-positional-");
+        let file = driver.open(dir.child("data"), &rw_create()).await.unwrap();
         let data = pattern(1024 * 1024, 3);
         file.write_all_at(Bytes::from(data.clone()), 0)
             .await
@@ -104,8 +99,8 @@ async fn positional_reads_have_no_cursor() {
 #[tokio::test]
 async fn read_at_past_eof_returns_zero() {
     for driver in drivers() {
-        let dir = TempDir::new("past-eof");
-        let file = driver.open(dir.file("data"), &rw_create()).await.unwrap();
+        let dir = TempDir::new("lore-io-past-eof-");
+        let file = driver.open(dir.child("data"), &rw_create()).await.unwrap();
         file.write_all_at(Bytes::from_static(&[1, 2, 3]), 0)
             .await
             .unwrap();
@@ -120,8 +115,8 @@ async fn read_at_past_eof_returns_zero() {
 #[tokio::test]
 async fn read_at_is_partial_at_eof() {
     for driver in drivers() {
-        let dir = TempDir::new("partial-eof");
-        let file = driver.open(dir.file("data"), &rw_create()).await.unwrap();
+        let dir = TempDir::new("lore-io-partial-eof-");
+        let file = driver.open(dir.child("data"), &rw_create()).await.unwrap();
         let data = pattern(100, 9);
         file.write_all_at(Bytes::from(data.clone()), 0)
             .await
@@ -138,8 +133,8 @@ async fn read_at_is_partial_at_eof() {
 #[tokio::test]
 async fn read_at_honours_the_requested_length() {
     for driver in drivers() {
-        let dir = TempDir::new("read-len");
-        let file = driver.open(dir.file("data"), &rw_create()).await.unwrap();
+        let dir = TempDir::new("lore-io-read-len-");
+        let file = driver.open(dir.child("data"), &rw_create()).await.unwrap();
         let data = pattern(64 * 1024, 37);
         file.write_all_at(Bytes::from(data.clone()), 0)
             .await
@@ -155,8 +150,8 @@ async fn read_at_honours_the_requested_length() {
 #[tokio::test]
 async fn read_exact_at_fails_past_eof() {
     for driver in drivers() {
-        let dir = TempDir::new("exact-eof");
-        let file = driver.open(dir.file("data"), &rw_create()).await.unwrap();
+        let dir = TempDir::new("lore-io-exact-eof-");
+        let file = driver.open(dir.child("data"), &rw_create()).await.unwrap();
         file.write_all_at(Bytes::from_static(&[0u8; 100]), 0)
             .await
             .unwrap();
@@ -168,8 +163,8 @@ async fn read_exact_at_fails_past_eof() {
 #[tokio::test]
 async fn write_at_extends_file() {
     for driver in drivers() {
-        let dir = TempDir::new("extend");
-        let file = driver.open(dir.file("data"), &rw_create()).await.unwrap();
+        let dir = TempDir::new("lore-io-extend-");
+        let file = driver.open(dir.child("data"), &rw_create()).await.unwrap();
         let offset = 1024 * 1024;
         file.write_all_at(Bytes::from_static(&[7u8; 4096]), offset)
             .await
@@ -181,8 +176,8 @@ async fn write_at_extends_file() {
 #[tokio::test]
 async fn write_at_accepts_bytes() {
     for driver in drivers() {
-        let dir = TempDir::new("bytes");
-        let file = driver.open(dir.file("data"), &rw_create()).await.unwrap();
+        let dir = TempDir::new("lore-io-bytes-");
+        let file = driver.open(dir.child("data"), &rw_create()).await.unwrap();
         let data = Bytes::from(pattern(8192, 11));
         file.write_all_at(data.clone(), 0).await.unwrap();
         let read = file.read_exact_at(data.len(), 0).await.unwrap();
@@ -195,8 +190,8 @@ async fn write_at_accepts_bytes() {
 #[tokio::test]
 async fn a_write_takes_its_length_from_the_buffer() {
     for driver in drivers() {
-        let dir = TempDir::new("write-len");
-        let file = driver.open(dir.file("data"), &rw_create()).await.unwrap();
+        let dir = TempDir::new("lore-io-write-len-");
+        let file = driver.open(dir.child("data"), &rw_create()).await.unwrap();
 
         let empty = file.write_at(Bytes::new(), 0).await.unwrap();
         assert_eq!(empty.1, 0, "an empty buffer wrote bytes");
@@ -220,9 +215,9 @@ async fn a_write_takes_its_length_from_the_buffer() {
 #[tokio::test]
 async fn write_file_bytes_roundtrip() {
     for driver in drivers() {
-        let dir = TempDir::new("durable");
+        let dir = TempDir::new("lore-io-durable-");
         let data = Bytes::from(pattern(16 * 1024, 13));
-        let path = dir.file("blob");
+        let path = dir.child("blob");
         let metadata = driver
             .write_file_bytes(&path, data.clone(), true)
             .await
@@ -240,9 +235,9 @@ async fn write_file_bytes_roundtrip() {
 #[tokio::test]
 async fn read_file_bytes_roundtrip() {
     for driver in drivers() {
-        let dir = TempDir::new("read-file");
+        let dir = TempDir::new("lore-io-read-file-");
         let data = Bytes::from(pattern(48 * 1024, 19));
-        let path = dir.file("blob");
+        let path = dir.child("blob");
         driver
             .write_file_bytes(&path, data.clone(), false)
             .await
@@ -250,7 +245,7 @@ async fn read_file_bytes_roundtrip() {
         let read = driver.read_file_bytes(&path).await.unwrap();
         assert_eq!(read, data);
 
-        let empty = dir.file("empty");
+        let empty = dir.child("empty");
         driver
             .write_file_bytes(&empty, Bytes::new(), false)
             .await
@@ -258,7 +253,7 @@ async fn read_file_bytes_roundtrip() {
         assert!(driver.read_file_bytes(&empty).await.unwrap().is_empty());
 
         let error = driver
-            .read_file_bytes(dir.file("absent"))
+            .read_file_bytes(dir.child("absent"))
             .await
             .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
@@ -271,9 +266,9 @@ async fn read_file_bytes_roundtrip() {
 #[tokio::test]
 async fn whole_file_operations_reject_a_large_file() {
     for driver in drivers() {
-        let dir = TempDir::new("whole-file-limit");
+        let dir = TempDir::new("lore-io-whole-file-limit-");
 
-        let path = dir.file("too-big");
+        let path = dir.child("too-big");
         let oversized = Bytes::from(vec![0u8; lore_io::WHOLE_FILE_LIMIT + 1]);
         let error = driver
             .write_file_bytes(&path, oversized, false)
@@ -292,8 +287,8 @@ async fn whole_file_operations_reject_a_large_file() {
 #[tokio::test]
 async fn a_rejected_whole_file_write_leaves_the_file_intact() {
     for driver in drivers() {
-        let dir = TempDir::new("whole-file-intact");
-        let path = dir.file("existing");
+        let dir = TempDir::new("lore-io-whole-file-intact-");
+        let path = dir.child("existing");
         let data = Bytes::from(pattern(4096, 41));
         driver
             .write_file_bytes(&path, data.clone(), false)
@@ -313,8 +308,8 @@ async fn a_rejected_whole_file_write_leaves_the_file_intact() {
 #[tokio::test]
 async fn rename_remove_and_create_dir_all() {
     for driver in drivers() {
-        let dir = TempDir::new("fsops");
-        let nested = dir.file("a/b/c");
+        let dir = TempDir::new("lore-io-fsops-");
+        let nested = dir.child("a/b/c");
         driver.create_dir_all(&nested).await.unwrap();
         let from = nested.join("from");
         let to = nested.join("to");
@@ -336,8 +331,8 @@ async fn rename_remove_and_create_dir_all() {
 #[tokio::test]
 async fn remove_dir_all_takes_the_tree_and_reports_a_missing_one() {
     for driver in drivers() {
-        let dir = TempDir::new("removetree");
-        let root = dir.file("tree");
+        let dir = TempDir::new("lore-io-removetree-");
+        let root = dir.child("tree");
         let nested = root.join("a/b/c");
         driver.create_dir_all(&nested).await.unwrap();
         for name in ["one", "two"] {
@@ -367,8 +362,8 @@ async fn remove_dir_all_takes_the_tree_and_reports_a_missing_one() {
 #[tokio::test]
 async fn read_dir_yields_every_child_with_metadata() {
     for driver in drivers() {
-        let dir = TempDir::new("readdir");
-        let root = dir.file("tree");
+        let dir = TempDir::new("lore-io-readdir-");
+        let root = dir.child("tree");
         driver.create_dir_all(root.join("child_dir")).await.unwrap();
         driver
             .write_file_bytes(root.join("child_file"), Bytes::from_static(b"four"), false)
@@ -414,28 +409,28 @@ fn verdict(held: bool) -> Option<bool> {
 #[tokio::test]
 async fn holds_name_exactly_answers_for_a_name_the_filesystem_holds() {
     for driver in drivers() {
-        let dir = TempDir::new("holdsname");
+        let dir = TempDir::new("lore-io-holdsname-");
         driver
-            .write_file_bytes(dir.file("Rock.mesh"), Bytes::from_static(b"data"), false)
+            .write_file_bytes(dir.child("Rock.mesh"), Bytes::from_static(b"data"), false)
             .await
             .unwrap();
-        driver.create_dir_all(dir.file("Meshes")).await.unwrap();
+        driver.create_dir_all(dir.child("Meshes")).await.unwrap();
 
         assert_eq!(
-            driver.holds_name_exactly(dir.file("Rock.mesh")).await,
+            driver.holds_name_exactly(dir.child("Rock.mesh")).await,
             verdict(true)
         );
         assert_eq!(
-            driver.holds_name_exactly(dir.file("Meshes")).await,
+            driver.holds_name_exactly(dir.child("Meshes")).await,
             verdict(true)
         );
         assert_eq!(
-            driver.holds_name_exactly(dir.file("absent")).await,
+            driver.holds_name_exactly(dir.child("absent")).await,
             verdict(false)
         );
         assert_eq!(
             driver
-                .holds_name_exactly(dir.file("absent").join("Rock.mesh"))
+                .holds_name_exactly(dir.child("absent").join("Rock.mesh"))
                 .await,
             verdict(false),
             "a missing directory holds no children"
@@ -450,9 +445,9 @@ async fn holds_name_exactly_answers_for_a_name_the_filesystem_holds() {
 #[tokio::test]
 async fn holds_name_exactly_refuses_a_name_that_could_be_read_as_a_pattern() {
     for driver in drivers() {
-        let dir = TempDir::new("holdsnamewildcard");
+        let dir = TempDir::new("lore-io-holdsnamewildcard-");
         driver
-            .write_file_bytes(dir.file("Rock.mesh"), Bytes::from_static(b"data"), false)
+            .write_file_bytes(dir.child("Rock.mesh"), Bytes::from_static(b"data"), false)
             .await
             .unwrap();
 
@@ -464,7 +459,7 @@ async fn holds_name_exactly_refuses_a_name_that_could_be_read_as_a_pattern() {
             "Rock.mesh\"",
         ] {
             assert_eq!(
-                driver.holds_name_exactly(dir.file(pattern)).await,
+                driver.holds_name_exactly(dir.child(pattern)).await,
                 verdict(false),
                 "{pattern} names no file"
             );
@@ -476,17 +471,18 @@ async fn holds_name_exactly_refuses_a_name_that_could_be_read_as_a_pattern() {
 /// that has been anywhere near `MAX_PATH` hands over - `std::fs::canonicalize` returns one, and
 /// the test fixtures in this workspace are built from those. Refusing it would answer no for
 /// every path under such a root.
+
 #[tokio::test]
 #[cfg(target_family = "windows")]
 async fn holds_name_exactly_answers_for_a_verbatim_path() {
     for driver in drivers() {
-        let dir = TempDir::new("holdsnameverbatim");
+        let dir = TempDir::new("lore-io-holdsnameverbatim-");
         driver
-            .write_file_bytes(dir.file("Rock.mesh"), Bytes::from_static(b"data"), false)
+            .write_file_bytes(dir.child("Rock.mesh"), Bytes::from_static(b"data"), false)
             .await
             .unwrap();
 
-        let verbatim = PathBuf::from(format!(r"\\?\{}", dir.path.display()));
+        let verbatim = std::path::PathBuf::from(format!(r"\\?\{}", dir.path().display()));
         assert_eq!(
             driver.holds_name_exactly(verbatim.join("Rock.mesh")).await,
             verdict(true)
@@ -504,11 +500,11 @@ async fn holds_name_exactly_answers_for_a_verbatim_path() {
 #[tokio::test]
 async fn holds_name_exactly_does_not_match_a_pattern_in_a_parent() {
     for driver in drivers() {
-        let dir = TempDir::new("holdsnameparent");
-        driver.create_dir_all(dir.file("Meshes")).await.unwrap();
+        let dir = TempDir::new("lore-io-holdsnameparent-");
+        driver.create_dir_all(dir.child("Meshes")).await.unwrap();
         driver
             .write_file_bytes(
-                dir.file("Meshes").join("Rock.mesh"),
+                dir.child("Meshes").join("Rock.mesh"),
                 Bytes::from_static(b"data"),
                 false,
             )
@@ -517,7 +513,7 @@ async fn holds_name_exactly_does_not_match_a_pattern_in_a_parent() {
 
         assert_eq!(
             driver
-                .holds_name_exactly(dir.file("Mesh*s").join("Rock.mesh"))
+                .holds_name_exactly(dir.child("Mesh*s").join("Rock.mesh"))
                 .await,
             verdict(false)
         );
@@ -532,8 +528,8 @@ async fn holds_name_exactly_does_not_match_a_pattern_in_a_parent() {
 #[cfg(target_family = "windows")]
 async fn holds_name_exactly_declines_a_path_beyond_max_path() {
     for driver in drivers() {
-        let dir = TempDir::new("holdsnamelong");
-        let mut deep = dir.path.clone();
+        let dir = TempDir::new("lore-io-holdsnamelong-");
+        let mut deep = dir.path().to_path_buf();
         while deep.as_os_str().len() < 260 {
             deep = deep.join("directory-with-a-name-long-enough-to-get-there");
         }
@@ -557,8 +553,8 @@ async fn holds_name_exactly_declines_a_path_beyond_max_path() {
 #[tokio::test]
 async fn set_permissions_marks_a_file_read_only() {
     for driver in drivers() {
-        let dir = TempDir::new("permissions");
-        let path = dir.file("guarded");
+        let dir = TempDir::new("lore-io-permissions-");
+        let path = dir.child("guarded");
         driver
             .write_file_bytes(&path, Bytes::from_static(b"contents"), false)
             .await
@@ -601,8 +597,8 @@ async fn read_dir_spans_chunk_boundaries() {
         // Straddles the chunk the listing resolves per dispatch: one short of it, exactly it,
         // one past, and a count needing several refills with the last one partial.
         for count in [1usize, 255, 256, 257, 600] {
-            let dir = TempDir::new("readdir-chunks");
-            let root = dir.file(&format!("wide{count}"));
+            let dir = TempDir::new("lore-io-readdir-chunks-");
+            let root = dir.child(&format!("wide{count}"));
             driver.create_dir_all(&root).await.unwrap();
             for index in 0..count {
                 driver
@@ -630,8 +626,8 @@ async fn read_dir_spans_chunk_boundaries() {
 #[tokio::test]
 async fn read_dir_on_an_empty_directory_ends() {
     for driver in drivers() {
-        let dir = TempDir::new("readdir-empty");
-        let root = dir.file("empty");
+        let dir = TempDir::new("lore-io-readdir-empty-");
+        let root = dir.child("empty");
         driver.create_dir_all(&root).await.unwrap();
 
         let mut listing = driver.read_dir(&root).await.unwrap();
@@ -644,9 +640,9 @@ async fn read_dir_on_an_empty_directory_ends() {
 #[tokio::test]
 async fn read_dir_reports_a_missing_directory() {
     for driver in drivers() {
-        let dir = TempDir::new("readdir-missing");
+        let dir = TempDir::new("lore-io-readdir-missing-");
         let error = driver
-            .read_dir(dir.file("absent"))
+            .read_dir(dir.child("absent"))
             .await
             .err()
             .expect("listing a missing directory must fail");
@@ -657,8 +653,8 @@ async fn read_dir_reports_a_missing_directory() {
 #[tokio::test]
 async fn concurrent_disjoint_writes_share_one_handle() {
     for driver in drivers() {
-        let dir = TempDir::new("concurrent");
-        let file = driver.open(dir.file("data"), &rw_create()).await.unwrap();
+        let dir = TempDir::new("lore-io-concurrent-");
+        let file = driver.open(dir.child("data"), &rw_create()).await.unwrap();
         let region = 64 * 1024usize;
         let regions = 16;
 
@@ -684,17 +680,66 @@ async fn concurrent_disjoint_writes_share_one_handle() {
     }
 }
 
+/// The completion of a resize is dropped once the length is set, whether or not the call is still
+/// awaited, as an atomic write's is. Observed through a completion that reads the file's length as
+/// it is dropped.
+#[tokio::test]
+async fn the_completion_of_a_resize_is_dropped_once_the_length_is_set() {
+    struct Sized {
+        path: std::path::PathBuf,
+        len: std::sync::mpsc::Sender<Option<u64>>,
+    }
+
+    impl Drop for Sized {
+        fn drop(&mut self) {
+            let _ = self
+                .len
+                .send(std::fs::metadata(&self.path).ok().map(|meta| meta.len()));
+        }
+    }
+
+    for driver in drivers() {
+        for awaited in [true, false] {
+            let dir = TempDir::new("lore-io-resize-completion-");
+            let file = driver.open(dir.child("data"), &rw_create()).await.unwrap();
+            let (len, sized) = std::sync::mpsc::channel();
+            let resize = file.set_len(
+                4096,
+                Sized {
+                    path: dir.child("data"),
+                    len,
+                },
+            );
+            if awaited {
+                resize.await.unwrap();
+            } else {
+                // Polled once, which dispatches the resize, and dropped.
+                let _ = tokio::time::timeout(std::time::Duration::ZERO, resize).await;
+            }
+            let len = sized
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("the completion is dropped");
+            assert_eq!(
+                len,
+                Some(4096),
+                "{} awaited {awaited}: the completion was dropped before the length was set",
+                driver.backend_name()
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn set_len_resizes_the_file() {
     for driver in drivers() {
-        let dir = TempDir::new("sizing");
-        let file = driver.open(dir.file("data"), &rw_create()).await.unwrap();
+        let dir = TempDir::new("lore-io-sizing-");
+        let file = driver.open(dir.child("data"), &rw_create()).await.unwrap();
 
-        file.set_len(4096).await.unwrap();
+        file.set_len(4096, ()).await.unwrap();
         assert_eq!(file.metadata().await.unwrap().len(), 4096);
 
         // Extending leaves a hole that reads as zeros rather than a short file.
-        file.set_len(2 * 1024 * 1024).await.unwrap();
+        file.set_len(2 * 1024 * 1024, ()).await.unwrap();
         assert_eq!(file.metadata().await.unwrap().len(), 2 * 1024 * 1024);
         let tail = file
             .read_exact_at(4096, 2 * 1024 * 1024 - 4096)
@@ -702,7 +747,7 @@ async fn set_len_resizes_the_file() {
             .unwrap();
         assert_eq!(&tail[..], &[0u8; 4096][..]);
 
-        file.set_len(1024).await.unwrap();
+        file.set_len(1024, ()).await.unwrap();
         assert_eq!(file.metadata().await.unwrap().len(), 1024);
         file.sync_all().await.unwrap();
     }
@@ -711,9 +756,9 @@ async fn set_len_resizes_the_file() {
 #[tokio::test]
 async fn open_missing_file_fails_not_found() {
     for driver in drivers() {
-        let dir = TempDir::new("missing");
+        let dir = TempDir::new("lore-io-missing-");
         let error = driver
-            .open(dir.file("absent"), &OpenOptions::new().read(true))
+            .open(dir.child("absent"), &OpenOptions::new().read(true))
             .await
             .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
@@ -732,8 +777,8 @@ async fn open_missing_file_fails_not_found() {
 fn operations_complete_under_a_foreign_executor() {
     for driver in drivers() {
         futures::executor::block_on(async {
-            let dir = TempDir::new("foreign-executor");
-            let file = driver.open(dir.file("data"), &rw_create()).await.unwrap();
+            let dir = TempDir::new("lore-io-foreign-executor-");
+            let file = driver.open(dir.child("data"), &rw_create()).await.unwrap();
             let data = pattern(64 * 1024, 47);
 
             file.write_all_at(Bytes::from(data.clone()), 0)
@@ -744,7 +789,7 @@ fn operations_complete_under_a_foreign_executor() {
             file.sync_data().await.unwrap();
             assert_eq!(file.metadata().await.unwrap().len(), data.len() as u64);
 
-            let path = dir.file("blob");
+            let path = dir.child("blob");
             driver
                 .write_file_bytes(&path, Bytes::from(data.clone()), false)
                 .await
@@ -776,8 +821,8 @@ fn operations_complete_under_a_foreign_executor() {
 #[tokio::test]
 async fn a_cancelled_write_still_completes() {
     for driver in drivers() {
-        let dir = TempDir::new("cancel-write");
-        let file = driver.open(dir.file("data"), &rw_create()).await.unwrap();
+        let dir = TempDir::new("lore-io-cancel-write-");
+        let file = driver.open(dir.child("data"), &rw_create()).await.unwrap();
         let data = pattern(256 * 1024, 29);
 
         let mut write = Box::pin(file.write_all_at(Bytes::from(data.clone()), 0));
@@ -802,8 +847,8 @@ async fn a_cancelled_write_still_completes() {
 #[tokio::test]
 async fn the_pool_still_serves_work_after_a_cancellation() {
     for driver in drivers() {
-        let dir = TempDir::new("cancel-then-work");
-        let file = driver.open(dir.file("data"), &rw_create()).await.unwrap();
+        let dir = TempDir::new("lore-io-cancel-then-work-");
+        let file = driver.open(dir.child("data"), &rw_create()).await.unwrap();
         let data = pattern(64 * 1024, 31);
         file.write_all_at(Bytes::from(data.clone()), 0)
             .await
@@ -823,14 +868,14 @@ async fn the_pool_still_serves_work_after_a_cancellation() {
 #[tokio::test]
 async fn open_read_head_covers_small_files() {
     for driver in drivers() {
-        let dir = TempDir::new("head-small");
+        let dir = TempDir::new("lore-io-head-small-");
         let data = pattern(100, 11);
         driver
-            .write_file_bytes(dir.file("data"), Bytes::copy_from_slice(&data), false)
+            .write_file_bytes(dir.child("data"), Bytes::copy_from_slice(&data), false)
             .await
             .unwrap();
         let (_file, metadata, head) = driver
-            .open_read_head(dir.file("data"), &OpenOptions::new().read(true), 4096)
+            .open_read_head(dir.child("data"), &OpenOptions::new().read(true), 4096)
             .await
             .unwrap();
         assert_eq!(metadata.len(), 100);
@@ -841,14 +886,14 @@ async fn open_read_head_covers_small_files() {
 #[tokio::test]
 async fn open_read_head_serves_follow_up_reads() {
     for driver in drivers() {
-        let dir = TempDir::new("head-large");
+        let dir = TempDir::new("lore-io-head-large-");
         let data = pattern(8192, 13);
         driver
-            .write_file_bytes(dir.file("data"), Bytes::copy_from_slice(&data), false)
+            .write_file_bytes(dir.child("data"), Bytes::copy_from_slice(&data), false)
             .await
             .unwrap();
         let (file, metadata, head) = driver
-            .open_read_head(dir.file("data"), &OpenOptions::new().read(true), 4096)
+            .open_read_head(dir.child("data"), &OpenOptions::new().read(true), 4096)
             .await
             .unwrap();
         assert_eq!(metadata.len(), 8192);
@@ -861,9 +906,9 @@ async fn open_read_head_serves_follow_up_reads() {
 #[tokio::test]
 async fn open_read_head_missing_file_fails_not_found() {
     for driver in drivers() {
-        let dir = TempDir::new("head-missing");
+        let dir = TempDir::new("lore-io-head-missing-");
         let error = driver
-            .open_read_head(dir.file("absent"), &OpenOptions::new().read(true), 4096)
+            .open_read_head(dir.child("absent"), &OpenOptions::new().read(true), 4096)
             .await
             .expect_err("opening a missing file must fail");
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
@@ -873,19 +918,19 @@ async fn open_read_head_missing_file_fails_not_found() {
 #[tokio::test]
 async fn write_file_segments_roundtrip() {
     for driver in drivers() {
-        let dir = TempDir::new("write-segments");
+        let dir = TempDir::new("lore-io-write-segments-");
         let segments: Vec<Vec<u8>> = vec![pattern(16, 21), pattern(4096, 22), pattern(33, 23)];
         let flat: Vec<u8> = segments.concat();
         driver
             .write_file_segments(
-                dir.file("data"),
+                dir.child("data"),
                 &OpenOptions::new().write(true).create(true).truncate(true),
                 segments,
                 true,
             )
             .await
             .unwrap();
-        let read = driver.read_file_bytes(dir.file("data")).await.unwrap();
+        let read = driver.read_file_bytes(dir.child("data")).await.unwrap();
         assert_eq!(&read[..], &flat[..]);
     }
 }
@@ -893,10 +938,10 @@ async fn write_file_segments_roundtrip() {
 #[tokio::test]
 async fn write_file_segments_atomic_replaces_target() {
     for driver in drivers() {
-        let dir = TempDir::new("write-atomic");
+        let dir = TempDir::new("lore-io-write-atomic-");
         let previous = pattern(64, 31);
         driver
-            .write_file_bytes(dir.file("data"), Bytes::copy_from_slice(&previous), false)
+            .write_file_bytes(dir.child("data"), Bytes::copy_from_slice(&previous), false)
             .await
             .unwrap();
 
@@ -904,19 +949,105 @@ async fn write_file_segments_atomic_replaces_target() {
         let flat: Vec<u8> = segments.concat();
         driver
             .write_file_segments_atomic(
-                dir.file("data.tmp"),
-                dir.file("data"),
+                dir.child("data.tmp"),
+                dir.child("data"),
                 &OpenOptions::new().write(true).create(true).truncate(true),
                 segments,
+                true,
+                (),
             )
             .await
             .unwrap();
         assert!(
-            !dir.file("data.tmp").exists(),
+            !dir.child("data.tmp").exists(),
             "temporary file must be renamed away"
         );
-        let read = driver.read_file_bytes(dir.file("data")).await.unwrap();
+        let read = driver.read_file_bytes(dir.child("data")).await.unwrap();
         assert_eq!(&read[..], &flat[..]);
+    }
+}
+
+/// An atomic write that fails removes its temporary file, here one whose rename meets a directory.
+#[tokio::test]
+async fn a_failed_atomic_write_leaves_no_temporary_file() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-write-atomic-failed-");
+        std::fs::create_dir_all(dir.child("data").join("blocker")).unwrap();
+
+        let written = driver
+            .write_file_segments_atomic(
+                dir.child("data.tmp"),
+                dir.child("data"),
+                &OpenOptions::new().write(true).create(true).truncate(true),
+                vec![pattern(64, 51)],
+                false,
+                (),
+            )
+            .await;
+
+        assert!(
+            written.is_err(),
+            "{}: the rename succeeded",
+            driver.backend_name()
+        );
+        assert!(
+            !dir.child("data.tmp").exists(),
+            "{}: the temporary file is left behind",
+            driver.backend_name()
+        );
+        assert!(dir.child("data").join("blocker").is_dir());
+    }
+}
+
+/// The completion is dropped once the write has landed, the rename included, whether or not the
+/// call is still awaited, so a caller that drops the call part way learns from it when the write
+/// it abandoned is on disk. Observed through a completion that reads the file as it is dropped.
+#[tokio::test]
+async fn the_completion_is_dropped_once_the_write_has_landed() {
+    struct Landed {
+        path: std::path::PathBuf,
+        read: std::sync::mpsc::Sender<Option<Vec<u8>>>,
+    }
+
+    impl Drop for Landed {
+        fn drop(&mut self) {
+            let _ = self.read.send(std::fs::read(&self.path).ok());
+        }
+    }
+
+    for driver in drivers() {
+        for awaited in [true, false] {
+            let dir = TempDir::new("lore-io-completion-");
+            let data = pattern(4096, 61);
+            let (read, landed) = std::sync::mpsc::channel();
+            let options = OpenOptions::new().write(true).create(true).truncate(true);
+            let write = driver.write_file_segments_atomic(
+                dir.child("data.tmp"),
+                dir.child("data"),
+                &options,
+                vec![data.clone()],
+                true,
+                Landed {
+                    path: dir.child("data"),
+                    read,
+                },
+            );
+            if awaited {
+                write.await.unwrap();
+            } else {
+                // Polled once, which dispatches the write, and dropped.
+                let _ = tokio::time::timeout(std::time::Duration::ZERO, write).await;
+            }
+            let read = landed
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("the completion is dropped");
+            assert_eq!(
+                read.as_deref(),
+                Some(&data[..]),
+                "{} awaited {awaited}: the completion was dropped before the write landed",
+                driver.backend_name()
+            );
+        }
     }
 }
 
@@ -947,19 +1078,21 @@ async fn segments_are_released_before_the_call_returns() {
     }
 
     for driver in drivers() {
-        let dir = TempDir::new("segments-released");
+        let dir = TempDir::new("lore-io-segments-released-");
         let data = pattern(4096, 41);
         let released = Arc::new(AtomicBool::new(false));
 
         driver
             .write_file_segments_atomic(
-                dir.file("data.tmp"),
-                dir.file("data"),
+                dir.child("data.tmp"),
+                dir.child("data"),
                 &OpenOptions::new().write(true).create(true).truncate(true),
                 Guarded {
                     data: data.clone(),
                     released: Arc::clone(&released),
                 },
+                true,
+                (),
             )
             .await
             .unwrap();
@@ -968,7 +1101,7 @@ async fn segments_are_released_before_the_call_returns() {
             released.load(Ordering::SeqCst),
             "the segments must not outlive the call"
         );
-        let read = driver.read_file_bytes(dir.file("data")).await.unwrap();
+        let read = driver.read_file_bytes(dir.child("data")).await.unwrap();
         assert_eq!(&read[..], &data[..]);
     }
 }
@@ -976,8 +1109,8 @@ async fn segments_are_released_before_the_call_returns() {
 #[tokio::test]
 async fn vectored_write_read_roundtrip() {
     for driver in drivers() {
-        let dir = TempDir::new("vectored");
-        let file = driver.open(dir.file("data"), &rw_create()).await.unwrap();
+        let dir = TempDir::new("lore-io-vectored-");
+        let file = driver.open(dir.child("data"), &rw_create()).await.unwrap();
         let segments: Vec<Vec<u8>> = vec![
             pattern(7, 1),
             pattern(4096, 2),
@@ -1004,8 +1137,8 @@ async fn vectored_write_read_roundtrip() {
 #[tokio::test]
 async fn vectored_read_past_eof_fails() {
     for driver in drivers() {
-        let dir = TempDir::new("vectored-eof");
-        let file = driver.open(dir.file("data"), &rw_create()).await.unwrap();
+        let dir = TempDir::new("lore-io-vectored-eof-");
+        let file = driver.open(dir.child("data"), &rw_create()).await.unwrap();
         file.write_all_at(pattern(100, 9), 0).await.unwrap();
 
         let targets: Vec<Vec<u8>> = vec![vec![0u8; 64], vec![0u8; 136]];
@@ -1022,8 +1155,8 @@ async fn vectored_read_past_eof_fails() {
 #[tokio::test]
 async fn vectored_io_handles_many_segments() {
     for driver in drivers() {
-        let dir = TempDir::new("vectored-many");
-        let file = driver.open(dir.file("data"), &rw_create()).await.unwrap();
+        let dir = TempDir::new("lore-io-vectored-many-");
+        let file = driver.open(dir.child("data"), &rw_create()).await.unwrap();
         let segments: Vec<Vec<u8>> = (0..1500).map(|i| pattern(9, i as u8)).collect();
         let flat: Vec<u8> = segments.concat();
         let segments = file.write_all_vectored_at(segments, 0).await.unwrap();
@@ -1043,8 +1176,8 @@ async fn vectored_io_handles_many_segments() {
 #[tokio::test]
 async fn many_concurrent_reads_complete() {
     for driver in drivers() {
-        let dir = TempDir::new("stress");
-        let file = driver.open(dir.file("data"), &rw_create()).await.unwrap();
+        let dir = TempDir::new("lore-io-stress-");
+        let file = driver.open(dir.child("data"), &rw_create()).await.unwrap();
         let data = pattern(1024 * 1024, 17);
         file.write_all_at(Bytes::from(data.clone()), 0)
             .await
@@ -1073,8 +1206,8 @@ async fn many_concurrent_reads_complete() {
 #[tokio::test]
 async fn a_read_handle_admits_readers_and_writers() {
     for driver in drivers() {
-        let dir = TempDir::new("sharemode");
-        let path = dir.file("shared");
+        let dir = TempDir::new("lore-io-sharemode-");
+        let path = dir.child("shared");
         driver
             .write_file_bytes(&path, Bytes::from_static(b"shared content"), false)
             .await
@@ -1103,8 +1236,8 @@ async fn a_read_handle_admits_readers_and_writers() {
 #[tokio::test]
 async fn a_narrowed_share_mode_refuses_writers() {
     for driver in drivers() {
-        let dir = TempDir::new("sharemode-narrow");
-        let path = dir.file("guarded");
+        let dir = TempDir::new("lore-io-sharemode-narrow-");
+        let path = dir.child("guarded");
         driver
             .write_file_bytes(&path, Bytes::from_static(b"guarded content"), false)
             .await
@@ -1144,9 +1277,9 @@ async fn a_narrowed_share_mode_refuses_writers() {
 #[tokio::test]
 async fn a_read_handle_permits_replace_by_rename() {
     for driver in drivers() {
-        let dir = TempDir::new("sharerename");
-        let path = dir.file("replaced");
-        let temporary = dir.file("replaced.tmp");
+        let dir = TempDir::new("lore-io-sharerename-");
+        let path = dir.child("replaced");
+        let temporary = dir.child("replaced.tmp");
         let original = Bytes::from_static(b"the bytes the reader opened");
         driver
             .write_file_bytes(&path, original.clone(), false)

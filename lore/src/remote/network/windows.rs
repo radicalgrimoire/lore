@@ -17,7 +17,6 @@ use windows_sys::Win32::Networking::WinSock::WSAGetLastError;
 use windows_sys::Win32::Storage::FileSystem::DeleteFileW;
 use windows_sys::Win32::Storage::FileSystem::GetTempPathW;
 
-use crate::remote::LORE_SERVICE_SOCKET_NAME;
 use crate::remote::network::UdsAcceptError;
 use crate::remote::network::UdsConnectionError;
 use crate::remote::network::UdsListenerError;
@@ -28,13 +27,88 @@ pub fn uds_supported() -> bool {
     true
 }
 
+/// A socket closed when dropped, so that a failure between creating one and
+/// handing it to a [`TcpStream`] does not leak it.
+///
+/// Every failure below is one a caller retries rather than gives up on. Nothing
+/// listening is the expected answer while a service starts, and a stop waits for
+/// the socket to be released by connecting until it fails, so both loops run
+/// their whole timeout at one attempt every 20ms — up to five hundred failed
+/// connects apiece. A socket left open per attempt is five hundred handles per
+/// start or stop, and the attempt discards the error, so nothing would say so.
+struct OwnedSocket(SOCKET);
+
+impl OwnedSocket {
+    /// Creates a unix stream socket, or says why it could not.
+    fn new() -> Result<Self, String> {
+        // Safety: Necessary to call windows APIs
+        let socket = unsafe { WinSock::socket(WinSock::AF_UNIX as i32, WinSock::SOCK_STREAM, 0) };
+        if socket == INVALID_SOCKET {
+            // Safety: Necessary to call windows API
+            return Err(format!("failed to create socket: {}", unsafe {
+                WSAGetLastError()
+            }));
+        }
+        Ok(Self(socket))
+    }
+
+    fn get(&self) -> SOCKET {
+        self.0
+    }
+
+    /// Hands the socket to a [`TcpStream`], which closes it from here on.
+    ///
+    /// A unix domain socket rather than a TCP one, which is a liberty taken
+    /// throughout this file: stream sockets are meant to behave alike, and this
+    /// is how the socket gets an owner that closes it.
+    fn into_stream(self) -> TcpStream {
+        // Ownership passes to the stream, so this must not also close it.
+        // `ManuallyDrop` rather than `mem::forget`, which `clippy::mem_forget`
+        // rejects and CI builds with `-D warnings`.
+        let socket = std::mem::ManuallyDrop::new(self);
+        // Safety: a socket this owned, created above and not closed.
+        unsafe { TcpStream::from_raw_socket(socket.0 as RawSocket) }
+    }
+}
+
+impl Drop for OwnedSocket {
+    fn drop(&mut self) {
+        // Safety: Necessary to call windows APIs. Closes a socket this owns and
+        // has not given away — [`into_stream`](Self::into_stream) forgets it.
+        unsafe { WinSock::closesocket(self.0) };
+    }
+}
+
 pub struct UdsListener {
-    socket: RawSocket,
+    socket: OwnedSocket,
+}
+
+/// A socket name to bind, not claimed: nothing reserves the name here, and
+/// [`UdsListener::new`] unlinks a socket already bound to it, so a second service can take the
+/// name from a running one.
+pub struct UdsListenerClaim {
+    name: String,
+}
+
+impl UdsListenerClaim {
+    pub fn listen(self) -> Result<UdsListener, UdsListenerError> {
+        UdsListener::new(&self.name)
+    }
 }
 
 impl UdsListener {
-    pub fn new() -> Result<UdsListener, UdsListenerError> {
-        let wide_file_name = uds_sock_path();
+    /// Always succeeds: see [`UdsListenerClaim`].
+    pub fn claim(name: &str) -> Result<Option<UdsListenerClaim>, UdsListenerError> {
+        Ok(Some(UdsListenerClaim {
+            name: name.to_string(),
+        }))
+    }
+
+    pub fn new(name: &str) -> Result<UdsListener, UdsListenerError> {
+        let wide_file_name = uds_sock_path(name);
+        // Ahead of the delete, so an address that cannot be built does not first
+        // remove the socket a running service is listening on.
+        let addr: SOCKADDR_UN = uds_sockaddr(name).map_err(UdsListenerError::internal)?;
 
         // Safety: Necessary to call windows APIs, only const pointers are passed to windows
         unsafe {
@@ -57,13 +131,13 @@ impl UdsListener {
             )));
         }
 
-        let sock = uds_socket();
-        let addr: SOCKADDR_UN =
-            uds_sockaddr().ok_or_else(|| UdsListenerError::internal("bad temp path"))?;
+        // Owned from here, so the bind and listen failures below close it rather
+        // than leaving it open for the life of the process that tried to serve.
+        let sock = OwnedSocket::new().map_err(UdsListenerError::internal)?;
         // Safety: Necessary to call windows APIs, only const pointers are passed to windows
         unsafe {
             if WinSock::bind(
-                sock,
+                sock.get(),
                 &addr as *const SOCKADDR_UN as *const SOCKADDR,
                 std::mem::size_of_val(&addr) as i32,
             ) != 0
@@ -74,16 +148,14 @@ impl UdsListener {
                 )));
             }
 
-            if WinSock::listen(sock, LISTENER_BACKLOG) != 0 {
+            if WinSock::listen(sock.get(), LISTENER_BACKLOG) != 0 {
                 return Err(UdsListenerError::internal(format!(
                     "failed to listen: {}",
                     WSAGetLastError()
                 )));
             }
         }
-        Ok(Self {
-            socket: sock as RawSocket,
-        })
+        Ok(Self { socket: sock })
     }
 
     pub fn accept(&self) -> Result<UdsStream, UdsAcceptError> {
@@ -95,7 +167,7 @@ impl UdsListener {
         // stream sockets are supposed to behave identically.
         unsafe {
             let res = WinSock::accept(
-                self.socket as SOCKET,
+                self.socket.get(),
                 &mut addr as *mut SOCKADDR_UN as *mut SOCKADDR,
                 &mut addr_size as *mut i32,
             );
@@ -129,7 +201,7 @@ impl UdsStream {
         self.stream.try_clone().map(|stream| Self { stream })
     }
 
-    pub fn connect() -> Result<UdsStream, UdsConnectionError> {
+    pub fn connect(name: &str) -> Result<UdsStream, UdsConnectionError> {
         if !wsa_startup() {
             // Safety: Necessary to call windows API
             return Err(UdsConnectionError::internal(format!(
@@ -138,17 +210,16 @@ impl UdsStream {
             )));
         }
 
-        let sock = uds_socket();
-        let addr: SOCKADDR_UN =
-            uds_sockaddr().ok_or_else(|| UdsConnectionError::internal("bad temp path"))?;
+        // Owned from here. This is the hot path for the leak: a connect that finds
+        // no service is how both the start and the stop loops make progress, so
+        // the failure below is taken hundreds of times per wait.
+        let sock = OwnedSocket::new().map_err(UdsConnectionError::internal)?;
+        let addr: SOCKADDR_UN = uds_sockaddr(name).map_err(UdsConnectionError::internal)?;
 
         // Safety: Needed to call windows API. Only const pointers are passed to windows.
-        // TcpStream::from_raw_socket requires the appropriate handle to be put in, we're fudging
-        // things a little bit by putting a unix domain socket into a TcpStream, but the actual
-        // stream sockets are supposed to behave identically.
         unsafe {
             if WinSock::connect(
-                sock,
+                sock.get(),
                 &addr as *const SOCKADDR_UN as *const SOCKADDR,
                 size_of_val(&addr) as i32,
             ) != 0
@@ -158,27 +229,33 @@ impl UdsStream {
                     WSAGetLastError()
                 )));
             }
-            Ok(UdsStream {
-                stream: TcpStream::from_raw_socket(sock as std::os::windows::io::RawSocket),
-            })
         }
+
+        Ok(UdsStream {
+            stream: sock.into_stream(),
+        })
     }
 }
 
+/// Starts Winsock, once for the process.
+///
+/// Every connect calls this, and a wait makes hundreds of connects, so it is not
+/// repeated: each `WSAStartup` takes a reference that a matching `WSACleanup`
+/// would have to release, and Winsock stays up for the life of the process
+/// either way. The result is remembered so a failure is still reported to each
+/// caller rather than only to the first.
 fn wsa_startup() -> bool {
-    let mut data = WSADATA::default();
-    // Safety: Necessary to call windows APIs, the mutable pointer passed in is properly initialized
-    // in rust to a safe value
-    let result = unsafe { WSAStartup(2 << 8 | 2, &mut data) };
-    result == 0
+    static STARTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *STARTED.get_or_init(|| {
+        let mut data = WSADATA::default();
+        // Safety: Necessary to call windows APIs, the mutable pointer passed in is properly
+        // initialized in rust to a safe value
+        let result = unsafe { WSAStartup(2 << 8 | 2, &mut data) };
+        result == 0
+    })
 }
 
-fn uds_socket() -> WinSock::SOCKET {
-    // Safety: Necessary to call windows APIs
-    unsafe { WinSock::socket(WinSock::AF_UNIX as i32, WinSock::SOCK_STREAM, 0) }
-}
-
-fn uds_sock_path() -> Vec<u16> {
+fn uds_sock_path(socket_name: &str) -> Vec<u16> {
     let mut path = Vec::new();
     // Safety: Necessary to call windows APIs. The buffer length required by windows is allocated in
     // buffer passed mutably to windows
@@ -190,20 +267,57 @@ fn uds_sock_path() -> Vec<u16> {
     }
     // Append the file name, taking into account the null terminator.
     path.resize(path.len() - 1, 0);
-    path.extend(LORE_SERVICE_SOCKET_NAME.encode_utf16());
+    path.extend(socket_name.encode_utf16());
     // Reinsert the null terminator.
     path.push(0);
     path
 }
 
-fn uds_sockaddr() -> Option<SOCKADDR_UN> {
-    let path_string = String::from_utf16(&uds_sock_path()).ok()?;
-    let path_bytes: Vec<i8> = path_string.as_bytes().iter().map(|v| *v as i8).collect();
-    let mut path: [i8; 108] = [0; 108];
-    path[0..path_bytes.len()].copy_from_slice(&path_bytes);
+/// Bytes an address holds for a socket path, including its terminator. The
+/// field is fixed at this size, as the Unix one is.
+#[lore_macro::test_pub]
+const SUN_PATH_CAPACITY: usize = 108;
 
-    Some(SOCKADDR_UN {
+/// Builds the address a socket is bound to or connected on, or says why the
+/// path cannot be one.
+///
+/// The path grows with the temporary directory and with the name
+/// `LORE_SERVICE_SOCKET` gives it, so one too long for the address is something
+/// a caller can arrive at by configuration. Reported rather than truncated: a
+/// truncated path names a different socket, which would silently divide callers
+/// between two services.
+fn uds_sockaddr(name: &str) -> Result<SOCKADDR_UN, String> {
+    let path_string = String::from_utf16(&uds_sock_path(name))
+        .map_err(|_err| "the socket path is not valid text".to_string())?;
+    sockaddr_for_path(path_string.trim_end_matches('\0'))
+}
+
+/// Writes `path` into an address, or says why it does not fit.
+///
+/// Takes the path rather than reading it, so the bound can be tested: the
+/// longest usable path is one byte short of the array, since the terminator
+/// needs a byte of its own.
+#[lore_macro::test_pub]
+fn sockaddr_for_path(path: &str) -> Result<SOCKADDR_UN, String> {
+    let path_bytes = path.as_bytes();
+    if path_bytes.len() >= SUN_PATH_CAPACITY {
+        return Err(format!(
+            "the socket path takes {} bytes, more than the {} an address holds \
+             alongside its terminator: {path}",
+            path_bytes.len(),
+            SUN_PATH_CAPACITY - 1
+        ));
+    }
+
+    // Zeroed, so writing fewer bytes than the array holds leaves the path
+    // terminated.
+    let mut sun_path: [i8; SUN_PATH_CAPACITY] = [0; SUN_PATH_CAPACITY];
+    for (slot, byte) in sun_path.iter_mut().zip(path_bytes) {
+        *slot = *byte as i8;
+    }
+
+    Ok(SOCKADDR_UN {
         sun_family: WinSock::AF_UNIX,
-        sun_path: path,
+        sun_path,
     })
 }

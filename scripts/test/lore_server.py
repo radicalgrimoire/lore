@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 # SPDX-License-Identifier: MIT
+import ctypes
 import functools
 import http.client
 import json
@@ -14,6 +15,9 @@ import sys
 from pathlib import Path
 from time import sleep
 
+import pytest
+
+from cleanup_util import remove_tree, remove_tree_contents
 from error_types import ServerException
 
 logger = logging.getLogger(__name__)
@@ -36,31 +40,74 @@ def lore_local_server(server_root, server_env, executable_path):
     server_log_fd.close()
 
 
-class _XdistControllerCleanup:
-    """Pytest plugin registered on the xdist controller to kill the shared
-    Lore server after all workers complete.  Registered via pytest_configure
-    so it is guaranteed to run on the controller process."""
+def _kill_shared_xdist_server(basetemp: Path) -> None:
+    """Kill the server gw0 launched for every worker to share, if it is running."""
+    info_path = basetemp / "lore_server_info.json"
+    if not info_path.exists():
+        return
+
+    info = json.loads(info_path.read_text())
+    if info.get("status") != "running":
+        return
+
+    pid = info["pid"]
+    log_path = Path(info["log_path"])
+    _kill_server_by_pid(pid, log_path, label="xdist controller")
+
+
+class _SessionCleanup:
+    """Pytest plugin that stops the shared Lore server and removes the session's
+    test data once every test has finished.  Registered via pytest_configure so
+    the hook is guaranteed to run on the xdist controller, which also stops the
+    server in a cleanup of its configuration: a session-finish hook that raises,
+    as xdist's does on reaching a worker that is gone, skips the hooks after it,
+    and cleanups run regardless.
+
+    The sweep lives here rather than in a session fixture because the controller
+    is the only process that runs after all workers are done. A worker finishing
+    its own tests says nothing about the others, and gw0's basetemp holds the
+    store of the server every worker is still talking to.
+    """
 
     @staticmethod
-    def pytest_sessionfinish(session, exitstatus):
-        # Only run on the xdist controller, not on workers or non-xdist runs
+    def pytest_sessionstart(session):
         if hasattr(session.config, "workerinput"):
             return
-        if not session.config.pluginmanager.has_plugin("dsession"):
+        factory = session.config._tmp_path_factory
+        session.config.add_cleanup(
+            lambda: _kill_shared_xdist_server(factory.getbasetemp())
+        )
+
+    @staticmethod
+    @pytest.hookimpl(trylast=True)
+    def pytest_sessionfinish(session, exitstatus):
+        # trylast, so this runs after _pytest.runner's own pytest_sessionfinish.
+        # On a normal run the session fixtures are already finalized by then --
+        # the last item's teardown does it -- but on an interrupted or
+        # collection-error run that hook is what finalizes them, and it is
+        # registered earlier than this plugin, so without trylast the sweep
+        # would delete the session server's root while the server was still up.
+        #
+        # An xdist worker owns none of this: the controller sweeps every
+        # worker's basetemp below, once they have all stopped.
+        if hasattr(session.config, "workerinput"):
             return
 
         basetemp = session.config._tmp_path_factory.getbasetemp()
-        info_path = basetemp / "lore_server_info.json"
-        if not info_path.exists():
+
+        if session.config.pluginmanager.has_plugin("dsession"):
+            _kill_shared_xdist_server(basetemp)
+
+        if session.config.getoption("--keep-test-data"):
+            logger.info("Leaving test data in %s (--keep-test-data)", basetemp)
             return
 
-        info = json.loads(info_path.read_text())
-        if info.get("status") != "running":
-            return
-
-        pid = info["pid"]
-        log_path = Path(info["log_path"])
-        _kill_server_by_pid(pid, log_path, label="xdist controller")
+        # Backstop for everything the per-test fixtures could not take: the
+        # server roots and logs that had to outlive the tests using them, any
+        # path a test made for itself, and anything a locked file left behind.
+        # A run without xdist arrives here with its server already stopped,
+        # since session fixtures finalize before this hook.
+        remove_tree_contents(basetemp, label="session test data")
 
 
 # ---------------------------------------------------------------------------
@@ -330,7 +377,9 @@ def release_reserved_ports(server_env, label: str = "") -> None:
             sock.close()
 
 
-def generate_server_config(request, tmp_path_factory, ports: dict):
+def generate_server_config(
+    request, tmp_path_factory, ports: dict, *, remove_when_done: bool = True
+):
     def copy_server_configs(base_dir: Path, dest_dir: Path) -> None:
         cfg_src = base_dir / "lore-server" / "config"
         cfg_dst = dest_dir / "lore-server" / "config"
@@ -346,6 +395,19 @@ def generate_server_config(request, tmp_path_factory, ports: dict):
 
     server_root = tmp_path_factory.mktemp("lore-server")
     server_root.mkdir(parents=True, exist_ok=True)
+
+    if remove_when_done and not request.config.getoption("--keep-test-data"):
+        # A server store is the largest thing a test writes, so it is removed at
+        # the scope of whoever asked for the config: a class-scoped server goes
+        # when its class ends, one built inside a test body when that test ends,
+        # pass or fail. The server is always stopped first -- the fixture that
+        # launched it depends on this one, so it finalizes first, and a
+        # generator fixture's own teardown is registered after this finalizer
+        # and therefore runs before it.
+        #
+        # The session-wide server opts out: under xdist it outlives every
+        # worker, so the controller's sweep is the only safe place to take it.
+        request.addfinalizer(lambda: remove_tree(server_root, label="server root"))
 
     copy_server_configs(test_base_directory, server_root)
 
@@ -380,7 +442,86 @@ def generate_server_config(request, tmp_path_factory, ports: dict):
     return server_root, server_env
 
 
-def launch_lore_server(server_root, server_env, executable_path):
+# `prctl` option naming the signal the kernel sends a process when its parent dies.
+PR_SET_PDEATHSIG = 1
+
+# Resolved here rather than in the child, which runs between fork and exec while
+# the suite's other threads may hold the locks a lookup takes.
+_prctl = ctypes.CDLL(None, use_errno=True).prctl if sys.platform == "linux" else None
+
+
+def _stop_with_parent():
+    """Has the kernel send this process SIGTERM when the thread that started it
+    exits."""
+    _prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
+
+
+def ends_with_launcher() -> dict:
+    """`Popen` arguments that stop the process when the one launching it ends,
+    however it ends, so that an aborted run leaves nothing behind. Linux only,
+    and empty elsewhere.
+
+    The kernel acts on the exit of the launching thread, so a process launched
+    this way must be launched from a thread that lives as long as it should.
+    """
+    return {"preexec_fn": _stop_with_parent} if _prctl else {}
+
+
+# Stops a server once the process running the session ends, given that process's
+# PID and the server's. Process file descriptors rather than PIDs, so that a PID
+# reused once either process is gone is never signalled: `pidfd_open` (434) and
+# `pidfd_send_signal` (424) by syscall number, the same on every Linux
+# architecture, since the interpreters the suite runs under can lack
+# `os.pidfd_open`.
+_SESSION_WATCHDOG = """
+import ctypes, select, signal, sys
+syscall = ctypes.CDLL(None, use_errno=True).syscall
+session, server = (syscall(434, int(pid), 0) for pid in sys.argv[1:])
+if min(session, server) >= 0 and server not in select.select([session, server], [], [])[0]:
+    syscall(424, server, signal.SIGTERM, None, 0)
+    if not select.select([server], [], [], 10)[0]:
+        syscall(424, server, signal.SIGKILL, None, 0)
+"""
+
+
+def ends_with_session(server_pid: int):
+    """Stops the server `server_pid` when the process running the session ends,
+    however it ends, for the server every xdist worker shares: it outlives the
+    worker that launched it, so `ends_with_launcher` cannot tie it to that
+    worker. A worker's parent is the process running the session. Linux only.
+    """
+    if not _prctl:
+        return
+    subprocess.Popen(
+        [sys.executable, "-c", _SESSION_WATCHDOG, str(os.getppid()), str(server_pid)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def server_popen_kwargs(outlives_launcher: bool = False) -> dict:
+    """`Popen` arguments for a server: a session of its own, so that a Ctrl+C at
+    the terminal reaches only the harness, which stops the server, and unless
+    `outlives_launcher`, `ends_with_launcher`."""
+    kwargs = {} if outlives_launcher else ends_with_launcher()
+    if sys.platform == "win32":
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+    return kwargs
+
+
+def launch_lore_server(
+    server_root, server_env, executable_path, outlives_launcher: bool = False
+):
+    """Starts a server and waits until it serves.
+
+    `outlives_launcher` keeps it running when the process launching it ends, for
+    the server every xdist worker shares: the worker that launches it can finish
+    before the others, and the run stops the server once they all have.
+    """
     server_log_path = server_root / "server.log"
     server_log_fd = server_log_path.open("w", buffering=1, encoding="utf-8")
 
@@ -393,12 +534,6 @@ def launch_lore_server(server_root, server_env, executable_path):
 
     server_binary_path: Path = Path(executable_path).expanduser().resolve(strict=False)
 
-    platform_kwargs = {}
-    if sys.platform == "win32":
-        platform_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-    else:
-        platform_kwargs["start_new_session"] = True
-
     release_reserved_ports(server_env, label=server_name)
 
     server_proc = subprocess.Popen(
@@ -407,7 +542,7 @@ def launch_lore_server(server_root, server_env, executable_path):
         stderr=subprocess.STDOUT,
         env=server_env,
         cwd=server_root,
-        **platform_kwargs,
+        **server_popen_kwargs(outlives_launcher),
     )
 
     quic_port = server_env["LORE__SERVER__QUIC__PORT"]

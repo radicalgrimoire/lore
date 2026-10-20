@@ -12,7 +12,7 @@ use crate::repository::RepositoryContext;
 use crate::revision;
 use crate::util::path::RelativePath;
 
-pub async fn get_revision(
+pub(crate) async fn get_revision(
     repository: Arc<RepositoryContext>,
     revision: Option<String>,
     key: &str,
@@ -21,7 +21,6 @@ pub async fn get_revision(
         revision::resolve(
             repository.clone(),
             revision,
-            execution_context().globals().search_limit(),
             execution_context().globals().search_location(),
         )
         .await
@@ -44,6 +43,15 @@ pub async fn get_revision(
     Ok(())
 }
 
+/// Boxed version of [`get_revision`] for cross-crate use.
+pub fn get_revision_boxed(
+    repository: Arc<RepositoryContext>,
+    revision: Option<String>,
+    key: &str,
+) -> crate::BoxFuture<'_, Result<(), MetadataErrors>> {
+    Box::pin(get_revision(repository, revision, key))
+}
+
 pub async fn get_file(
     repository: Arc<RepositoryContext>,
     revision: Option<String>,
@@ -54,7 +62,6 @@ pub async fn get_file(
         revision::resolve(
             repository.clone(),
             revision,
-            execution_context().globals().search_limit(),
             execution_context().globals().search_location(),
         )
         .await
