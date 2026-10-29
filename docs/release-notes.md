@@ -7,13 +7,49 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Breaking changes
 
+- `lore-server`: with authorization configured, operations that change a partition check for the `write` permission.
+  Any permission on a partition still allows reading it, but no longer allows writing. Servers without authorization
+  configured allow every caller to read, write and administer repositories
+- `lore-server`: changing branch protection, through branch protect and unprotect or by setting the `protect` key in
+  branch metadata, needs `owner` or `admin` on the repository, or `write` for its creator. Previously anyone with
+  access to the repository could set the branch protection rules
+- `lore-server`: vending a presigned URL needs the `presign` permission on the repository instead of the
+  `is_service_account` token claim. Servers without authorization configured still allow every caller to vend
+- Server hooks: `Hook::pre_handler` is now `async`, so a pre-handler can call other services without blocking a worker
+  thread. Custom hooks must make their `pre_handler` async and rebuild. A pre-handler is cancelled at its timeout
+  (1 second, or the hook's own `pre_handler_timeout`), and a timeout now fails the request with `UNAVAILABLE` instead of
+  `INTERNAL`
+- A client connected to a `lores://` remote refuses to connect, failing with `NotSupported`, if the server advertises a
+  storage, revision, lock, repository, or notification endpoint whose scheme doesn't authenticate the server, such as
+  `lore://`. It used to connect to that endpoint without validating its certificate, and for gRPC without TLS. A
+  server that advertises these endpoints must give them a scheme that authenticates the server, such as `lores://`
+
 ### Features
 
+- `lore-server`: forward the lock service's `Query` to a remote Lore server, opt-in via `lock_query` under
+  `[server.grpc_public_services.forwarded_requests.enabled_rpcs]`. The peer serves it only when it has a lock store
 - QUIC connections to replication peers configured under `[immutable_store.composite.replica_factory]` start with a
   1 MiB initial congestion window, set with `initial_cwnd_bytes`. Values below 2400 bytes are rejected at startup. A
   periodically refreshed connection starts at no less than this window
 
 ### Fixes & Improvements
+
+- A revision named by number, such as `<branch>@<number>`, resolves from the first page the remote returns for it,
+  rather than walking the branch's history back from its latest revision one page at a time
+- Following a branch's history through the remote no longer takes the revisions a page holds above the one it was
+  asked for as that revision's ancestors. A page the server serves from a cached segment holds them, and finding the
+  revision two branches share could answer with one of them, newer than the one they really share
+- On Windows, a Lore service started while another serves the same socket exits without serving, as it does on Linux
+  and macOS. It used to take the socket over and leave the first service running unreachable, holding its SWFS mounts
+  until killed, so commands that each started a service at the same moment could leave one behind per extra command
+- A branch push reads each mutable store key once, loads the branch alongside the pushed revision, and checks the
+  branch name while it verifies the revision's fragments rather than before, so a push spends fewer store round trips
+  before it moves the branch. A push the server refuses because the branch is protected no longer reinstates the name
+  of a deleted branch first
+- The deprecated `urc.rpc` `BranchPush` RPC treats a missing or deleted branch as `lore.revision.v1` `BranchPush`
+  does: a branch without metadata is `NOT_FOUND` rather than an internal error, and a push to a deleted branch
+  reinstates its name, or fails with `ALREADY_EXISTS` when another branch holds the name, rather than failing with
+  `NOT_FOUND`
 
 ## v0.12.0 (Oct 26th 2026) [#1966]
 

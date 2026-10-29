@@ -65,7 +65,7 @@ async fn seed_revision(repository_context: &Arc<RepositoryContext>, branch: Bran
         repository_context.clone(),
         branch,
         state_hash,
-        true,
+        crate::util::test_support::PUSH_ANY,
         true,
         false,
         DEFAULT_HISTORY_STEP_SIZE,
@@ -786,6 +786,13 @@ mod forwarded_request {
         ) -> Box<dyn lore_server::grpc::forwarded_requests::repository_service::ForwardedRepositoryServiceClient>
 {
             unreachable!("forwarded_repository_service should not be called in branch_list tests")
+        }
+
+        fn forwarded_lock_service(
+            &self,
+        ) -> Box<dyn lore_server::grpc::forwarded_requests::lock_service::ForwardedLockServiceClient>
+        {
+            unreachable!("forwarded_lock_service should not be called in branch_list tests")
         }
     }
 
