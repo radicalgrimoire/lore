@@ -9,8 +9,13 @@ use crate::fragment_flags::FragmentFlags;
 pub struct WriteOptions {
     /// This fragment stores a revision state
     pub revision_state: bool,
-    /// This fragment should be cached locally with payload if possible
+    /// This fragment should be cached locally with payload if possible. Recorded in the fragment's
+    /// flags, so it travels with the fragment and every store that fetches it caches it too.
     pub local_cache_priority: bool,
+    /// Keep the payload in this store even where the write makes it durable on the remote,
+    /// without asking anyone else to cache it: unlike `local_cache_priority`, it is not recorded in
+    /// the fragment.
+    pub keep_local: bool,
     /// Allow attempting to write the fragment to a remote
     pub remote_write: bool,
     /// Fixed size chunking if nonzero
@@ -46,6 +51,18 @@ impl WriteOptions {
     pub fn with_local_cache_priority(mut self) -> Self {
         self.local_cache_priority = true;
         self
+    }
+
+    /// See [`WriteOptions::keep_local`].
+    pub fn with_keep_local(mut self) -> Self {
+        self.keep_local = true;
+        self
+    }
+
+    /// Whether the write keeps the payload in this store once it is durable on the remote: asked
+    /// for by [`WriteOptions::local_cache_priority`] or [`WriteOptions::keep_local`].
+    pub fn cache_local(&self) -> bool {
+        self.local_cache_priority || self.keep_local
     }
 
     pub fn with_remote_write(mut self) -> Self {
@@ -116,6 +133,9 @@ pub struct ReadOptions {
     pub direct_write: bool,
     /// Force sync data to storage media after write
     pub sync_data: bool,
+    /// Create the directory a file read lands in, with its missing ancestors, where the write
+    /// finds it missing
+    pub create_parent: bool,
     /// Priority read hint for stream scheduling (metadata/tree blocks)
     pub priority: bool,
     /// A local miss answers `AddressNotFound` at once: the load never waits on another task's
@@ -140,6 +160,7 @@ impl Default for ReadOptions {
             cache: false,
             direct_write: false,
             sync_data: false,
+            create_parent: false,
             priority: false,
             never_wait: false,
             max_content_size: None,
@@ -181,6 +202,12 @@ impl ReadOptions {
 
     pub fn optional_cache(mut self, cache: bool) -> Self {
         self.cache = cache;
+        self
+    }
+
+    /// See [`ReadOptions::create_parent`].
+    pub fn creating_parent(mut self) -> Self {
+        self.create_parent = true;
         self
     }
 

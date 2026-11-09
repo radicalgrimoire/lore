@@ -56,6 +56,7 @@ use crate::node::NodeIDExt;
 use crate::node::ROOT_NODE;
 use crate::path::emit_path_ignore;
 use crate::state;
+use crate::state::Clear;
 use crate::state::State;
 use crate::util::fan_out;
 use crate::util::path::RelativePath;
@@ -499,11 +500,27 @@ async fn file_size_from_node_change_path(
     Ok(info.size())
 }
 
-/// Reports every change a path's scan finds, answering with how many arrived and the first
+/// How a scan reports the changes it finds: what it counts them into, and whether a deleted
+/// directory stands for everything below it.
+#[lore_macro::test_pub]
+#[derive(Clone)]
+pub(crate) struct ScanReport {
+    /// The counts the reported changes fold into.
+    summary: Arc<StatusSummaryStats>,
+    /// Whether a deleted directory is reported as one entry, as a plain status reports the marks
+    /// a scan left, rather than with every entry below it, as `--scan` reports them.
+    whole_deleted_directories: bool,
+}
+
+/// Reports every change a path's scan finds, answering with how many were reported and the first
 /// failure among them.
 ///
 /// Reads to the end rather than stopping at a failure: the walk marks dirty as it goes, and its
 /// marks are what a status run leaves behind whether or not every change could be reported.
+///
+/// Where `report` asks for whole deleted directories, a delete below a directory reported
+/// deleted is left out. The walk reports a directory before what it finds below it, so the
+/// directories reported deleted are all that is held, never the changes.
 ///
 /// Each change is taken by a `let`-`else` rather than a `while let`, whose scrutinee would stay
 /// reserved beside the change while it is reported.
@@ -511,17 +528,31 @@ async fn file_size_from_node_change_path(
 async fn report_scan_changes(
     operation: &InstanceOperationImpl,
     repository: &Arc<RepositoryContext>,
-    summary: &StatusSummaryStats,
+    report: &ScanReport,
     changes: &mut state::ChangeStream<state::FilesystemDiffStats>,
 ) -> (usize, Option<StatusError>) {
     let mut reported = 0;
     let mut failure = None;
+    let mut deleted_directories: Vec<RelativePath> = Vec::new();
     loop {
         let Some(change) = changes.next().await else {
             break;
         };
+        if report.whole_deleted_directories && change.action == FileAction::Delete {
+            let path = change.path();
+            if deleted_directories
+                .iter()
+                .any(|directory| path.below(directory).is_some_and(|rest| !rest.is_empty()))
+            {
+                continue;
+            }
+            if change.from.flags.is_directory() && !change.to.mapping.node.is_valid_node_id() {
+                deleted_directories.push(path.clone());
+            }
+        }
         reported += 1;
-        if let Err(err) = report_scan_change(operation, repository, summary, &change).await {
+        if let Err(err) = report_scan_change(operation, repository, &report.summary, &change).await
+        {
             failure.get_or_insert(err);
         }
     }
@@ -618,9 +649,10 @@ async fn dirty_change_is_modified(
         node_state
             .mapping
             .state
-            .node_clear_dirty(
-                node_state.mapping.repository.clone(),
+            .node_clear(
+                &node_state.mapping.repository,
                 node_state.mapping.node,
+                Clear::Dirty,
             )
             .await
             .forward::<StatusError>("clearing stale dirty flag")?;
@@ -879,7 +911,7 @@ async fn report_repository_staged_diff(
         repository.clone(),
         state_staged,
         path,
-        FilterMode::Full,
+        FilterMode::TRACKED,
     )
     .await
     .forward::<StatusError>("computing diff against staged state")?;
@@ -911,7 +943,7 @@ async fn report_layer_staged_diff(
         )
         .await,
         selection.mount_path.clone(),
-        FilterMode::Full,
+        FilterMode::TRACKED,
     )
     .await
     .forward::<StatusError>("computing diff against staged state")?;
@@ -939,15 +971,15 @@ struct LayerSelection {
 /// layer draws. One naming a path below the mount selects what lies at the same offset below the
 /// layer's source.
 fn layer_selection(layer: &layer::Layer, path: Option<&RelativePath>) -> Option<LayerSelection> {
-    let target_path = RelativePath::new_from_initial_path(&layer.target_path).unwrap_or_default();
-    let selected = path.cloned().unwrap_or_else(|| target_path.clone());
+    let mount_path = RelativePath::new_from_initial_path(&layer.target_path).unwrap_or_default();
+    let selected = path.cloned().unwrap_or_else(|| mount_path.clone());
     if !selected.is_empty() && !selected.overlaps(&layer.target_path) {
         return None;
     }
 
     let sub_path = selected
         .as_str()
-        .get(target_path.len()..)
+        .get(mount_path.len()..)
         .unwrap_or_default();
     Some(LayerSelection {
         mount_path: RelativePath::new_from_clean_parts(&layer.target_path, sub_path),
@@ -1021,9 +1053,9 @@ async fn report_staged_diffs(
 }
 
 /// Resolve `source_path` to the work needed to count its subtree, labelling
-/// descendant paths under `target_path` for view filtering. The two differ for
+/// descendant paths under `mount_path` for view filtering. The two differ for
 /// a layer: the node is resolved at the layer's `source_path` while paths are
-/// labelled with the mount `target_path`, so the local view filter matches the
+/// labelled with the `mount_path`, so the local view filter matches the
 /// working-tree layout. Returns the node's own `(directories, files)`
 /// contribution plus an optional root [`CountWork`] for its descendants. A file
 /// yields `(0, 1, None)`; a directory or link `(1, 0, Some(work))`. An empty
@@ -1034,12 +1066,12 @@ async fn count_at_path_root(
     state: Arc<state::State>,
     repository: Arc<RepositoryContext>,
     source_path: &RelativePath,
-    target_path: &RelativePath,
+    mount_path: &RelativePath,
 ) -> Result<(u64, u64, Option<CountWork>), StatusError> {
-    // Every work item below is rooted at `target_path`, so its ancestors are
+    // Every work item below is rooted at `mount_path`, so its ancestors are
     // folded once here and the walk steps from there. Link resolution keeps the
     // filter, so the verdict holds for the resolved repository too.
-    let states = repository.filter.exclusion_states(target_path);
+    let states = repository.filter.exclusion_states(mount_path);
 
     if source_path.is_empty() {
         return Ok((
@@ -1049,7 +1081,7 @@ async fn count_at_path_root(
                 state,
                 repository,
                 node_id: ROOT_NODE,
-                path: target_path.clone(),
+                path: mount_path.clone(),
                 states,
             }),
         ));
@@ -1091,7 +1123,7 @@ async fn count_at_path_root(
                 state,
                 repository,
                 node_id: inner.node,
-                path: target_path.clone(),
+                path: mount_path.clone(),
                 states,
             }),
         ));
@@ -1104,7 +1136,7 @@ async fn count_at_path_root(
             state,
             repository,
             node_id: link.node,
-            path: target_path.clone(),
+            path: mount_path.clone(),
             states,
         }),
     ))
@@ -1305,6 +1337,79 @@ async fn resolve_remote_latest(
     }
 }
 
+/// Whether a branch has revisions the remote latest does not, and whether the remote latest has
+/// revisions the branch does not, answered as `(local_ahead, remote_ahead)` for `local_state`, the
+/// branch's local latest, and `remote_state`, a different remote latest.
+///
+/// `local_diverged` is whether the branch holds revisions not on the remote history, and
+/// `last_sync` is the remote latest the branch was last recorded as synced to. A diverged branch
+/// numbered past the remote latest is behind it unless the remote latest is on its first-parent
+/// history, where a merge of divergent history holds the remote latest it merged. A `last_sync`
+/// equal to the remote latest says it is. Any other `last_sync` is checked against that history
+/// ([`on_first_parent_history`]), since it is stored apart from the branch latest and a process
+/// killed between the two writes leaves a committed merge with the sync point before it.
+#[lore_macro::test_pub]
+async fn compare_with_remote(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+    local_state: &State,
+    remote_state: &State,
+    local_diverged: bool,
+    last_sync: Hash,
+) -> (bool, bool) {
+    let local_n = local_state.revision_number();
+    let remote_n = remote_state.revision_number();
+    if !local_diverged {
+        (false, remote_n > local_n)
+    } else if local_n > remote_n {
+        let remote_ahead = last_sync != remote_state.revision()
+            && !on_first_parent_history(repository, branch, local_state, remote_state).await;
+        (true, remote_ahead)
+    } else {
+        // Numbered at or past the branch latest, the remote latest is not on its history.
+        (true, true)
+    }
+}
+
+/// Whether `revision_state` is on the history of `latest_state`, walked along first parents.
+///
+/// The walk stops at the first revision numbered at or below `revision_state`, so it reads at most
+/// one revision for each revision number between the two. A revision that cannot be read ends it,
+/// answering `false`.
+async fn on_first_parent_history(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+    latest_state: &State,
+    revision_state: &State,
+) -> bool {
+    let revision = revision_state.revision();
+    let revision_number = revision_state.revision_number();
+    find::find_revision(
+        repository.clone(),
+        branch,
+        latest_state.revision(),
+        false,
+        None,
+        |state, _metadata| {
+            if state.revision() == revision {
+                find::FindMatchResult::Match
+            } else if state.revision_number() <= revision_number {
+                find::FindMatchResult::Abort
+            } else {
+                find::FindMatchResult::Continue
+            }
+        },
+    )
+    .await
+    .inspect_err(|err| {
+        lore_debug!(
+            "Revision {revision} not found on the first-parent history of {}: {err}",
+            latest_state.revision()
+        );
+    })
+    .is_ok()
+}
+
 /// Reconciles every requested path against the filesystem within `operation`, marking
 /// dirty as it goes. Given a `summary`, it emits a status event per change the caller did not
 /// stage, counted into `summary`, and reports a path neither the tree nor the working tree holds
@@ -1329,14 +1434,14 @@ pub(crate) async fn scan_paths(
     state_current: &Arc<state::State>,
     state_staged: &Arc<state::State>,
     layer_mounts: &Arc<Vec<state::LayerMountInfo>>,
-    summary: Option<&Arc<StatusSummaryStats>>,
+    report: Option<&ScanReport>,
 ) -> Result<bool, StatusError> {
     let targets = resolve_scan_targets(
         &operation,
         repository,
         state_staged,
         paths,
-        summary.is_some(),
+        report.is_some(),
     )
     .await?;
     create_shared_untracked_ancestors(repository, state_staged, &targets).await?;
@@ -1354,7 +1459,7 @@ pub(crate) async fn scan_paths(
                 state_staged.clone(),
                 target.path,
                 layer_mounts.clone(),
-                summary.cloned(),
+                report.cloned(),
                 discards.clone(),
             )
         );
@@ -1487,23 +1592,25 @@ fn resolve_scan_target(
             });
         }
 
-        if !operation
-            .file_info(&path)
-            .await
-            .is_ok_and(|info| info.exists())
-        {
-            if report_ignored {
-                emit_path_ignore(path.as_str()).await;
+        // A path that cannot be described is kept, so that the scan reports it, rather than
+        // dropped with the paths that are not there.
+        let info = match operation.file_info(&path).await {
+            Ok(info) if !info.exists() => {
+                if report_ignored {
+                    emit_path_ignore(path.as_str()).await;
+                }
+                lore_trace!("Ignoring invalid path: {path}");
+                return None;
             }
-            lore_trace!("Ignoring invalid path: {path}");
-            return None;
-        }
+            Ok(info) => Some(info),
+            Err(_) => None,
+        };
 
         let filter = &repository.filter;
         let (_, excluded) = filter.child_excludes_tree(
             filter.parent_exclusion_states(&path),
             &path,
-            true,
+            info.is_some_and(|info| info.is_dir()),
             FilterMode::Full,
         );
         Some(ScanTarget {
@@ -1562,7 +1669,7 @@ async fn create_shared_untracked_ancestors(
 }
 
 /// Reconciles `path` against the filesystem, or the whole repository for `None`, reporting the
-/// changes it finds into `summary` where given and holding what it finds stale on `discards`.
+/// changes it finds as `report` asks where given and holding what it finds stale on `discards`.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::manual_async_fn, clippy::too_many_arguments)]
@@ -1573,7 +1680,7 @@ fn scan_path(
     state_staged: Arc<state::State>,
     path: Option<RelativePath>,
     layer_mounts: Arc<Vec<state::LayerMountInfo>>,
-    summary: Option<Arc<StatusSummaryStats>>,
+    report: Option<ScanReport>,
     discards: Arc<state::WalkDiscards>,
 ) -> impl Future<Output = Result<(), StatusError>> + Send {
     async move {
@@ -1607,9 +1714,9 @@ fn scan_path(
         .await
         .forward::<StatusError>("computing diff against filesystem")?;
 
-        let (reported, failure) = match summary.as_ref() {
-            Some(summary) => {
-                report_scan_changes(&operation, &repository, summary, &mut changes).await
+        let (reported, failure) = match report.as_ref() {
+            Some(report) => {
+                report_scan_changes(&operation, &repository, report, &mut changes).await
             }
             None => (0, None),
         };
@@ -1618,8 +1725,8 @@ fn scan_path(
             .finish()
             .await
             .forward::<StatusError>("computing diff against filesystem")?;
-        if let Some(summary) = summary {
-            summary.append_diff(&diff_stats);
+        if let Some(report) = report {
+            report.summary.append_diff(&diff_stats);
         }
 
         lore_debug!(
@@ -1645,18 +1752,24 @@ struct TreeDiffPlan {
     check_dirty: bool,
     /// Whether the working tree is scanned for changes neither state holds.
     scan: bool,
+    /// Whether the scan was asked for, so it reports as `--scan` does: every entry below a
+    /// deleted directory, and a summary. A scan run unasked reports as a plain status does.
+    scan_asked: bool,
 }
 
 impl TreeDiffPlan {
     /// The plan `options` ask for over a repository that holds a staged state where `has_staged`
     /// says so. A provider that holds its state in a `State`, whose diff is exact, is scanned
-    /// whether or not the scan was asked for, and its dirty flags need no check.
+    /// whether or not the scan was asked for, and its dirty flags need no check. Unasked, its
+    /// scan reports what a plain status reports on any other working tree: a deleted directory as
+    /// one entry, and no summary.
     #[lore_macro::test_pub]
     fn for_status(options: &StatusOptions, has_staged: bool, holds_state: bool) -> Self {
         TreeDiffPlan {
             compare_staged: options.staged && has_staged,
             check_dirty: options.check_dirty && !holds_state,
             scan: options.scan || holds_state,
+            scan_asked: options.scan,
         }
     }
 
@@ -1720,6 +1833,10 @@ async fn report_tree_diffs(
                 "Calculating deltas against filesystem for {} paths",
                 paths.len()
             );
+            let report = ScanReport {
+                summary: summary.clone(),
+                whole_deleted_directories: !plan.scan_asked,
+            };
             scan_paths(
                 operation,
                 repository,
@@ -1727,7 +1844,7 @@ async fn report_tree_diffs(
                 state_current,
                 state_staged,
                 layer_mounts,
-                Some(summary),
+                Some(&report),
             )
             .await?;
             Ok(cleared_links)
@@ -1895,9 +2012,6 @@ pub(crate) async fn status(
         Hash::default()
     };
 
-    let mut local_ahead = false;
-    let mut remote_ahead = false;
-
     let last_sync = branch::load_last_sync(repository.clone(), branch.id)
         .await
         .unwrap_or_default();
@@ -1910,30 +2024,21 @@ pub(crate) async fn status(
         .await
         .unwrap_or(true);
 
-    if local_latest != remote_latest.unwrap_or_default()
+    let (local_ahead, remote_ahead) = if local_latest != remote_latest.unwrap_or_default()
         && let Some(remote_state) = remote_state.clone()
     {
-        let local_n = local_state.revision_number();
-        let remote_n = remote_state.revision_number();
-        if !local_diverged {
-            remote_ahead = remote_n > local_n;
-        } else if remote_n > local_n {
-            // Local has unpushed work AND remote moved beyond it.
-            local_ahead = true;
-            remote_ahead = true;
-        } else if local_n > remote_n {
-            local_ahead = true;
-            // Refine with last_sync: if remote has moved beyond the last
-            // recorded sync point, it has revisions we don't have.
-            if last_sync != remote_latest.unwrap_or_default() {
-                remote_ahead = true;
-            }
-        } else {
-            // Same revision number, different hashes — divergent.
-            local_ahead = true;
-            remote_ahead = true;
-        }
-    }
+        compare_with_remote(
+            &repository,
+            branch.id,
+            &local_state,
+            &remote_state,
+            local_diverged,
+            last_sync,
+        )
+        .await
+    } else {
+        (false, false)
+    };
     {
         let status = match (remote_ahead, local_ahead) {
             (true, true) => "divergent",
@@ -2064,8 +2169,9 @@ pub(crate) async fn status(
 
     // Emit the aggregate dirty-node summary for reconciling status runs. For
     // a scan these are the changes detected against the filesystem; for
-    // --check-dirty they are the nodes that stayed dirty after verification.
-    if plan.scan || check_dirty {
+    // --check-dirty they are the nodes that stayed dirty after verification. A scan run unasked
+    // reports as a plain status does, with no summary.
+    if plan.scan_asked || check_dirty {
         let data = summary.event_data();
         lore_debug!(
             "Status summary: {} added, {} modified, {} deleted, {} moved, {} copied, {} hash checks, {} mtime matches",

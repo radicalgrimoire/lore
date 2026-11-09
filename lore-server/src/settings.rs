@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
 use std::env;
+use std::num::NonZeroU8;
+use std::num::NonZeroUsize;
 
 use config::Config;
 use lore_base::runtime::TokioSettings;
@@ -19,6 +21,7 @@ use lore_telemetry::TraceConfigError;
 use serde::Deserialize;
 
 use crate::auth::jwk::JWKServiceSettings;
+use crate::auth::jwk::is_issuer_url;
 use crate::authnz::repository_authorizer::AuthorizerSelection;
 use crate::authnz::repository_authorizer::select_repository_authorizer;
 use crate::authnz::repository_catalog::select_repository_catalog;
@@ -28,6 +31,7 @@ use crate::hooks::HookSettings;
 use crate::quic::client_monitor::default_quic_client_monitor_interval_secs;
 use crate::quic::initial_cwnd::DEFAULT_PEER_INITIAL_CWND_BYTES;
 use crate::quic::initial_cwnd::InitialCwndBytes;
+use crate::quic::initial_cwnd::default_peer_initial_cwnd_bytes;
 use crate::store::replica_factory::ReplicaFactorySettings;
 use crate::tls::CertificateSettings;
 use crate::topology::TopologySettings;
@@ -203,6 +207,12 @@ fn validate_auth_config(settings: &Settings) -> Result<(), config::ConfigError> 
     let Some(auth) = auth else {
         return Ok(());
     };
+    if settings.server.trust_unsigned_identity {
+        return Err(config::ConfigError::Message(
+            "server.trust_unsigned_identity applies only to a server without [server.auth]"
+                .to_string(),
+        ));
+    }
     if auth.jwt_issuer.is_empty() {
         return Err(config::ConfigError::Message(
             "server.auth.jwt_issuer must not be empty".to_string(),
@@ -258,10 +268,11 @@ fn validate_oidc_config(
             AuthorizerSelection::AllowAll | AuthorizerSelection::AuthClient => Ok(()),
         };
     };
-    let is_issuer_url = auth.jwt_issuer.first().is_some_and(|issuer| {
-        reqwest::Url::parse(issuer).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
-    });
-    if !is_issuer_url {
+    if !auth
+        .jwt_issuer
+        .first()
+        .is_some_and(|issuer| is_issuer_url(issuer))
+    {
         return error(
             "server.auth.oidc requires the first server.auth.jwt_issuer entry to be the \
              provider's issuer URL",
@@ -299,6 +310,14 @@ fn validate_oidc_config(
                 "{setting} must contain {PARTITION_PLACEHOLDER}, which stands for the partition ID"
             ));
         }
+    }
+    if oidc
+        .token_exchange_issuer
+        .as_deref()
+        .filter(|issuer| !issuer.is_empty())
+        .is_some_and(|issuer| !is_issuer_url(issuer))
+    {
+        return error("server.auth.oidc.token_exchange_issuer must be an http or https issuer URL");
     }
     if is_set(&oidc.token_exchange_issuer) && !has_template {
         return error(
@@ -438,9 +457,13 @@ pub struct AuthSettings {
 pub struct OidcSettings {
     /// The public client ID clients present to the provider.
     pub client_id: String,
-    /// Default scopes clients request at login.
+    /// Default scopes clients request at an interactive (device) login.
     #[serde(default)]
     pub scopes: Vec<String>,
+    /// Scopes clients request with the client credentials grant, for a provider that adds
+    /// the claims Lore reads only for a requested scope. Empty requests none.
+    #[serde(default)]
+    pub client_credentials_scopes: Vec<String>,
     /// Whether a client should default to OIDC login or use gRPC auth at
     /// at `[environment.endpoint] auth_url`.
     #[serde(default)]
@@ -457,6 +480,18 @@ pub struct OidcSettings {
 }
 
 impl AuthSettings {
+    /// The `[server.auth.oidc]` `token_exchange_issuer` when it names an issuer `jwt_issuer`
+    /// doesn't: a separate token service, whose tokens are verified against its own keys.
+    pub fn separate_exchange_issuer(&self) -> Option<&str> {
+        let issuer = self
+            .oidc
+            .as_ref()?
+            .token_exchange_issuer
+            .as_deref()
+            .filter(|issuer| !issuer.is_empty())?;
+        (!self.jwt_issuer.iter().any(|accepted| accepted == issuer)).then_some(issuer)
+    }
+
     pub fn implicit_actions(&self) -> Vec<crate::authnz::repository_authorizer::Action> {
         self.implicit_actions
             .clone()
@@ -499,8 +534,8 @@ pub enum RepositoryCatalogMode {
     /// Ask a `UrcAuthApi` service's `LookupUserPermissions`, forwarding the
     /// caller's token.
     AuthService,
-    /// Ask `PartitionList` on the `lore.user.v1.UserService` at
-    /// `[environment.endpoint] user_url`, forwarding the caller's token.
+    /// Ask `RepositoryList` on the `lore.user.v1.RepositoryRegistryService`
+    /// at `[environment.endpoint] user_url`, forwarding the caller's token.
     UserService,
 }
 
@@ -600,7 +635,12 @@ pub struct QuicSettings {
     pub idle_timeout: Option<u64>,
     pub keep_alive: Option<u64>,
     pub max_bidi_streams: Option<u64>,
-    pub num_listeners: u8,
+    /// Accept tasks per socket; see
+    /// [`QuinnConfigBuilder::num_listeners`](crate::quic::quinn::QuinnConfigBuilder::num_listeners).
+    pub num_listeners: Option<NonZeroU8>,
+    /// UDP sockets bound to `port`, used on Linux and Android only; see
+    /// [`QuinnConfigBuilder::num_sockets`](crate::quic::quinn::QuinnConfigBuilder::num_sockets).
+    pub num_sockets: Option<NonZeroUsize>,
     pub port: i32,
     pub transport_bits_per_second: Option<usize>,
     pub transport_rtt: Option<usize>,
@@ -645,6 +685,11 @@ where
 //#[serde(deny_unknown_fields)]
 pub struct ServerSettings {
     pub auth: Option<AuthSettings>,
+    /// Without `[server.auth]`, take the caller's identity from an unsigned
+    /// bearer token. Anyone can claim any identity, so this only names
+    /// callers; it grants nothing. Refused at load beside `[server.auth]`.
+    #[serde(default)]
+    pub trust_unsigned_identity: bool,
     pub grpc: Option<GrpcSettings>,
     /// One block per public gRPC service; an absent table enables every
     /// service.
@@ -854,6 +899,11 @@ pub struct ReplicatedStoreSettings {
     pub client_max_reconnects: Option<u32>,
     pub max_bandwidth_bytes_per_second: Option<u64>,
     pub expected_rtt_ms: Option<u64>,
+    /// Initial congestion window, in bytes, for a new connection to the remote's internal QUIC
+    /// endpoint. This is also the minimum window carried over when a connection is periodically
+    /// refreshed.
+    #[serde(default = "default_peer_initial_cwnd_bytes")]
+    pub initial_cwnd_bytes: InitialCwndBytes,
 }
 
 #[derive(Copy, Clone, Default, Debug, Deserialize, PartialEq)]

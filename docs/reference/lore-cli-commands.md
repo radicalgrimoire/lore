@@ -347,7 +347,7 @@ Create a repository in the given directory
 
 * `--description <description>` — Optional description of repository
 * `--id <id>` — Optional ID of repository
-* `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory
+* `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory, over a shared store as if --use-shared-store were given
 
   Default value: `none`
 
@@ -357,9 +357,11 @@ Create a repository in the given directory
     - `default`:
       Use whichever VFS system is preferred based on the user's system
     - `swfs`:
-      Use Epic's Split Write File System as the Virtual File System
+      Use Epic's Split Write File System as the Virtual File System. An SWFS instance keeps its content in the shared
+      store made for its remote, so it needs a reachable remote: it cannot be created offline, or for a repository with
+      no remote
 
-* `--use-shared-store` — Use the shared store rather than create a local immutable store
+* `--use-shared-store` — Use the shared store rather than create a local immutable store. A VFS always does
 * `--shared-store-path <SHARED_STORE_PATH>` — Use this path rather than the system default as the shared store location
 
 ## `lore repository clone`
@@ -368,8 +370,8 @@ Clone a remote repository into the given path
 
 A clone needs the remote, so `--offline` does not keep it from connecting: it prepares the clone for working offline
 instead. With it, as with `--cache`, a clone that writes its files caches every file metadata block of the cloned
-revision, which staging and committing write to, so both work without the remote, and fails if it cannot. A bare clone
-writes no files and reads them from the remote when a command needs them.
+revision, which staging and committing write to, so both work without the remote, and fails if it cannot. A bare or
+virtual clone writes no files and reads them from the remote when a command needs them.
 
 **Usage:** `lore repository clone [OPTIONS] <url> [path]`
 
@@ -386,7 +388,7 @@ writes no files and reads them from the remote when a command needs them.
 * `--bare` — Clone without files, only fetch latest revision tree
 * `--direct-file-write` — Write directly to the destination file instead of write to a temporary file and move into
   place
-* `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory
+* `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory, over a shared store as if --use-shared-store were given
 
   Default value: `none`
 
@@ -396,12 +398,14 @@ writes no files and reads them from the remote when a command needs them.
     - `default`:
       Use whichever VFS system is preferred based on the user's system
     - `swfs`:
-      Use Epic's Split Write File System as the Virtual File System
+      Use Epic's Split Write File System as the Virtual File System. An SWFS instance keeps its content in the shared
+      store made for its remote, so it needs a reachable remote: it cannot be created offline, or for a repository with
+      no remote
 
 * `--layer <repository>` — Layer to add
 * `--layer-metadata <key>` — Metadata key to link layer revisions with
-* `--prefetch <file>` — File containing list of files to prefetch
-* `--use-shared-store` — Use the shared store rather than create a local immutable store
+* `--prefetch <file>` — Access recording whose paths a virtual clone warms in the background (one path per line, directories ending with `/`)
+* `--use-shared-store` — Use the shared store rather than create a local immutable store. A VFS always does
 * `--shared-store-path <SHARED_STORE_PATH>` — Use this path rather than the system default as the shared store location
 * `--no-tracking` — Clone without local repository tracking (memory-only stores)
 * `--root-file <path>` — Root files for dependency-based selective clone (only clone these files and their dependencies)
@@ -1747,7 +1751,9 @@ Reset changes to a path or file to the current revision, discarding your local c
 
 ###### **Options:**
 
-* `--purge` — Delete untracked files
+* `--purge` — Delete every file the revision does not hold within the view: untracked files, whatever the ignore file
+  says, and files the view excludes. Nested repositories stay. With `--force` the view is not applied, and the files it
+  excludes are restored
 * `--targets <file>` — Path to a targets file containing all the paths to all files
 * `--revision <revision>` — Revision to reset files to
 * `--last-merged-from <branch>` — If given, the files will be reset to the last point of merge from this branch, or the
@@ -1902,6 +1908,7 @@ Authenticate the CLI
 * `--auth-url <AUTH_URL>` — Auth service URL with scheme (e.g. `ucs-auth://auth.example.com`). Required when logging in
   with `--token` outside a repository without a remote-url
 * `--no-browser` — Avoid opening a browser to login
+* `--reuse-session` — Keep the stored login instead of logging in again while its session is valid
 
 ## `lore auth info`
 
@@ -2034,6 +2041,7 @@ Authenticate the CLI
 * `--auth-url <AUTH_URL>` — Auth service URL with scheme (e.g. `ucs-auth://auth.example.com`). Required when logging in
   with `--token` outside a repository without a remote-url
 * `--no-browser` — Avoid opening a browser to login
+* `--reuse-session` — Keep the stored login instead of logging in again while its session is valid
 
 ## `lore link`
 
@@ -2156,8 +2164,8 @@ Clone a remote repository into the given path
 
 A clone needs the remote, so `--offline` does not keep it from connecting: it prepares the clone for working offline
 instead. With it, as with `--cache`, a clone that writes its files caches every file metadata block of the cloned
-revision, which staging and committing write to, so both work without the remote, and fails if it cannot. A bare clone
-writes no files and reads them from the remote when a command needs them.
+revision, which staging and committing write to, so both work without the remote, and fails if it cannot. A bare or
+virtual clone writes no files and reads them from the remote when a command needs them.
 
 **Usage:** `lore clone [OPTIONS] <url> [path]`
 
@@ -2174,7 +2182,7 @@ writes no files and reads them from the remote when a command needs them.
 * `--bare` — Clone without files, only fetch latest revision tree
 * `--direct-file-write` — Write directly to the destination file instead of write to a temporary file and move into
   place
-* `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory
+* `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory, over a shared store as if --use-shared-store were given
 
   Default value: `none`
 
@@ -2184,12 +2192,14 @@ writes no files and reads them from the remote when a command needs them.
     - `default`:
       Use whichever VFS system is preferred based on the user's system
     - `swfs`:
-      Use Epic's Split Write File System as the Virtual File System
+      Use Epic's Split Write File System as the Virtual File System. An SWFS instance keeps its content in the shared
+      store made for its remote, so it needs a reachable remote: it cannot be created offline, or for a repository with
+      no remote
 
 * `--layer <repository>` — Layer to add
 * `--layer-metadata <key>` — Metadata key to link layer revisions with
-* `--prefetch <file>` — File containing list of files to prefetch
-* `--use-shared-store` — Use the shared store rather than create a local immutable store
+* `--prefetch <file>` — Access recording whose paths a virtual clone warms in the background (one path per line, directories ending with `/`)
+* `--use-shared-store` — Use the shared store rather than create a local immutable store. A VFS always does
 * `--shared-store-path <SHARED_STORE_PATH>` — Use this path rather than the system default as the shared store location
 * `--no-tracking` — Clone without local repository tracking (memory-only stores)
 * `--root-file <path>` — Root files for dependency-based selective clone (only clone these files and their dependencies)
@@ -2344,7 +2354,9 @@ Reset changes to a file or directory
 
 ###### **Options:**
 
-* `--purge` — Delete untracked files
+* `--purge` — Delete every file the revision does not hold within the view: untracked files, whatever the ignore file
+  says, and files the view excludes. Nested repositories stay. With `--force` the view is not applied, and the files it
+  excludes are restored
 * `--targets <file>` — Path to a targets file containing all the paths to all files
 * `--revision <revision>` — Revision to reset files to
 * `--last-merged-from <branch>` — If given, the files will be reset to the last point of merge from this branch, or the

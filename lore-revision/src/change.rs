@@ -260,6 +260,31 @@ impl NodeChange {
             .then_some(&self.from.mapping.path)
     }
 
+    /// The path the node stood at where the change leaves it at another: a move's source, or the
+    /// path a node stood at below a directory a move renamed. `None` for a node that stays where it
+    /// stood, and for one the change adds.
+    pub fn relocated_from(&self) -> Option<&RelativePath> {
+        let from = &self.from.mapping.path;
+        (self.from.mapping.node.is_valid_node_id()
+            && !from.is_empty()
+            && from.as_str() != self.path().as_str())
+        .then_some(from)
+    }
+
+    /// Whether the change is a move whose source differs from its destination in case alone.
+    pub fn is_case_only_move(&self) -> bool {
+        self.move_source()
+            .is_some_and(|source| source.as_lowercase_str() == self.path().as_lowercase_str())
+    }
+
+    /// Whether a walk against the working tree found a file under a case variant of its name,
+    /// holding what the node holds.
+    pub fn is_case_variant(&self) -> bool {
+        self.is_case_only_move()
+            && !self.flags.contains(Flags::Modify)
+            && self.from.flags.contains(NodeFlags::File)
+    }
+
     /// The side the change resolves to: `from` for a delete, `to` otherwise.
     pub fn resolved_side(&self) -> &NodeChangeState {
         match self.action {
@@ -410,12 +435,46 @@ pub async fn is_conflict(
 /// The subtree moves between repositories along with a mount replaced between a directory and a
 /// link, so a change the other side of a merge made below it does not stand on its own.
 pub fn is_link_replacement(change: &NodeChange) -> bool {
+    replaced_types(change).is_some_and(|(from_type, to_type)| {
+        from_type == LoreNodeType::Link || to_type == LoreNodeType::Link
+    })
+}
+
+/// The type of node a change puts where a file stood, or a file where a directory stood. `None`
+/// for any other change.
+pub fn file_directory_replacement(change: &NodeChange) -> Option<LoreNodeType> {
+    replaced_types(change)
+        .filter(|types| {
+            matches!(
+                types,
+                (LoreNodeType::File, LoreNodeType::Directory)
+                    | (LoreNodeType::Directory, LoreNodeType::File)
+            )
+        })
+        .map(|(_, to_type)| to_type)
+}
+
+/// Whether the two sides of a conflict put a file and a directory at one path, which no merge
+/// below that path resolves.
+pub fn file_directory_clash(source: &NodeChange, target: &NodeChange) -> bool {
+    source.to.mapping.node.is_valid_node_id()
+        && target.to.mapping.node.is_valid_node_id()
+        && matches!(
+            (source.to.flags.node_type(), target.to.flags.node_type()),
+            (LoreNodeType::File, LoreNodeType::Directory)
+                | (LoreNodeType::Directory, LoreNodeType::File)
+        )
+}
+
+/// The types of the node a change replaces and of the node it replaces it with, where the two
+/// differ.
+fn replaced_types(change: &NodeChange) -> Option<(LoreNodeType, LoreNodeType)> {
     if !change.from.mapping.node.is_valid_node_id() || !change.to.mapping.node.is_valid_node_id() {
-        return false;
+        return None;
     }
     let from_type = change.from.flags.node_type();
     let to_type = change.to.flags.node_type();
-    from_type != to_type && (from_type == LoreNodeType::Link || to_type == LoreNodeType::Link)
+    (from_type != to_type).then_some((from_type, to_type))
 }
 
 pub fn sort_by_path(changes: &mut [NodeChange]) {

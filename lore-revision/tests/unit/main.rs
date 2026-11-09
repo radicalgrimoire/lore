@@ -8,12 +8,15 @@
 
 mod auth;
 mod branch;
+mod case_folding;
 mod change;
 mod commit;
 mod dependency;
 mod event;
 mod file;
 mod filter;
+mod filter_walk;
+mod find;
 mod fs;
 mod global;
 /// The fixtures the crate's process-isolated tests include, shared with these.
@@ -23,14 +26,19 @@ mod history;
 mod immutable;
 mod infer;
 mod instance;
+mod instance_in_use_retry;
+mod instance_move_rollback;
 mod interface;
+mod layer;
 mod link;
 mod lock;
 mod merge;
 mod metadata;
 mod node;
+mod notification;
 mod paged_remote;
 mod protocol;
+mod refusal;
 mod relay;
 mod repository;
 mod revision;

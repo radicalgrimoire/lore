@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use lore_base::error::AddressNotFound;
+use lore_base::error::Disconnected;
 use lore_base::types::Address;
 use lore_base::types::Fragment;
 use lore_base::types::Hash;
@@ -55,6 +56,22 @@ fn a_fragment_the_peer_is_missing_keeps_its_address_on_the_way_out() {
 
     assert!(error.is_address_not_found(), "{error:?}");
     assert!(error.translated() == LoreError::AddressNotFound);
+}
+
+/// An offer the peer refuses onto a branch holding revisions the local history does not is a
+/// divergence. Any other failure keeps its own variant.
+#[test]
+fn a_refused_offer_is_divergent_only_onto_a_diverged_branch() {
+    let refused = || PushError::internal("remote rejected the request");
+
+    let error = refused_offer(refused(), true);
+    assert!(error.is_divergent(), "{error:?}");
+
+    let error = refused_offer(refused(), false);
+    assert!(error.is_internal(), "{error:?}");
+
+    let error = refused_offer(PushError::from(Disconnected), true);
+    assert!(error.is_disconnected(), "{error:?}");
 }
 
 /// What the push does with a fragment is decided entirely by the status byte the peer answered
@@ -134,62 +151,62 @@ mod classify {
     }
 }
 
+const DURABLE: u32 = lore_base::types::FragmentFlags::PayloadStoredDurable.bits();
+
+/// A repository over in-memory stores, holding only what the test puts in it.
+async fn null_repository() -> Arc<RepositoryContext> {
+    let immutable_store = lore_storage::local::immutable_store::create(
+        None::<&str>,
+        lore_storage::local::immutable_store::ImmutableStoreCreateOptions::none(),
+        false,
+        lore_storage::ImmutableStoreSettings::default(),
+    )
+    .await
+    .expect("in-memory immutable store");
+    let mutable_store = lore_storage::local::mutable_store::create(
+        None::<&str>,
+        lore_storage::MutableStoreSettings::default(),
+        immutable_store.clone(),
+    )
+    .await
+    .expect("in-memory mutable store");
+
+    Arc::new(RepositoryContext::new_null_context(
+        immutable_store,
+        mutable_store,
+    ))
+}
+
+/// Store a payload under `address` carrying no durability, as a local commit leaves it.
+async fn store_local(repository: &Arc<RepositoryContext>, address: Address) {
+    let payload = Bytes::from_static(b"payload");
+    let fragment = Fragment {
+        flags: 0,
+        size_payload: payload.len() as u32,
+        size_content: payload.len() as u64,
+    };
+    repository
+        .immutable_store()
+        .put(repository.id, address, fragment, Some(payload), false)
+        .await
+        .expect("storing a local payload");
+}
+
+/// The flags the store holds for `address`.
+async fn stored_flags(repository: &Arc<RepositoryContext>, address: Address) -> u32 {
+    repository
+        .immutable_store()
+        .get_metadata(repository.id, address)
+        .await
+        .expect("the store holds the address")
+        .fragment
+        .flags
+}
+
 /// Recording a full match is what takes the fragment off the local store's protected list, so
 /// this is where a push stops re-offering content the peer already holds.
 mod mark {
     use super::*;
-
-    const DURABLE: u32 = lore_base::types::FragmentFlags::PayloadStoredDurable.bits();
-
-    /// A repository over in-memory stores, holding only what the test puts in it.
-    async fn null_repository() -> Arc<RepositoryContext> {
-        let immutable_store = lore_storage::local::immutable_store::create(
-            None::<&str>,
-            lore_storage::local::immutable_store::ImmutableStoreCreateOptions::none(),
-            false,
-            lore_storage::ImmutableStoreSettings::default(),
-        )
-        .await
-        .expect("in-memory immutable store");
-        let mutable_store = lore_storage::local::mutable_store::create(
-            None::<&str>,
-            lore_storage::MutableStoreSettings::default(),
-            immutable_store.clone(),
-        )
-        .await
-        .expect("in-memory mutable store");
-
-        Arc::new(RepositoryContext::new_null_context(
-            immutable_store,
-            mutable_store,
-        ))
-    }
-
-    /// Store a payload under `address` carrying no durability, as a local commit leaves it.
-    async fn store_local(repository: &Arc<RepositoryContext>, address: Address) {
-        let payload = Bytes::from_static(b"payload");
-        let fragment = Fragment {
-            flags: 0,
-            size_payload: payload.len() as u32,
-            size_content: payload.len() as u64,
-        };
-        repository
-            .immutable_store()
-            .put(repository.id, address, fragment, Some(payload), false)
-            .await
-            .expect("storing a local payload");
-    }
-
-    /// The flags the store holds for `address`.
-    async fn stored_flags(repository: &Arc<RepositoryContext>, address: Address) -> u32 {
-        repository
-            .immutable_store()
-            .get_metadata(repository.id, address)
-            .await
-            .expect("the store holds the address")
-            .fragment
-            .flags
-    }
 
     /// The fact a full match establishes: the payload is safe on the peer, so the local entry
     /// is no longer the only copy.
@@ -412,5 +429,227 @@ mod offer {
                 "{name}: every answer was asked for"
             );
         }
+    }
+}
+
+/// Asking the peer to duplicate an association it already holds, as a push does before it uploads.
+/// The peer answers copy requests with `SlowDown`, a refusal, or success.
+mod duplicate_association {
+    use lore_base::error::NotFound;
+    use lore_transport::test_util::CopyingPeer;
+
+    use super::*;
+
+    /// What the peer was asked for, how the copy ended, and the local entry's flags afterwards.
+    struct Duplicated {
+        result: Result<bool, PushError>,
+        copies: usize,
+        copied: u64,
+        flags: u32,
+    }
+
+    /// Duplicate a locally stored address on a peer that answers as `slow_downs` and `refusal` say.
+    async fn duplicate(seed: u8, slow_downs: usize, refusal: Option<ProtocolError>) -> Duplicated {
+        let repository = null_repository().await;
+        let wanted = address(seed);
+        store_local(&repository, wanted).await;
+        let peer = CopyingPeer::new(slow_downs, refusal);
+        let session = peer.session(repository.id);
+        let stats = PushStats::new(false);
+
+        let result = duplicate_association(&repository, &session, wanted, &stats).await;
+
+        Duplicated {
+            result,
+            copies: peer.copies(),
+            copied: stats.snapshot().copied,
+            flags: stored_flags(&repository, wanted).await,
+        }
+    }
+
+    /// A copy the peer throttles and then accepts registers the association and marks the local
+    /// entry as durable.
+    #[tokio::test(start_paused = true)]
+    async fn a_throttled_copy_that_is_accepted_is_recorded_as_durable() {
+        let duplicated = duplicate(0xD1, 2, None).await;
+
+        assert!(duplicated.result.expect("the copy is accepted"));
+        assert_eq!(duplicated.copies, 3);
+        assert_eq!(duplicated.copied, 1);
+        assert_eq!(duplicated.flags & DURABLE, DURABLE);
+    }
+
+    /// If the peer throttles a copy until retries run out, the push fails with `SlowDown` rather
+    /// than uploading the payload.
+    #[tokio::test(start_paused = true)]
+    async fn a_copy_throttled_through_every_retry_fails_the_push() {
+        let duplicated = duplicate(0xD3, usize::MAX, None).await;
+
+        let error = duplicated
+            .result
+            .expect_err("a copy still throttled fails the push");
+        assert!(error.is_slow_down(), "{error:?}");
+        assert_eq!(duplicated.copies, lore_storage::store_retry().limit() + 1);
+        assert_eq!(duplicated.copied, 0);
+        assert_eq!(duplicated.flags & DURABLE, 0);
+    }
+
+    /// A copy refused for a reason other than throttling is not retried, and leaves the payload to
+    /// be uploaded.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_copy_leaves_the_payload_to_upload() {
+        let duplicated = duplicate(0xD5, 0, Some(ProtocolError::from(NotFound))).await;
+
+        assert!(!duplicated.result.expect("a refusal is not an error"));
+        assert_eq!(duplicated.copies, 1);
+        assert_eq!(duplicated.copied, 0);
+        assert_eq!(duplicated.flags & DURABLE, 0);
+    }
+}
+
+/// Uploading the payloads the peer is missing.
+mod upload {
+    use lore_base::error::NotAuthorized;
+
+    use super::*;
+    use crate::branch::with_execution;
+    use crate::immutable::session_tests::refusing_session;
+
+    /// An upload the peer refuses fails the push with the refusal.
+    #[tokio::test]
+    async fn an_upload_the_peer_refuses_fails_the_push_with_the_refusal() {
+        let pushed = with_execution(async {
+            let repository = null_repository().await;
+            let wanted = address(0xE1);
+            store_local(&repository, wanted).await;
+            push_fragments(
+                repository,
+                refusing_session(ProtocolError::from(NotAuthorized)),
+                PushQueryResult {
+                    absent: vec![wanted],
+                    ..PushQueryResult::default()
+                },
+                Arc::new(PushProgress::new(Arc::new(PushStats::new(false)))),
+            )
+            .await
+        })
+        .await;
+
+        assert!(
+            pushed.as_ref().is_err_and(|err| err.is_not_authorized()),
+            "got {pushed:?}"
+        );
+    }
+}
+
+/// The history a push collects by walking back from the peer's latest revision of the branch to
+/// where the local line leaves it.
+mod unpushed_history {
+    use std::time::Duration;
+
+    use lore_base::error::NotAuthorized;
+    use lore_base::types::BranchId;
+    use lore_revision::branch::BranchLatestStatus;
+    use lore_revision::metadata::Metadata;
+    use lore_revision::state::State;
+
+    use super::*;
+    use crate::branch::with_execution;
+    use crate::branch::write_line;
+    use crate::paged_remote::Anchor;
+    use crate::paged_remote::PagedRemote;
+    use crate::paged_remote::client_on;
+    use crate::paged_remote::client_stores;
+    use crate::paged_remote::remote_revision;
+
+    /// The error a push of a local line of two revisions meets collecting its history against
+    /// `peer`, whose latest revision of the branch is `peer_latest`, a revision only the peer
+    /// holds. The walk is bounded by a second, so that a walk that loops fails the test.
+    async fn unpushed_history_error(peer: PagedRemote, peer_latest: Hash) -> PushError {
+        let branch = BranchId::from([7; 16]);
+        let stores = client_stores().await;
+        let line = write_line(&stores.writer, Hash::default(), 1, 2).await;
+        let mut metadata = Metadata::new();
+        metadata
+            .set_string("name", "pushed")
+            .expect("naming the branch");
+        let metadata = metadata
+            .serialize(stores.writer.clone())
+            .await
+            .expect("writing the branch metadata");
+        lore_revision::branch::mutable_store_metadata(stores.writer.clone(), branch, metadata)
+            .await
+            .expect("storing the branch metadata");
+        lore_revision::branch::store_latest(
+            stores.writer.clone(),
+            branch,
+            Hash::default(),
+            line[1],
+            BranchLatestStatus::Divergent,
+        )
+        .await
+        .expect("storing the local latest");
+        let client = client_on(&stores, Arc::new(peer));
+        let remote = client.remote().await.expect("the client is connected");
+        let state = State::deserialize(client.clone(), line[1])
+            .await
+            .expect("reading the local latest");
+
+        let collected = collect_unpushed_history(
+            &client,
+            &remote,
+            &state,
+            branch,
+            line[1],
+            peer_latest,
+            branch,
+        );
+        match tokio::time::timeout(Duration::from_secs(1), collected)
+            .await
+            .expect("the walk ends within a second")
+        {
+            Ok(_) => panic!("the walk stops at the peer's latest"),
+            Err(error) => error,
+        }
+    }
+
+    /// A push whose walk back from the peer's latest revision stops fails with the walk's error,
+    /// which keeps its code: `RevisionNotFound` naming the peer's latest where the peer's page does
+    /// not move the line, and the peer's `NotAuthorized` where its list fails.
+    #[tokio::test]
+    async fn a_push_whose_walk_stops_fails_with_the_walks_error() {
+        Box::pin(with_execution(async {
+            let branch = BranchId::from([7; 16]);
+            let peer_latest = remote_revision(3, Hash::default(), Hash::from([0xA0; 32])).await;
+            let top = peer_latest.signature;
+
+            let stopped = unpushed_history_error(
+                PagedRemote::new(branch, top).holding([&peer_latest]).page(
+                    Anchor::Signature(top),
+                    vec![(3, top)],
+                    top,
+                ),
+                top,
+            )
+            .await;
+            let refused = unpushed_history_error(
+                PagedRemote::new(branch, top)
+                    .failing(Anchor::Signature(top), ProtocolError::from(NotAuthorized)),
+                top,
+            )
+            .await;
+
+            assert_eq!(
+                (
+                    stopped
+                        .as_revision_not_found()
+                        .map(|error| error.revision.clone()),
+                    refused.is_not_authorized(),
+                ),
+                (Some(top.to_string()), true),
+                "{stopped:?}; {refused:?}"
+            );
+        }))
+        .await;
     }
 }

@@ -119,8 +119,18 @@ pub fn counted_write_context() -> lore_storage::WriteContext {
 
 /// Construct [`WriteOptions`] from a repository context. Writes reach the remote only where the
 /// context uploads and the call is not a dry run.
+///
+/// A repository that caches content locally ([`RepositoryContext::disable_cache`] unset, as every
+/// SWFS instance's is) keeps the payloads it writes as it keeps those it reads, even one the write
+/// makes durable on the remote. Without it the store keeps the entry and drops the payload, which a
+/// plain instance can afford, as its working tree holds the file, and an SWFS instance cannot: it
+/// serves the file from the store, offline. Kept with [`WriteOptions::with_keep_local`] rather than
+/// `local_cache_priority`, which the fragment records and every store fetching it then honours.
 pub fn write_options_from_repository(repository: Arc<RepositoryContext>) -> WriteOptions {
-    let flags = WriteOptions::default();
+    let mut flags = WriteOptions::default();
+    if !repository.disable_cache() {
+        flags = flags.with_keep_local();
+    }
     let dry_run =
         crate::runtime::try_execution_context().is_some_and(|context| context.globals().dry_run());
     if !repository.disable_upload() && !dry_run {
@@ -202,7 +212,7 @@ pub(crate) fn resolve_session(repository: &Arc<RepositoryContext>) -> Option<Arc
 /// without a lookup on the connection, and the context decides whether the connection pins
 /// it as well.
 #[lore_macro::test_pub]
-async fn pooled_session(
+pub(crate) async fn pooled_session(
     repository: &Arc<RepositoryContext>,
     correlation_id: &str,
 ) -> Result<Arc<StorageSession>, ProtocolError> {
@@ -266,6 +276,9 @@ pub async fn store_raw_remote_retry(
             }
             Err(ProtocolError::Disconnected(_)) => {
                 return Err(Disconnected.into());
+            }
+            Err(err) if is_refusal(&err) => {
+                return Err(err.forward("storing fragment to remote"));
             }
             Err(err) => {
                 return Err(ImmutableError::internal_with_context(
@@ -621,6 +634,9 @@ pub fn write_from_file_with_tracker(
 /// Whether a file still holds content already stored is [`file_matches`], which measures against
 /// the fragmentation that content was stored under.
 ///
+/// Content a virtual filesystem serves from the store is stored under the address it names, so
+/// that address's hash answers without reading it.
+///
 /// Returns [`lore_storage::hash_file`]'s future with its error forwarded, without a future of its
 /// own.
 #[inline]
@@ -628,8 +644,49 @@ pub fn hash_file(
     repository: Arc<RepositoryContext>,
     source: &lore_storage::ContentSource<'_>,
 ) -> impl Future<Output = Result<Hash, ImmutableError>> {
-    lore_storage::hash_file(repository.immutable_store(), repository.id, source, None)
-        .map(|hashed| hashed.forward::<ImmutableError>("hashing file"))
+    match virtual_immutable(source) {
+        Some((address, _)) => futures::future::Either::Left(std::future::ready(Ok(address.hash))),
+        None => futures::future::Either::Right(
+            lore_storage::hash_file(repository.immutable_store(), repository.id, source, None)
+                .map(|hashed| hashed.forward::<ImmutableError>("hashing file")),
+        ),
+    }
+}
+
+/// The whole content `source` holds, which the caller budgets for holding resident.
+///
+/// `lore_storage` reads no virtual content, so content a virtual filesystem serves from the store
+/// is read from `repository`'s immutable store, and fetched from the remote where it is not local.
+pub async fn read_source(
+    repository: &Arc<RepositoryContext>,
+    source: &lore_storage::ContentSource<'_>,
+) -> Result<Bytes, ImmutableError> {
+    match virtual_immutable(source) {
+        Some((address, _)) => {
+            read(
+                repository.clone(),
+                address,
+                None,
+                read_options_from_repository(repository),
+            )
+            .await
+        }
+        None => source
+            .read_all()
+            .await
+            .forward::<ImmutableError>("reading file"),
+    }
+}
+
+/// The address and size of content a virtual filesystem serves from the immutable store, and
+/// `None` for any other source.
+pub fn virtual_immutable(source: &lore_storage::ContentSource<'_>) -> Option<(Address, u64)> {
+    match source {
+        lore_storage::ContentSource::Virtual(
+            lore_storage::content::VirtualContent::Immutable { address, size },
+        ) => Some((*address, *size)),
+        _ => None,
+    }
 }
 
 /// Whether `source` still holds the content `previous` addresses, fetching fragment metadata

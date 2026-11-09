@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 
+use bytes::Bytes;
 use lore_base::types::Address;
 use lore_base::types::BranchPoint;
+use lore_base::types::Fragment;
 use lore_base::types::Hash;
 use lore_revision::change;
 use lore_revision::change::FileAction;
@@ -22,6 +24,8 @@ mod push;
 use lore_revision::branch::*;
 use lore_revision::util::path::RelativePathBuf;
 
+use crate::paged_remote::above_unverified;
+
 fn branch_id(byte: u8) -> BranchId {
     BranchId::from([byte; 16])
 }
@@ -35,6 +39,34 @@ fn branch_point(branch: u8, revision_byte: u8) -> BranchPoint {
         branch: branch_id(branch),
         revision: revision(revision_byte),
     }
+}
+
+/// Names bytes that are not metadata, stored in `repository`'s local store, as the metadata of
+/// `branch`, so a read of the local copy fails.
+pub(crate) async fn store_unreadable_metadata(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+) {
+    let bytes = Bytes::from_static(b"not branch metadata");
+    let hash = lore_storage::hash::hash_slice(&bytes);
+    repository
+        .immutable_store()
+        .put(
+            repository.id,
+            Address::zero_context_hash(hash),
+            Fragment {
+                flags: 0,
+                size_payload: bytes.len() as u32,
+                size_content: bytes.len() as u64,
+            },
+            Some(bytes),
+            false,
+        )
+        .await
+        .expect("storing bytes that are not metadata");
+    mutable_store_metadata(repository.clone(), branch, hash)
+        .await
+        .expect("storing the metadata hash");
 }
 
 /// A branch merging the branch it was created from: the shared branch is the
@@ -190,7 +222,7 @@ async fn with_execution<F: Future>(body: F) -> F::Output {
 
 /// A repository backed by in-memory stores and no remote, so every read has to
 /// come from the revisions the test wrote.
-async fn null_repository() -> Arc<RepositoryContext> {
+pub(crate) async fn null_repository() -> Arc<RepositoryContext> {
     let immutable_store = lore_storage::local::immutable_store::create(
         None::<&str>,
         lore_storage::local::immutable_store::ImmutableStoreCreateOptions::none(),
@@ -235,7 +267,7 @@ async fn write_revision(
 /// Write a revision on a branch of its own. Without a distinguishing metadata
 /// hash it would be addressed as, and so be, the revision the parent's own line
 /// holds at that number.
-async fn write_branch_revision(
+pub(crate) async fn write_branch_revision(
     repository: &Arc<RepositoryContext>,
     parent: Hash,
     revision_number: u64,
@@ -276,7 +308,7 @@ async fn write_merge_revision(
 
 /// Write a line of `count` revisions numbered from `first_revision_number`,
 /// returning them oldest first.
-async fn write_line(
+pub(crate) async fn write_line(
     repository: &Arc<RepositoryContext>,
     parent: Hash,
     first_revision_number: u64,
@@ -417,6 +449,128 @@ mod find_common_revision_in_history_lines {
             .expect("the search must not fail on readable lines");
 
             assert_eq!(met, Some(shared[2]));
+        }))
+        .await;
+    }
+
+    /// A line that reaches the newest shared revision a batch before the other still meets the
+    /// other there, not at an older shared revision both lines load in the later batch.
+    #[tokio::test]
+    async fn history_lines_meet_at_the_newest_shared_revision_a_batch_apart() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let shared = write_line(&repository, Hash::default(), 1, 120).await;
+            let one = write_line(&repository, shared[119], 1000, 5).await;
+            let other = write_line(&repository, shared[119], 2000, 100).await;
+
+            let met = Box::pin(find_common_revision_in_history_lines(
+                repository, one[4], other[99],
+            ))
+            .await
+            .expect("the search must not fail on readable lines");
+
+            assert_eq!(met, Some(shared[119]));
+        }))
+        .await;
+    }
+
+    /// Siblings at equal numbers are not shared, so both lines pass them and meet at
+    /// the shared revision below.
+    #[tokio::test]
+    async fn history_lines_pass_siblings_at_equal_numbers_to_the_shared_revision_below() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let shared = write_line(&repository, Hash::default(), 1, 3).await;
+            let one_sibling = write_branch_revision(&repository, shared[2], 4, 1).await;
+            let other_sibling = write_branch_revision(&repository, shared[2], 4, 2).await;
+            let one = write_line(&repository, one_sibling, 5, 2).await;
+            let other = write_line(&repository, other_sibling, 5, 1).await;
+
+            let met = Box::pin(find_common_revision_in_history_lines(
+                repository, one[1], other[0],
+            ))
+            .await
+            .expect("the search must not fail on readable lines");
+
+            assert_eq!(met, Some(shared[2]));
+        }))
+        .await;
+    }
+
+    /// A line whose revision numbers do not decrease does not follow self parents,
+    /// so the search fails rather than answering from it.
+    #[tokio::test]
+    async fn a_history_line_whose_numbers_do_not_decrease_fails_the_search() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let parent = write_revision(&repository, Hash::default(), 5).await;
+            let child = write_revision(&repository, parent, 3).await;
+            let other = write_line(&repository, Hash::default(), 1, 2).await;
+
+            let error = Box::pin(find_common_revision_in_history_lines(
+                repository, child, other[1],
+            ))
+            .await
+            .expect_err("the line from child rises in number to its parent");
+
+            assert!(error.is_internal(), "{error:?}");
+        }))
+        .await;
+    }
+
+    /// A batch is loaded only for the line whose oldest revision has the higher
+    /// number, so the store is read for the line below only once the lines need it:
+    /// three batches of `one`, and the first of `other`, which reaches the shared
+    /// revision before `one` does.
+    #[tokio::test]
+    async fn history_lines_load_the_line_below_only_once_it_is_needed() {
+        Box::pin(with_execution(async {
+            let (stores, counting) = crate::paged_remote::counted_client_stores().await;
+            let repository = stores.writer.clone();
+            let shared = write_line(&repository, Hash::default(), 1, 150).await;
+            let one = write_line(&repository, shared[149], 1000, 250).await;
+            let other = write_line(&repository, shared[149], 151, 1).await;
+            counting.take_reads();
+
+            let met = Box::pin(find_common_revision_in_history_lines(
+                repository, one[249], other[0],
+            ))
+            .await
+            .expect("the search must not fail on readable lines");
+
+            assert_eq!(met, Some(shared[149]));
+            assert_eq!(
+                counting.take_reads().payloads,
+                400,
+                "a state read for each revision of four batches of 100"
+            );
+        }))
+        .await;
+    }
+
+    /// A page that lists a revision on a line without its own state fails the search, whether
+    /// the state is missing, cut short, or another revision's, and whether the revision is the one
+    /// asked for or one below it.
+    #[tokio::test]
+    async fn history_lines_fail_where_a_page_lists_a_revision_without_its_own_state() {
+        Box::pin(with_execution(async {
+            for case in above_unverified(Hash::default()).await {
+                let unrelated = write_line(&case.writer, Hash::default(), 1, 2).await;
+
+                let met = Box::pin(find_common_revision_in_history_lines(
+                    case.client,
+                    case.local,
+                    unrelated[1],
+                ))
+                .await;
+
+                assert!(
+                    met.as_ref().is_err_and(|error| error.is_internal()),
+                    "{} state for {}: {met:?}",
+                    case.kind,
+                    case.position
+                );
+            }
         }))
         .await;
     }
@@ -914,6 +1068,27 @@ async fn history_line_that_cannot_be_read_diverges() {
     .await;
 }
 
+/// A page that lists a revision on the line without its own state fails the search for a
+/// revision on that line, whether the state is missing, cut short, or another revision's, and
+/// whether the revision is the one asked for or one below it.
+#[tokio::test]
+async fn history_line_search_fails_where_a_page_lists_a_revision_without_its_own_state() {
+    Box::pin(with_execution(async {
+        for case in above_unverified(Hash::default()).await {
+            let found =
+                find_revision_in_history_line(case.client, case.local, 4, revision(201), 1).await;
+
+            assert!(
+                found.as_ref().is_err_and(|error| error.is_internal()),
+                "{} state for {}: {found:?}",
+                case.kind,
+                case.position
+            );
+        }
+    }))
+    .await;
+}
+
 #[tokio::test]
 async fn history_line_of_an_unknown_revision_is_empty() {
     Box::pin(with_execution(async {
@@ -922,6 +1097,7 @@ async fn history_line_of_an_unknown_revision_is_empty() {
         assert!(
             load_history_line(repository, revision(200))
                 .await
+                .expect("an unknown revision is not a failure")
                 .is_empty(),
             "A revision that is not stored yields no line to search"
         );
@@ -929,27 +1105,65 @@ async fn history_line_of_an_unknown_revision_is_empty() {
     .await;
 }
 
+/// Whether a line reached its floor is read from the number its oldest revision
+/// carries. An unreadable oldest revision numbered above the floor is not at it;
+/// the next batch, which cannot read it either, ends the line.
 #[tokio::test]
-async fn reaching_the_floor_needs_a_readable_line_below_it() {
+async fn reaching_the_floor_is_read_from_the_oldest_revision_number() {
     Box::pin(with_execution(async {
         let repository = null_repository().await;
         let line = write_line(&repository, Hash::default(), 1, 3).await;
 
         assert!(
-            history_reached_floor(repository.clone(), &[], 0).await,
+            history_reached_floor(&[], 0),
             "An empty line has nothing left to load"
         );
         assert!(
-            history_reached_floor(repository.clone(), &[revision(200)], 0).await,
-            "A line that cannot be read any further has nothing left to load"
-        );
-        assert!(
-            history_reached_floor(repository.clone(), &line[..1], 1).await,
+            history_reached_floor(&[(1, line[0])], 1),
             "Revision number 1 is at a floor of 1"
         );
         assert!(
-            !history_reached_floor(repository, &line[2..], 1).await,
+            !history_reached_floor(&[(3, line[2])], 1),
             "Revision number 3 is above a floor of 1, so the line can still be followed"
+        );
+
+        let mut unreadable = vec![(3, revision(200))];
+        assert!(
+            !history_reached_floor(&unreadable, 1),
+            "An unreadable revision numbered above the floor is not at it"
+        );
+        assert!(
+            load_additional_history(repository, &mut unreadable)
+                .await
+                .expect("an unreadable revision is not a failure"),
+            "The next batch cannot read the revision either, so the line has nothing left to load"
+        );
+        assert_eq!(unreadable, vec![(3, revision(200))]);
+    }))
+    .await;
+}
+
+/// A line whose first batch passes the older revision's number without reaching
+/// it has diverged, which the search answers without loading another batch.
+#[tokio::test]
+async fn history_line_diverges_without_loading_past_the_older_revisions_number() {
+    Box::pin(with_execution(async {
+        let (stores, counting) = crate::paged_remote::counted_client_stores().await;
+        let repository = stores.writer.clone();
+        let shared = write_line(&repository, Hash::default(), 1, 2).await;
+        let newer = write_revision(&repository, shared[1], 13).await;
+        let older = write_revision(&repository, shared[1], 3).await;
+        counting.take_reads();
+
+        let found = find_revision_in_history_line(repository, newer, 13, older, 3)
+            .await
+            .expect("passing the older revision's number is not a failure");
+
+        assert_eq!(found, HistoryLineSearch::Diverged);
+        assert_eq!(
+            counting.take_reads().payloads,
+            3,
+            "one state read for each revision of the newer line's first batch"
         );
     }))
     .await;
@@ -963,21 +1177,25 @@ async fn extending_an_exhausted_line_reports_it_exhausted() {
     Box::pin(with_execution(async {
         let repository = null_repository().await;
         let line = write_line(&repository, Hash::default(), 1, 2).await;
-        let mut history = vec![line[1], line[0]];
+        let mut history = vec![(2, line[1]), (1, line[0])];
 
         assert!(
-            load_additional_history(repository.clone(), &mut history, 0).await,
+            load_additional_history(repository.clone(), &mut history)
+                .await
+                .expect("an exhausted line is not a failure"),
             "A line followed to its root revision has nothing further to load"
         );
         assert_eq!(
             history,
-            vec![line[1], line[0]],
+            vec![(2, line[1]), (1, line[0])],
             "An exhausted line must not grow"
         );
 
         let mut empty = Vec::new();
         assert!(
-            load_additional_history(repository, &mut empty, 0).await,
+            load_additional_history(repository, &mut empty)
+                .await
+                .expect("an empty line is not a failure"),
             "There is nothing to extend an empty line from"
         );
         assert!(empty.is_empty());
@@ -1165,4 +1383,294 @@ async fn each_relayed_diff_item_is_held_once() {
         );
     }))
     .await;
+}
+
+/// Resolving a branch through the remote, where the instance does not hold it.
+mod resolve_through_the_remote {
+    use std::fmt::Debug;
+    use std::path::PathBuf;
+
+    use lore_base::error::BranchNotFound;
+    use lore_base::error::Disconnected;
+    use lore_base::error::NotAuthenticated;
+    use lore_base::error::NotAuthorized;
+    use lore_base::test_util::TempDir;
+    use lore_error_set::FfiError;
+    use lore_revision::file::history::HistoryOptions;
+    use lore_revision::file::reset::ResetMergeSide;
+    use lore_revision::file::reset::ResetOptions;
+    use lore_revision::instance::InstanceId;
+    use lore_revision::interface::LoreArray;
+    use lore_revision::interface::LoreGlobalArgs;
+    use lore_revision::interface::LoreString;
+    use lore_revision::metadata::Metadata;
+    use lore_revision::repository::RemoteState;
+    use lore_revision::repository::RepositoryPaths;
+    use lore_revision::test_util::context_with_state;
+    use lore_transport::Connection;
+    use lore_transport::ProtocolError;
+
+    use super::*;
+    use crate::helper::in_memory;
+    use crate::immutable::serving::Serving;
+    use crate::immutable::serving::serving_remote;
+    use crate::immutable::session_tests::under_globals;
+    use crate::paged_remote::PagedRemote;
+    use crate::paged_remote::client_and_writer;
+
+    /// Globals for a lookup that consults only the remote where `remote_only`, and prefers what
+    /// the instance holds otherwise.
+    fn globals(remote_only: bool) -> LoreGlobalArgs {
+        LoreGlobalArgs {
+            remote: remote_only as u8,
+            ..LoreGlobalArgs::default()
+        }
+    }
+
+    /// A lookup that reaches the remote fails with the remote's refusal of the credentials,
+    /// whether the remote refuses the connect or the query, by name or by id, with `--remote` or
+    /// without.
+    #[tokio::test]
+    async fn a_lookup_the_remote_refuses_fails_with_the_refusal() {
+        let id = branch_id(7).to_string();
+        let mut unrefused = Vec::new();
+        for remote_only in [false, true] {
+            for branch in ["refused", id.as_str()] {
+                let refused_connect =
+                    context_with_state(RemoteState::Failed(ProtocolError::from(NotAuthorized)))
+                        .await;
+                let (refused_query, _) = client_and_writer(Arc::new(
+                    PagedRemote::new(branch_id(7), Hash::default())
+                        .refusing(ProtocolError::from(NotAuthorized)),
+                ))
+                .await;
+                for (refused, repository) in
+                    [("connect", refused_connect), ("query", refused_query)]
+                {
+                    let resolved =
+                        under_globals(globals(remote_only), || resolve(repository, branch)).await;
+                    if !resolved.as_ref().is_err_and(|err| err.is_not_authorized()) {
+                        unrefused.push(format!(
+                            "{branch} with its {refused} refused, remote only {remote_only}: \
+                             got {resolved:?}"
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(unrefused.is_empty(), "{unrefused:#?}");
+    }
+
+    /// A lookup whose connect fails for any reason but a refusal finds no branch: by name, or by
+    /// id with `--remote`, it fails as `BranchNotFound`, and by id otherwise it answers the id
+    /// alone.
+    #[tokio::test]
+    async fn a_lookup_without_a_reachable_remote_finds_no_branch() {
+        let id = branch_id(7);
+        let id_text = id.to_string();
+        for (remote_only, branch, answered) in [
+            (false, "unreachable", None),
+            (true, "unreachable", None),
+            (true, id_text.as_str(), None),
+            (false, id_text.as_str(), Some(id)),
+        ] {
+            let repository =
+                context_with_state(RemoteState::Failed(ProtocolError::from(Disconnected))).await;
+            let resolved =
+                under_globals(globals(remote_only), || resolve(repository, branch)).await;
+            match answered {
+                Some(id) => assert!(
+                    resolved
+                        .as_ref()
+                        .is_ok_and(|status| status.id == id && status.latest.is_zero()),
+                    "{branch}, remote only {remote_only}: got {resolved:?}"
+                ),
+                None => assert!(
+                    resolved
+                        .as_ref()
+                        .is_err_and(|err| err.is_branch_not_found()),
+                    "{branch}, remote only {remote_only}: got {resolved:?}"
+                ),
+            }
+        }
+    }
+
+    /// A context that cannot write, whose local copy of a branch's metadata is unreadable, reads the
+    /// remote's metadata and keeps it in its local store.
+    #[tokio::test]
+    async fn a_read_only_metadata_read_keeps_the_remote_metadata_locally() {
+        let branch = branch_id(7);
+        let source = context_with_state(RemoteState::Offline).await;
+        let mut served = Metadata::new();
+        served
+            .set_branch(branch)
+            .expect("the metadata holds the branch");
+        let hash = under_globals(globals(false), || served.serialize_local(source.clone()))
+            .await
+            .expect("the remote's metadata is stored");
+        let (immutable, mutable) = lore_revision::repository::create_client_memory_stores()
+            .await
+            .expect("in-memory stores should be creatable");
+        let writer = Arc::new(
+            RepositoryContext::new_with_state(
+                None,
+                immutable,
+                mutable,
+                source.id,
+                InstanceId::default(),
+                RemoteState::Connected(Connection::detached_revision(
+                    vec![serving_remote(&source, Serving::default())],
+                    Ok(()),
+                    source.id,
+                    Arc::new(PagedRemote::new(branch, Hash::default()).metadata(hash)),
+                )),
+                Arc::default(),
+                None,
+            )
+            .with_write_token(in_memory::token()),
+        );
+        store_unreadable_metadata(&writer, branch).await;
+        let repository = Arc::new(writer.without_command_locks());
+
+        let read = under_globals(globals(false), || {
+            lore_revision::branch::metadata(repository.clone(), branch)
+        })
+        .await
+        .expect("the remote's metadata is read");
+
+        assert_eq!(read.get_branch().ok(), Some(branch));
+        assert!(
+            lore_revision::immutable::is_stored_local(repository, Address::zero_context_hash(hash))
+                .await,
+            "the remote's metadata is kept locally"
+        );
+    }
+
+    /// An instance on in-memory stores, rooted at the directory returned with it, whose current
+    /// branch is set and whose connect to the remote fails with `failure`.
+    async fn instance_whose_connect_fails(
+        failure: ProtocolError,
+    ) -> (TempDir, Arc<RepositoryContext>) {
+        let root = TempDir::new("refused-lookup-");
+        let (immutable, mutable) = lore_revision::repository::create_client_memory_stores()
+            .await
+            .expect("in-memory stores should be creatable");
+        let repository = Arc::new(
+            RepositoryContext::new_with_state(
+                Some(RepositoryPaths::new(
+                    root.path().to_path_buf(),
+                    root.child(".lore"),
+                )),
+                immutable,
+                mutable,
+                lore_revision::lore::RepositoryId::default(),
+                InstanceId::default(),
+                RemoteState::Failed(failure),
+                Arc::default(),
+                None,
+            )
+            .with_write_token(in_memory::token()),
+        );
+        lore_revision::instance::store_current_anchor_branch(&repository, branch_id(1))
+            .await
+            .expect("the current branch should be storable");
+        (root, repository)
+    }
+
+    /// The FFI code of `BranchNotFound`.
+    fn branch_not_found() -> i32 {
+        BranchNotFound {
+            branch: String::new(),
+        }
+        .ffi_code()
+    }
+
+    /// The connect failures for which `command`, run on an instance whose connect to the remote
+    /// fails that way, does not fail with the code expected of it: the refusal's own for a
+    /// refusal, and `not_found` for a remote it cannot reach.
+    async fn codes_that_differ<T, E, F>(
+        not_found: i32,
+        command: impl Fn(Arc<RepositoryContext>, PathBuf) -> F,
+    ) -> Vec<String>
+    where
+        T: Debug,
+        E: FfiError + Debug,
+        F: Future<Output = Result<T, E>>,
+    {
+        let command = &command;
+        let mut differing = Vec::new();
+        for (failure, expected) in [
+            (
+                ProtocolError::from(NotAuthenticated),
+                NotAuthenticated.ffi_code(),
+            ),
+            (ProtocolError::from(NotAuthorized), NotAuthorized.ffi_code()),
+            (ProtocolError::from(Disconnected), not_found),
+        ] {
+            let described = format!("{failure:?}");
+            let result = under_globals(globals(false), || async move {
+                let (root, repository) = instance_whose_connect_fails(failure).await;
+                command(repository, root.path().to_path_buf()).await
+            })
+            .await;
+            if result.as_ref().err().map(FfiError::ffi_code) != Some(expected) {
+                differing.push(format!("{described}: got {result:?}"));
+            }
+        }
+        differing
+    }
+
+    /// `lore file history --branch` fails with the remote's refusal of the branch lookup, and
+    /// with `BranchNotFound` where the remote cannot be reached.
+    #[tokio::test]
+    async fn file_history_fails_with_a_refused_branch_lookup() {
+        let differing = codes_that_differ(branch_not_found(), |repository, root| {
+            lore_revision::file::history::history(
+                repository,
+                root.join("file").to_string_lossy().into_owned(),
+                HistoryOptions {
+                    revision: None,
+                    branch: Some("refused".to_string()),
+                    length: 0,
+                    depth: 0,
+                },
+            )
+        })
+        .await;
+        assert!(differing.is_empty(), "{differing:#?}");
+    }
+
+    /// `lore branch reset` fails with the remote's refusal of the branch lookup, and with
+    /// `BranchNotFound` where the remote cannot be reached.
+    #[tokio::test]
+    async fn branch_reset_fails_with_a_refused_branch_lookup() {
+        let differing = codes_that_differ(branch_not_found(), |repository, _| async move {
+            lore_revision::branch::reset::reset(
+                repository,
+                &in_memory::token(),
+                "refused".to_string(),
+                String::new(),
+            )
+            .await
+        })
+        .await;
+        assert!(differing.is_empty(), "{differing:#?}");
+    }
+
+    /// `lore file reset` to the last merge of a branch fails with the remote's refusal of the
+    /// branch lookup, and with `BranchNotFound` where the remote cannot be reached.
+    #[tokio::test]
+    async fn file_reset_to_last_merged_fails_with_a_refused_branch_lookup() {
+        let differing = codes_that_differ(branch_not_found(), |repository, _| {
+            lore_revision::file::reset::reset_to_last_merged(
+                repository,
+                LoreArray::default(),
+                LoreString::from("refused"),
+                ResetMergeSide::default(),
+                ResetOptions::default(),
+            )
+        })
+        .await;
+        assert!(differing.is_empty(), "{differing:#?}");
+    }
 }

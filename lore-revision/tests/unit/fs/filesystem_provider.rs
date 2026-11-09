@@ -54,9 +54,11 @@ pub struct TestFilesystemProvider {
     pub failing_scans: Arc<Mutex<Vec<String>>>,
     /// Paths whose scan finds the named node stale.
     pub stale_on_scan: Arc<Mutex<Vec<(String, NodeID)>>>,
+    begin_fails: bool,
     finalize_fails: bool,
     committed_fails: bool,
     write_fails: bool,
+    file_info_fails: bool,
     content_source_fails: bool,
     content_source_missing: bool,
     holds_paths: bool,
@@ -67,6 +69,14 @@ pub struct TestFilesystemProvider {
 impl TestFilesystemProvider {
     pub fn new() -> TestFilesystemProvider {
         Self::default()
+    }
+
+    /// A provider that fails to begin an operation, as one whose filesystem will not freeze.
+    pub fn failing_begin() -> TestFilesystemProvider {
+        Self {
+            begin_fails: true,
+            ..Self::new()
+        }
     }
 
     /// A provider whose operations record the finalize and then report it failed.
@@ -81,6 +91,14 @@ impl TestFilesystemProvider {
     pub fn failing_content_sources() -> TestFilesystemProvider {
         Self {
             content_source_fails: true,
+            ..Self::new()
+        }
+    }
+
+    /// A provider whose operations cannot describe any path.
+    pub fn failing_file_info() -> TestFilesystemProvider {
+        Self {
+            file_info_fails: true,
             ..Self::new()
         }
     }
@@ -110,10 +128,11 @@ impl TestFilesystemProvider {
         }
     }
 
-    /// A provider that holds its state in a `State`.
+    /// A provider that holds its state in a `State`, whose operations fail every write.
     pub fn holding_state() -> TestFilesystemProvider {
         Self {
             holds_state: true,
+            write_fails: true,
             ..Self::new()
         }
     }
@@ -195,6 +214,9 @@ pub fn test_repository_over(
 impl FilesystemProvider for TestFilesystemProvider {
     async fn begin_operation(&self) -> Result<Arc<InstanceOperationImpl>, FsError> {
         self.begin_count.fetch_add(1, Ordering::AcqRel);
+        if self.begin_fails {
+            return Err(FsError::internal("the test provider fails to begin"));
+        }
         Ok(Arc::new(InstanceOperationImpl::new(
             StaticDispatchInstanceOperation::Test(TestOperation {
                 file_info_count: self.file_info_count.clone(),
@@ -203,6 +225,7 @@ impl FilesystemProvider for TestFilesystemProvider {
                 finalize_events: self.finalize_events.clone(),
                 finalize_fails: self.finalize_fails,
                 write_fails: self.write_fails,
+                file_info_fails: self.file_info_fails,
                 content_source_fails: self.content_source_fails,
                 content_source_missing: self.content_source_missing,
                 holds_paths: self.holds_paths,
@@ -598,13 +621,17 @@ fn a_directory_info_is_an_existing_directory_with_no_content() {
 }
 
 /// The mode read straight off the metadata, which is the path [`FileInfo::mode`] has to
-/// reproduce for a node staged either way to land the same one.
+/// reproduce for a node staged either way to land the same one: the user's executable bit on
+/// Unix, and none on a platform without one.
 fn metadata_to_mode(metadata: &std::fs::Metadata, previous: u16) -> u16 {
-    lore_revision::util::fs::mode_from_observed(
-        metadata.is_file(),
-        lore_revision::util::fs::file_executable_observed(metadata),
-        previous,
-    )
+    #[cfg(target_family = "unix")]
+    let executable = {
+        use std::os::unix::fs::PermissionsExt;
+        Some(metadata.permissions().mode() & 0o100 != 0)
+    };
+    #[cfg(not(target_family = "unix"))]
+    let executable = None;
+    lore_revision::util::fs::mode_from_observed(metadata.is_file(), executable, previous)
 }
 
 /// A node staged from a `FileInfo` has to land the size, time and mode a node
@@ -620,7 +647,7 @@ fn file_information_answers_what_the_metadata_helpers_answer() {
     let check = |path: &Path| {
         let metadata = std::fs::metadata(path).expect("metadata");
         let info = FileInfo::from_metadata(&metadata);
-        assert_eq!(lore_revision::util::fs::file_size(&metadata), info.size());
+        assert_eq!(metadata.len(), info.size());
         assert_eq!(lore_revision::util::fs::file_mtime(&metadata), info.mtime());
         assert_eq!(metadata.is_dir(), info.is_dir());
         assert_eq!(metadata.is_file(), info.is_file());
@@ -660,6 +687,60 @@ fn file_information_answers_what_the_metadata_helpers_answer() {
             "an executable file reports the bit whatever the node held"
         );
     }
+}
+
+/// A stat reads the same way on every platform: anything but a file or a directory holds
+/// nothing the repository tracks, the user's executable bit alone is the file's, no mode
+/// leaves the bit unobserved, and a time before the Unix epoch reads as zero.
+#[test]
+fn file_information_reads_every_kind_of_stat() {
+    use std::time::Duration;
+    use std::time::SystemTime;
+
+    use lore_io::Stat;
+    use lore_io::StatKind;
+
+    let at = SystemTime::UNIX_EPOCH + Duration::from_millis(1_500);
+    let stat = |kind, mode, modified| Stat {
+        kind,
+        len: 7,
+        modified,
+        mode,
+    };
+    let file = |executable, mtime| FileInfo::File {
+        executable,
+        size: 7,
+        mtime,
+    };
+
+    assert_eq!(
+        FileInfo::NotExist,
+        FileInfo::from_stat(&stat(StatKind::Other, Some(0o100_644), Some(at)))
+    );
+    assert_eq!(
+        FileInfo::Directory,
+        FileInfo::from_stat(&stat(StatKind::Directory, Some(0o040_755), Some(at)))
+    );
+    assert_eq!(
+        file(Some(true), 1_500),
+        FileInfo::from_stat(&stat(StatKind::File, Some(0o100_744), Some(at)))
+    );
+    assert_eq!(
+        file(Some(false), 1_500),
+        FileInfo::from_stat(&stat(StatKind::File, Some(0o100_655), Some(at)))
+    );
+    assert_eq!(
+        file(None, 1_500),
+        FileInfo::from_stat(&stat(StatKind::File, None, Some(at)))
+    );
+    assert_eq!(
+        file(None, 0),
+        FileInfo::from_stat(&stat(
+            StatKind::File,
+            None,
+            Some(SystemTime::UNIX_EPOCH - Duration::from_secs(1))
+        ))
+    );
 }
 
 /// The forwarder routes a lookup to the operation rather than refusing one, which

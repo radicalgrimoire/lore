@@ -393,7 +393,7 @@ graph that produce new revisions whose parents and contents follow from the oper
 
 A revision's tree of files and directories is itself a Merkle tree. Each file node's hash derives
 from the file's content (directly, or via a fragment list when the file is large enough to be
-split). Each directory node's hash derives from the sorted hash list of its children. The root hash
+split). Each directory node's hash derives from its children's names and hashes. The root hash
 uniquely identifies the entire repository state - every byte of every file in the revision is
 reachable and verifiable from a single 32-byte root hash.
 
@@ -1080,6 +1080,9 @@ lower-case name hash on the node lets common lookups (case-insensitive name matc
 without dereferencing the table at all. Keeping names out of the node lets node records stay
 small and uniform regardless of file-name length.
 
+A directory's hash covers each child's name exactly as stored, so a rename that changes only case
+changes it, while lookups match children by the name hash alone.
+
 Fixed-size everywhere is the design driver. A node block can be mmapped from disk straight into
 memory and used without parsing or copying; node-to-node navigation is a 32-bit index lookup;
 serialized size is identical to in-memory size. Zero-copy deserialization is the goal, and
@@ -1289,14 +1292,20 @@ obvious "I only work on this directory" case.
 #### 12.3 Ignore files: outbound filtering
 
 An *ignore file* (`.loreignore`) is an outbound filter declaring which paths the user does not
-want included in commits. Paths matching ignore rules are not staged, not committed, and not
-reported in status. Build artifacts, editor temporary files, machine-local configuration: all
-typical inhabitants.
+want included in commits. Paths matching ignore rules that the tree does not already track are
+not staged, not committed, and not reported in status. A forced stage or a merge can still stage
+such a path; status lists it and the commit takes it. Build artifacts, editor temporary files,
+machine-local configuration: all typical inhabitants.
 
 Ignore is purely about *new* content. A file that is already part of the committed revision
 will keep flowing through inbound operations even if a later ignore rule would exclude it; the
 ignore rule does not retroactively eject committed files. Removing such a file from the
 revision is a separate explicit act.
+
+An instance can add rules of its own in `ignore`, in its Lore directory (`.lore/ignore` for a
+regular instance). They use the syntax of `.loreignore`, apply after its rules and wherever it
+applies, and are never committed, so they suit what only one working tree produces. They can only
+exclude: Lore skips a `!` re-inclusion there with a warning.
 
 #### 12.4 FilterMode: which filter applies when
 
@@ -1311,10 +1320,15 @@ The rule is simple: operations on *committed state* consult the view only; opera
   branches, computing a diff between revisions, restoring a file from a revision - filter
   through the view. They do not consult the ignore file: a file that was committed before an
   ignore rule was added must still flow through, otherwise the system would refuse to update
-  perfectly legitimate committed paths.
+  perfectly legitimate committed paths. Resetting to a revision is one of them, so the ignore
+  file has no say in what a reset restores or removes.
 - Operations on the working directory or staging area - staging, status, locking - filter
   through both. The view limits what the operation sees on disk; the ignore file then further
-  excludes things the user has declared shouldn't be staged.
+  excludes things the user has declared shouldn't be staged. The ignore file is asked only about
+  paths the tree does not hold yet: a path already staged or committed, for example one staged
+  past the ignore file with `--force`, keeps flowing through staging and status like any other,
+  its deletion included. A working-tree entry of another kind at its path is new content
+  ([ADR-00027](../developing/decisions/00027-ignore-filter-applies-to-untracked-paths-only.md)).
 
 This split is what keeps `.loreignore` from breaking earlier history: a newly-added ignore
 rule does not retroactively excise committed files, because committed-state operations consult

@@ -2394,7 +2394,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "lore"
-version = "0.12.1-nightly"
+version = "0.13.1-nightly"
 dependencies = [
  "async-trait",
  "bitcode",
@@ -2415,6 +2415,7 @@ dependencies = [
  "lore-storage",
  "lore-transport",
  "parking_lot",
+ "pin-project",
  "rand 0.9.5",
  "serde",
  "serde_json",
@@ -2429,7 +2430,7 @@ dependencies = [
 
 [[package]]
 name = "lore-aws"
-version = "0.12.1-nightly"
+version = "0.13.1-nightly"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2443,6 +2444,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "hex",
+ "lore-aws",
  "lore-base",
  "lore-error-set",
  "lore-macro",
@@ -2471,7 +2473,7 @@ dependencies = [
 
 [[package]]
 name = "lore-base"
-version = "0.12.1-nightly"
+version = "0.13.1-nightly"
 dependencies = [
  "backtrace",
  "bitcode",
@@ -2502,7 +2504,7 @@ dependencies = [
 
 [[package]]
 name = "lore-capi"
-version = "0.12.1-nightly"
+version = "0.13.1-nightly"
 dependencies = [
  "blake3",
  "cbindgen",
@@ -2514,7 +2516,7 @@ dependencies = [
 
 [[package]]
 name = "lore-chaos-client"
-version = "0.12.1-nightly"
+version = "0.13.1-nightly"
 dependencies = [
  "anyhow",
  "clap",
@@ -2532,7 +2534,7 @@ dependencies = [
 
 [[package]]
 name = "lore-client"
-version = "0.12.1-nightly"
+version = "0.13.1-nightly"
 dependencies = [
  "anstream",
  "anstyle",
@@ -2556,7 +2558,7 @@ dependencies = [
 
 [[package]]
 name = "lore-credential"
-version = "0.12.1-nightly"
+version = "0.13.1-nightly"
 dependencies = [
  "apple-native-keyring-store",
  "base64 0.22.1",
@@ -2598,8 +2600,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "lore-fuse"
+version = "0.13.1-nightly"
+dependencies = [
+ "dashmap",
+ "libc",
+ "lore-base",
+ "lore-fuse",
+ "lore-macro",
+ "parking_lot",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "zerocopy",
+]
+
+[[package]]
 name = "lore-hashicorp"
-version = "0.12.1-nightly"
+version = "0.13.1-nightly"
 dependencies = [
  "async-trait",
  "lore-base",
@@ -2628,9 +2646,11 @@ dependencies = [
  "axum",
  "bytes",
  "ctor",
+ "libc",
  "lore",
  "lore-aws",
  "lore-base",
+ "lore-fuse",
  "lore-hashicorp",
  "lore-proto",
  "lore-revision",
@@ -2657,7 +2677,7 @@ dependencies = [
 
 [[package]]
 name = "lore-io"
-version = "0.12.1-nightly"
+version = "0.13.1-nightly"
 dependencies = [
  "bytes",
  "futures",
@@ -2673,7 +2693,7 @@ dependencies = [
 
 [[package]]
 name = "lore-macro"
-version = "0.12.1-nightly"
+version = "0.13.1-nightly"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2682,11 +2702,13 @@ dependencies = [
 
 [[package]]
 name = "lore-notification"
-version = "0.12.1-nightly"
+version = "0.13.1-nightly"
 dependencies = [
  "async-trait",
  "lore-base",
  "lore-error-set",
+ "lore-macro",
+ "lore-notification",
  "lore-proto",
  "lore-revision",
  "lore-storage",
@@ -2698,7 +2720,7 @@ dependencies = [
 
 [[package]]
 name = "lore-proto"
-version = "0.1.65"
+version = "0.1.67"
 dependencies = [
  "lore-base",
  "prost",
@@ -2710,7 +2732,7 @@ dependencies = [
 
 [[package]]
 name = "lore-revision"
-version = "0.12.1-nightly"
+version = "0.13.1-nightly"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2720,7 +2742,9 @@ dependencies = [
  "blake3",
  "bytes",
  "chrono",
+ "crossbeam-epoch",
  "crossbeam-queue",
+ "crossbeam-utils",
  "ctor",
  "dashmap",
  "diffy",
@@ -2737,6 +2761,7 @@ dependencies = [
  "lore-base",
  "lore-credential",
  "lore-error-set",
+ "lore-fuse",
  "lore-io",
  "lore-macro",
  "lore-proto",
@@ -2747,6 +2772,7 @@ dependencies = [
  "open",
  "opentelemetry",
  "parking_lot",
+ "pin-project",
  "prost-types",
  "quinn",
  "rand 0.9.5",
@@ -2774,7 +2800,7 @@ dependencies = [
 
 [[package]]
 name = "lore-server"
-version = "0.12.1-nightly"
+version = "0.13.1-nightly"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -2799,6 +2825,7 @@ dependencies = [
  "jsonwebtoken",
  "lore-aws",
  "lore-base",
+ "lore-credential",
  "lore-error-set",
  "lore-hashicorp",
  "lore-macro",
@@ -2819,6 +2846,7 @@ dependencies = [
  "pin-project",
  "prost-types",
  "quinn",
+ "quinn-proto",
  "rand 0.9.5",
  "rcgen",
  "reqwest",
@@ -2855,7 +2883,7 @@ dependencies = [
 
 [[package]]
 name = "lore-storage"
-version = "0.12.1-nightly"
+version = "0.13.1-nightly"
 dependencies = [
  "async-trait",
  "bitcode",
@@ -2895,7 +2923,7 @@ dependencies = [
 
 [[package]]
 name = "lore-telemetry"
-version = "0.12.1-nightly"
+version = "0.13.1-nightly"
 dependencies = [
  "axum",
  "bytes",
@@ -2919,7 +2947,7 @@ dependencies = [
 
 [[package]]
 name = "lore-transport"
-version = "0.12.1-nightly"
+version = "0.13.1-nightly"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -3615,9 +3643,9 @@ dependencies = [
 
 [[package]]
 name = "pulldown-cmark"
-version = "0.13.5"
+version = "0.13.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "278e9268c93b9e498a2da46c34d90ba93a3255eb99009646398f34bc73ab36eb"
+checksum = "3db2be46835f013dd3f4fa7f5f7402c537787b54ebb6fe2b94bbdd7e2669bb7b"
 dependencies = [
  "bitflags 2.13.2",
  "memchr",
