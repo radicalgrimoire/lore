@@ -31,6 +31,7 @@ use tokio::join;
 use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
+use tokio::try_join;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use zerocopy::Immutable;
 
@@ -44,6 +45,7 @@ use crate::event;
 use crate::event::EventError;
 use crate::find;
 use crate::hash;
+use crate::history;
 use crate::immutable;
 use crate::immutable::ReadFromImmutable;
 use crate::immutable::WriteToImmutable;
@@ -701,10 +703,16 @@ pub async fn load_name_to_id(
         return Ok(id.to_context());
     }
 
-    if let Ok(remote) = repository.remote().await
-        && let Ok(revision_service) = remote.revision(repository.id).await
-        && let Ok(response) = revision_service.branch_query(None, Some(name)).await
-        && !response.id.is_zero()
+    if let Some(remote) = absent_unless_refused::<_, _, BranchError>(
+        repository.remote().await,
+        "connecting to the remote",
+    )? && let Some(revision_service) = absent_unless_refused::<_, _, BranchError>(
+        remote.revision(repository.id).await,
+        "connecting to the remote revision service",
+    )? && let Some(response) = absent_unless_refused::<_, _, BranchError>(
+        revision_service.branch_query(None, Some(name)).await,
+        "querying the remote for the branch name",
+    )? && !response.id.is_zero()
     {
         let branch = response.id;
         let _ = store_name_to_id(repository.clone(), branch, name).await;
@@ -786,10 +794,10 @@ pub async fn load_latest(
         Ok(head) => Ok(head),
         Err(err) if err.is_branch_not_found() => {
             // In case no revision is yet pushed return a zero hash
-            if let Ok(_metadata) = metadata_hash(repository, branch).await {
-                Ok(Hash::default())
-            } else {
-                Err(err)
+            match metadata_hash(repository, branch).await {
+                Ok(_metadata) => Ok(Hash::default()),
+                Err(refused) if is_refusal(&refused) => Err(refused),
+                Err(_) => Err(err),
             }
         }
         Err(err) => Err(err),
@@ -839,25 +847,27 @@ pub async fn load_last_sync(
     }
 }
 
+/// The latest revision of `branch` on the remote. A failed branch query, other than a refusal, is
+/// reported as [`BranchNotFound`].
 pub async fn load_remote_latest(
     remote: Arc<Connection>,
     repository: RepositoryId,
     branch: BranchId,
 ) -> Result<Hash, BranchError> {
-    if let Ok(response) = remote
+    remote
         .revision(repository)
         .await
         .forward::<BranchError>("Failed to connect to remote revision service")?
         .branch_query(Some(branch), None)
         .await
-    {
-        Ok(response.latest)
-    } else {
-        // Silent error return, let caller determine if error
-        Err(BranchError::from(BranchNotFound {
-            branch: branch.to_string(),
-        }))
-    }
+        .map(|response| response.latest)
+        .map_err(|err| {
+            forward_refusal_or(err, "querying the remote branch", |_err| {
+                BranchError::from(BranchNotFound {
+                    branch: branch.to_string(),
+                })
+            })
+        })
 }
 
 #[derive(PartialEq)]
@@ -990,9 +1000,13 @@ pub async fn metadata_hash(
         return Ok(metadata);
     }
 
-    if let Ok(remote) = repository.remote().await
-        && let Ok(status) = load_remote(remote, repository.id, branch).await
-        && !status.metadata.is_zero()
+    if let Some(remote) = absent_unless_refused::<_, _, BranchError>(
+        repository.remote().await,
+        "connecting to the remote",
+    )? && let Some(status) = absent_unless_refused::<_, _, BranchError>(
+        load_remote(remote, repository.id, branch).await,
+        "loading the remote branch",
+    )? && !status.metadata.is_zero()
     {
         return Ok(status.metadata);
     }
@@ -1112,15 +1126,10 @@ async fn resolve_remote(
     repository: Arc<RepositoryContext>,
     branch: &str,
 ) -> Result<BranchStatus, BranchError> {
-    let branch_input = branch;
-    let remote = repository.remote().await.map_err(|err| {
-        BranchError::BranchNotFound(
-            BranchNotFound {
-                branch: branch_input.to_string(),
-            }
-            .chain_err_from(err, "remote unavailable for branch lookup"),
-        )
-    })?;
+    let remote = repository
+        .remote()
+        .await
+        .map_err(|err| remote_lookup_failure(err, branch))?;
     let service = remote
         .revision(repository.id)
         .await
@@ -1130,6 +1139,31 @@ async fn resolve_remote(
     } else {
         service.branch_query(None, Some(branch)).await
     };
+    queried_status(response, branch)
+}
+
+/// `err`, the failed connect of a lookup of `branch` on the remote, as the lookup's failure. A
+/// refusal of the credentials passes on; any other failure is `BranchNotFound`, as the branch is
+/// unknown without the remote.
+fn remote_lookup_failure(err: ProtocolError, branch: &str) -> BranchError {
+    if is_refusal(&err) {
+        return err.forward("connecting to remote for branch lookup");
+    }
+    BranchError::BranchNotFound(
+        BranchNotFound {
+            branch: branch.to_string(),
+        }
+        .chain_err_from(err, "remote unavailable for branch lookup"),
+    )
+}
+
+/// The status of `branch` from the remote's `response` to a query for it. A branch the remote does
+/// not hold is `BranchNotFound`, a refusal of the credentials passes on, and any other failure is
+/// internal.
+fn queried_status(
+    response: Result<lore_transport::BranchQueryResponse, ProtocolError>,
+    branch: &str,
+) -> Result<BranchStatus, BranchError> {
     match response {
         Ok(response) => Ok(BranchStatus {
             id: response.id,
@@ -1139,8 +1173,9 @@ async fn resolve_remote(
             deleted: response.deleted,
         }),
         Err(ProtocolError::NotFound(_)) => Err(BranchError::from(BranchNotFound {
-            branch: branch_input.to_string(),
+            branch: branch.to_string(),
         })),
+        Err(err) if is_refusal(&err) => Err(err.forward("querying branch on remote")),
         Err(err) => Err(BranchError::internal_with_context(
             err,
             "Failed to get information from remote",
@@ -1160,51 +1195,31 @@ async fn resolve_default(
     repository: Arc<RepositoryContext>,
     branch: &str,
 ) -> Result<BranchStatus, BranchError> {
-    let branch_input = branch;
     let id = if let Ok(id) = Context::from_str(branch) {
         id
-    } else if let Ok(branch) = branch::load_name_to_id(repository.clone(), branch).await {
-        branch
+    } else if let Some(id) = absent_unless_refused::<_, _, BranchError>(
+        branch::load_name_to_id(repository.clone(), branch).await,
+        "looking up the branch name",
+    )? {
+        id
     } else {
-        let remote = repository.remote().await.map_err(|err| {
-            BranchError::BranchNotFound(
-                BranchNotFound {
-                    branch: branch_input.to_string(),
-                }
-                .chain_err_from(err, "remote unavailable for branch lookup"),
-            )
-        })?;
-        match remote
+        let remote = repository
+            .remote()
+            .await
+            .map_err(|err| remote_lookup_failure(err, branch))?;
+        let response = remote
             .revision(repository.id)
             .await
             .forward::<BranchError>("Failed to connect to remote revision service")?
             .branch_query(None, Some(branch))
-            .await
-        {
-            Ok(response) => {
-                return Ok(BranchStatus {
-                    id: response.id,
-                    latest: response.latest,
-                    metadata: response.metadata,
-                    local: false,
-                    deleted: response.deleted,
-                });
-            }
-            Err(ProtocolError::NotFound(_)) => {
-                return Err(BranchError::from(BranchNotFound {
-                    branch: branch_input.to_string(),
-                }));
-            }
-            Err(err) => {
-                return Err(BranchError::internal_with_context(
-                    err,
-                    "Failed to get information from remote",
-                ));
-            }
-        }
+            .await;
+        return queried_status(response, branch);
     };
 
-    if let Ok(metadata) = metadata_hash(repository.clone(), id).await {
+    if let Some(metadata) = absent_unless_refused::<_, _, BranchError>(
+        metadata_hash(repository.clone(), id).await,
+        "loading the branch metadata hash",
+    )? {
         let latest = load_latest(repository.clone(), id)
             .await
             .unwrap_or_default();
@@ -1218,9 +1233,13 @@ async fn resolve_default(
         });
     }
 
-    if let Ok(remote) = repository.remote().await
-        && let Ok(status) = load_remote(remote, repository.id, id).await
-    {
+    if let Some(remote) = absent_unless_refused::<_, _, BranchError>(
+        repository.remote().await,
+        "connecting to the remote",
+    )? && let Some(status) = absent_unless_refused::<_, _, BranchError>(
+        load_remote(remote, repository.id, id).await,
+        "loading the remote branch",
+    )? {
         return Ok(status);
     }
 
@@ -1239,19 +1258,26 @@ pub async fn load_metadata(
         .forward::<BranchError>("Failed to deserialize branch metadata")
 }
 
+/// The metadata of `branch`, read locally, or on the remote where the instance holds none it can
+/// read. Keeping the remote's metadata hash locally is best effort, so a context that cannot write
+/// still reads the remote's metadata. The remote's refusal of the caller is returned.
 pub async fn metadata(
     repository: Arc<RepositoryContext>,
     branch: BranchId,
 ) -> Result<Metadata, BranchError> {
     let local_metadata = metadata_local(repository.clone(), branch).await;
-    if local_metadata.is_ok() {
+    if local_metadata.as_ref().map_or_else(is_refusal, |_| true) {
         return local_metadata;
     }
 
-    if let Ok(remote) = repository.remote().await
-        && let Ok(status) = load_remote(remote, repository.id, branch).await
-    {
-        mutable_store(repository.clone(), METADATA, branch, status.metadata).await?;
+    if let Some(remote) = absent_unless_refused::<_, _, BranchError>(
+        repository.remote().await,
+        "connecting to the remote",
+    )? && let Some(status) = absent_unless_refused::<_, _, BranchError>(
+        load_remote(remote, repository.id, branch).await,
+        "loading the remote branch",
+    )? {
+        let _ = mutable_store(repository.clone(), METADATA, branch, status.metadata).await;
         return load_metadata(repository, status.metadata).await;
     }
 
@@ -1264,15 +1290,6 @@ pub async fn metadata_local(
 ) -> Result<Metadata, BranchError> {
     let hash = metadata_hash(repository.clone(), branch).await?;
     load_metadata(repository, hash).await
-}
-
-pub async fn metadata_remote(
-    remote: Arc<Connection>,
-    repository: Arc<RepositoryContext>,
-    branch: BranchId,
-) -> Result<Metadata, BranchError> {
-    let status = load_remote(remote, repository.id, branch).await?;
-    load_metadata(repository, status.metadata).await
 }
 
 pub fn metadata_populate(
@@ -1508,8 +1525,12 @@ pub fn is_valid_name(name: &str) -> bool {
     true
 }
 
+/// [`create_at`], returning the branch it made.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments beside the future of
+/// [`create_at`]. An `async` block awaiting that future would hold it twice.
 #[allow(clippy::too_many_arguments)]
-pub async fn create(
+pub fn create(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     branch: BranchId,
@@ -1520,7 +1541,47 @@ pub async fn create(
     stack: Vec<BranchPoint>,
     dry_run: bool,
     create_linked: bool,
-) -> Result<Context, BranchError> {
+) -> impl Future<Output = Result<Context, BranchError>> {
+    futures::FutureExt::map(
+        create_at(
+            repository,
+            token,
+            branch,
+            name,
+            category,
+            creator,
+            created,
+            stack,
+            dry_run,
+            create_linked,
+        ),
+        |created| created.map(|created| created.branch),
+    )
+}
+
+/// A branch [`create_at`] made, and where it left the instance.
+pub struct CreatedBranch {
+    pub branch: BranchId,
+    /// The latest revision stored for the branch. Zero where an existing branch was restored.
+    pub head: Hash,
+    /// The staged state based on `head`, where linked branches repinned or rebased it.
+    pub staged: Option<Hash>,
+}
+
+/// [`create`], reporting the head it stored and the staged state rebased onto it.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_at(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    branch: BranchId,
+    name: &str,
+    category: &str,
+    creator: &str,
+    created: u64,
+    stack: Vec<BranchPoint>,
+    dry_run: bool,
+    create_linked: bool,
+) -> Result<CreatedBranch, BranchError> {
     // Check if name is valid
     if !is_valid_name(name) {
         return Err(BranchError::internal("Invalid name"));
@@ -1605,7 +1666,11 @@ pub async fn create(
             metadata_store(repository.clone(), branch, existing_metadata).await?;
         }
         store_name_to_id(repository.clone(), branch, name).await?;
-        return Ok(branch);
+        return Ok(CreatedBranch {
+            branch,
+            head: Hash::default(),
+            staged: None,
+        });
     }
 
     let mut head = stack
@@ -1696,6 +1761,7 @@ pub async fn create(
     lore_drain_tasks!(tasks, BranchError::internal("Task failed"))?;
 
     let mut is_commit = false;
+    let mut staged = None;
 
     if !dry_run {
         lore_debug!("Creating branch {name} {branch} with stack {stack:?} at signature {head}");
@@ -1706,11 +1772,11 @@ pub async fn create(
                     .await
                     .forward::<BranchError>("Failed to deserialize current revision anchor")
             {
-                let state = state_staged.unwrap_or(state_current);
-                let serialized_latest = create_linked_branches(
+                let (serialized_latest, rebased_staged) = create_linked_branches(
                     repository.clone(),
                     token,
-                    state.clone(),
+                    state_current,
+                    state_staged,
                     branch,
                     current_branch,
                     head,
@@ -1721,6 +1787,7 @@ pub async fn create(
 
                 is_commit = serialized_latest != head;
                 head = serialized_latest;
+                staged = rebased_staged;
             }
 
             lore_debug!("Created linked branches, new latest {head}");
@@ -1763,33 +1830,85 @@ pub async fn create(
         .send();
     }
 
-    Ok(branch)
+    Ok(CreatedBranch {
+        branch,
+        head,
+        staged,
+    })
 }
 
+/// A link row the cascade repins, held by the staged state or the current one.
+#[derive(Clone, Copy)]
+struct CascadeMount {
+    link: state::LinkReference,
+    staged: bool,
+}
+
+/// The auto-following links `state_staged` and `state` hold, grouped by linked repository.
+///
+/// The staged state's rows come first, so a group's first row is the pin the next commit takes.
+/// A row of `state` that the staged state removes or remounts stays in its group, so the link is
+/// on the new branch once the change is unstaged.
+///
+/// Grouping keeps the cascade from racing itself: concurrent creates with the same branch ID
+/// resolve to one winner, and the loser is rejected with "branch has been advanced by another
+/// instance", failing the whole create.
+async fn cascade_mounts(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    state_staged: Option<&Arc<State>>,
+) -> Result<Vec<(RepositoryId, Vec<CascadeMount>)>, BranchError> {
+    let staged_links = match state_staged {
+        Some(state_staged) => state_staged
+            .link_list(repository.clone())
+            .await
+            .forward::<BranchError>("listing staged links")?,
+        None => Vec::new(),
+    };
+    let current_links = state
+        .link_list(repository.clone())
+        .await
+        .forward::<BranchError>("listing links")?;
+
+    let mounts = staged_links
+        .into_iter()
+        .map(|link| CascadeMount { link, staged: true })
+        .chain(current_links.into_iter().map(|link| CascadeMount {
+            link,
+            staged: false,
+        }))
+        .filter(|mount| mount.link.flags & link::LinkFlags::DisableAutoFollow == 0);
+    Ok(link::group_by_repository(mounts, |mount| {
+        mount.link.repository
+    }))
+}
+
+/// Creates `branch` in the linked repositories, and moves each link that names an explicit
+/// branch onto it.
+///
+/// The links of `state_staged` and `state` both drive the cascade, the staged ones first, so a
+/// linked branch starts at the pin the next commit takes. A row naming an explicit branch is
+/// repinned in the state holding it, at its own pin, with the zero branch to follow the new one.
+///
+/// Repinning `state` writes a revision on top of `current_latest`, which is returned as the
+/// branch's latest, and `state_staged` is rebased onto it.
 #[allow(clippy::too_many_arguments)]
 async fn create_linked_branches(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     state: Arc<State>,
+    state_staged: Option<Arc<State>>,
     branch: BranchId,
     current_branch: BranchId,
     current_latest: Hash,
     name: String,
     category: String,
-) -> Result<Hash, BranchError> {
-    let link_list = state
-        .link_list(repository.clone())
-        .await
-        .forward::<BranchError>("Failed to list links")?;
+) -> Result<(Hash, Option<Hash>), BranchError> {
+    let link_groups = cascade_mounts(&repository, &state, state_staged.as_ref()).await?;
 
-    if link_list.is_empty() {
-        return Ok(current_latest);
+    if link_groups.is_empty() {
+        return Ok((current_latest, None));
     }
-
-    // Grouping keeps the cascade from racing itself: concurrent creates with the
-    // same branch ID resolve to one winner, and the loser is rejected with
-    // "branch has been advanced by another instance", failing the whole create.
-    let link_groups = link::auto_following_mounts(&link_list);
 
     let mut link_tasks = JoinSet::new();
 
@@ -1802,6 +1921,7 @@ async fn create_linked_branches(
 
             let repository = repository.clone();
             let state = state.clone();
+            let state_staged = state_staged.clone();
             let branch_id = branch;
             let branch_name = name.clone();
             let branch_category = category.clone();
@@ -1810,7 +1930,7 @@ async fn create_linked_branches(
                 // The first mount seeds the branch point; the others adopt what
                 // it resolved to, since they all address the same branch.
                 let leader = mounts[0];
-                let resolved_parent_branch = leader.resolve_branch(current_branch);
+                let resolved_parent_branch = leader.link.resolve_branch(current_branch);
 
                 let outcome = link::create_branch(
                     link.clone(),
@@ -1819,49 +1939,53 @@ async fn create_linked_branches(
                     branch_name,
                     branch_category,
                     resolved_parent_branch,
-                    leader.signature,
+                    leader.link.signature,
                 )
                 .await
                 .forward_with::<BranchError, _>(|| {
                     format!("Failed to create branch for link repository {link_id}")
                 })?;
 
-                // The create is shared, the reporting is not: every mount that
-                // follows this repository reports its own outcome, keyed on its
-                // path, because the repository ID cannot tell the mounts apart.
                 for mount in mounts.iter() {
-                    let link_path = state
-                        .node_path(repository.clone(), mount.local_node)
-                        .await
-                        .unwrap_or_default();
+                    let mount_state = match &state_staged {
+                        Some(state_staged) if mount.staged => state_staged,
+                        _ => &state,
+                    };
 
-                    link::report_branch_outcome(
-                        &link_path,
-                        link_id,
-                        branch_id,
-                        outcome.revision,
-                        outcome.reused,
-                    );
+                    // The create is shared, the reporting is not: every mount of the state that
+                    // seeded the branch reports its own outcome, keyed on its path, because the
+                    // repository ID cannot tell the mounts apart.
+                    if mount.staged == leader.staged {
+                        let link_path = mount_state
+                            .node_path(repository.clone(), mount.link.local_node)
+                            .await
+                            .unwrap_or_default();
 
-                    // When the link uses the implicit branch convention (zero),
-                    // skip update_link_pin_by_node — the branch is already
-                    // implicitly correct and the signature is unchanged (the new
-                    // linked branch points to the same revision). This avoids
-                    // dirtying the state and producing a bookkeeping revision.
-                    if !mount.branch.is_zero() {
-                        link::update_link_pin_by_node(
-                            &state,
-                            repository.clone(),
-                            mount.repository,
+                        link::report_branch_outcome(
+                            &link_path,
+                            link_id,
                             branch_id,
-                            mount.signature,
-                            mount.local_node,
+                            outcome.revision,
+                            outcome.reused,
+                        );
+                    }
+
+                    // A row that tracks its parent's branch already resolves to the new one, at
+                    // the same revision, so it is left alone.
+                    if !mount.link.branch.is_zero() {
+                        link::update_link_pin_by_node(
+                            mount_state,
+                            repository.clone(),
+                            mount.link.repository,
+                            BranchId::default(),
+                            mount.link.signature,
+                            mount.link.local_node,
                         )
                         .await
                         .forward_with::<BranchError, _>(|| {
                             format!(
                                 "Failed to update link reference for link repository {}",
-                                mount.repository
+                                mount.link.repository
                             )
                         })?;
                     }
@@ -1874,13 +1998,41 @@ async fn create_linked_branches(
 
     lore_drain_tasks!(link_tasks, BranchError::internal("Task failed"))?;
 
-    // If no link state was mutated (all links use implicit zero-branch
-    // convention), return the current latest unchanged — no bookkeeping
-    // revision needed.
-    if !state.is_dirty() {
-        return Ok(current_latest);
-    }
+    let head = if state.is_dirty() {
+        store_repin_revision(&repository, token, &state, branch, current_latest).await?
+    } else {
+        current_latest
+    };
 
+    let staged = match state_staged {
+        Some(state_staged) if head != current_latest => {
+            state_staged.reparent_replacing(current_latest, head);
+            Some(state_staged)
+        }
+        Some(state_staged) if state_staged.is_dirty() => Some(state_staged),
+        _ => None,
+    };
+    let staged = match staged {
+        Some(state_staged) => Some(
+            state_staged
+                .serialize(repository.clone(), token)
+                .await
+                .forward::<BranchError>("Failed to serialize staged state")?,
+        ),
+        None => None,
+    };
+
+    Ok((head, staged))
+}
+
+/// Writes the repins `state` holds as a revision on top of `current_latest`.
+async fn store_repin_revision(
+    repository: &Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    state: &Arc<State>,
+    branch: BranchId,
+    current_latest: Hash,
+) -> Result<Hash, BranchError> {
     let metadata_hash = state.metadata_hash();
 
     if metadata_hash.is_zero() {
@@ -1928,16 +2080,10 @@ async fn create_linked_branches(
     .await
     .forward::<BranchError>("Failed to weave history")?;
 
-    let signature = state
+    state
         .serialize(repository.clone(), token)
         .await
-        .forward::<BranchError>("Failed to serialize revision state")?;
-
-    crate::instance::store_staged_anchor(&repository, signature)
-        .await
-        .forward::<BranchError>("Failed to serialize anchor")?;
-
-    Ok(signature)
+        .forward::<BranchError>("Failed to serialize revision state")
 }
 
 pub async fn delete(
@@ -2972,6 +3118,27 @@ async fn try_auto_resolve_conflict(
     }
 }
 
+/// The stack of `branch` from its metadata, read locally or on the remote, and empty when it can't
+/// be read. The remote's refusal of the caller is returned rather than read as no stack. `side`
+/// names the branch in the log.
+async fn diff3_stack(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+    side: &str,
+) -> Result<Vec<BranchPoint>, BranchError> {
+    let Some(branch_metadata) = absent_unless_refused::<_, _, BranchError>(
+        metadata(repository.clone(), branch).await,
+        "loading branch metadata",
+    )?
+    else {
+        lore_debug!("No local or remote {side} branch metadata available");
+        return Ok(Vec::new());
+    };
+    let stack = stack(&branch_metadata);
+    lore_debug!("Loaded metadata for {side} branch {branch}, found stack {stack:?}");
+    Ok(stack)
+}
+
 /// Resolve the common-ancestor base revision for a 3-way diff between two
 /// branches' tips. Performs the branch-stack walking, branch-point
 /// matching, and divergence detection that `diff3_collect` would otherwise
@@ -3012,57 +3179,8 @@ pub async fn resolve_diff3_base(
     );
 
     let common_ancestor = if source_branch != target_branch {
-        let source_stack = if let Ok(branch_metadata) =
-            metadata(repository.clone(), source_branch).await
-        {
-            let stack = stack(&branch_metadata);
-            lore_debug!(
-                "Loaded local metadata for source branch {source_branch}, found stack {stack:?}"
-            );
-            stack
-        } else if let Ok(remote) = repository.remote().await {
-            if let Ok(branch_metadata) =
-                metadata_remote(remote, repository.clone(), source_branch).await
-            {
-                let stack = stack(&branch_metadata);
-                lore_debug!(
-                    "Loaded remote metadata for source branch {source_branch}, found stack {stack:?}"
-                );
-                stack
-            } else {
-                lore_debug!("No local or remote source branch metadata available");
-                vec![]
-            }
-        } else {
-            lore_debug!("No local source branch metadata available and have no remote");
-            vec![]
-        };
-
-        let target_stack = if let Ok(branch_metadata) =
-            metadata(repository.clone(), target_branch).await
-        {
-            let stack = stack(&branch_metadata);
-            lore_debug!(
-                "Loaded local metadata for target branch {target_branch}, found stack {stack:?}"
-            );
-            stack
-        } else if let Ok(remote) = repository.remote().await {
-            if let Ok(branch_metadata) =
-                metadata_remote(remote, repository.clone(), target_branch).await
-            {
-                let stack = stack(&branch_metadata);
-                lore_debug!(
-                    "Loaded remote metadata for target branch {target_branch}, found stack {stack:?}"
-                );
-                stack
-            } else {
-                lore_debug!("No local or remote target branch metadata available");
-                vec![]
-            }
-        } else {
-            lore_debug!("No local target branch metadata available and have no remote");
-            vec![]
-        };
+        let source_stack = diff3_stack(&repository, source_branch, "source").await?;
+        let target_stack = diff3_stack(&repository, target_branch, "target").await?;
 
         let Some(common_ancestor) = find_common_ancestor_from_branch_points(
             repository.clone(),
@@ -3087,16 +3205,10 @@ pub async fn resolve_diff3_base(
 
         common_ancestor
     } else {
-        let branch_point = metadata(repository.clone(), source_branch)
-            .await
-            .map(|metadata| {
-                let stack = stack(&metadata);
-                lore_debug!(
-                    "Loaded local metadata for source branch {source_branch}, found stack {stack:?}"
-                );
-                stack.first().map(|parent| parent.revision)
-            })
-            .unwrap_or_default();
+        let branch_point = diff3_stack(&repository, source_branch, "source")
+            .await?
+            .first()
+            .map(|parent| parent.revision);
         let common_ancestor = Box::pin(find_common_revision_in_history_lines(
             repository.clone(),
             source_revision,
@@ -3426,7 +3538,8 @@ enum HistoryLineSearch {
 /// Only this direction can succeed: a revision's number is one past its parents',
 /// so a walk backwards never reaches a higher numbered revision. The walk stops
 /// once the line drops below `older_revision_number`, and after
-/// `MAX_DIVERGENT_HISTORY_LENGTH` revisions.
+/// `MAX_DIVERGENT_HISTORY_LENGTH` revisions. It fails where a batch of the line
+/// fails to load, as [`find::batch_load_history`] describes.
 ///
 /// The two ways of not finding it are worth telling apart.
 /// [`HistoryLineSearch::Diverged`] is a result: the line went past where the
@@ -3449,17 +3562,27 @@ async fn find_revision_in_history_line(
         return Ok(HistoryLineSearch::Reached);
     }
 
-    let mut line = load_history_line(repository.clone(), newer_revision).await;
+    let mut line = load_history_line(repository.clone(), newer_revision).await?;
     let mut scanned = 0;
 
     loop {
-        if line[scanned..].contains(&older_revision) {
+        if line[scanned..]
+            .iter()
+            .any(|&(_, revision)| revision == older_revision)
+        {
             lore_debug!(
                 "Revision {older_revision} -> {older_revision_number} is on the line from {newer_revision}"
             );
             return Ok(HistoryLineSearch::Reached);
         }
         scanned = line.len();
+
+        if history_reached_floor(&line, older_revision_number) {
+            lore_debug!(
+                "Line from {newer_revision} passed revision number {older_revision_number} without reaching {older_revision}"
+            );
+            return Ok(HistoryLineSearch::Diverged);
+        }
 
         if line.len() >= MAX_DIVERGENT_HISTORY_LENGTH {
             lore_warn!(
@@ -3468,16 +3591,9 @@ async fn find_revision_in_history_line(
             return Ok(HistoryLineSearch::Exhausted);
         }
 
-        if load_additional_history(repository.clone(), &mut line, older_revision_number).await {
-            if line[scanned..].contains(&older_revision) {
-                lore_debug!(
-                    "Revision {older_revision} -> {older_revision_number} is on the line from {newer_revision}"
-                );
-                return Ok(HistoryLineSearch::Reached);
-            }
-
+        if load_additional_history(repository.clone(), &mut line).await? {
             lore_debug!(
-                "Line from {newer_revision} passed revision number {older_revision_number} without reaching {older_revision}"
+                "Line from {newer_revision} ran out without reaching {older_revision} -> {older_revision_number}"
             );
             return Ok(HistoryLineSearch::Diverged);
         }
@@ -3490,9 +3606,13 @@ async fn find_revision_in_history_line(
 /// Self parents only, on both sides, so the revision found is where the two lines
 /// converge rather than the newest revision the two can reach through merges.
 ///
-/// Both lines are followed to the root revisions, each capped at
-/// `MAX_DIVERGENT_HISTORY_LENGTH`. `Ok(None)` means the cap was reached first, or
-/// that the lines genuinely share nothing.
+/// The lines meet as [`history::meet`] describes, each loaded a batch at a time
+/// and capped at `MAX_DIVERGENT_HISTORY_LENGTH`. A batch is loaded only for a
+/// line `meet` waits on, with every revision passed, which is the line whose
+/// oldest revision has the higher number, or both at equal numbers. `Ok(None)`
+/// means a line ended, or reached the cap, before the lines met. A line whose
+/// revision numbers do not decrease fails the search, as does a batch that fails
+/// to load, as [`find::batch_load_history`] describes.
 #[lore_macro::test_pub]
 async fn find_common_revision_in_history_lines(
     repository: Arc<RepositoryContext>,
@@ -3503,123 +3623,99 @@ async fn find_common_revision_in_history_lines(
 
     // Both lines are fetched at once. Each is a round trip when the history is not
     // cached, and neither depends on the other.
-    let (mut self_line, mut other_line) = join!(
+    let (mut self_line, mut other_line) = try_join!(
         load_history_line(repository.clone(), self_revision),
         load_history_line(repository.clone(), other_revision)
-    );
-
-    // Each line keeps a lookup of itself, extended as the line is, so a round
-    // tests the revisions it just loaded against everything the other side holds
-    // without rebuilding anything or rewalking a pair.
-    // Spelled out rather than aliased: a type alias naming a `HashSet` with a
-    // hasher is an item cbindgen parses, and it cannot represent a second type
-    // parameter on it.
-    let mut self_lookup: std::collections::HashSet<
-        Hash,
-        std::hash::BuildHasherDefault<RevisionHasher>,
-    > = self_line.iter().copied().collect();
-    let mut other_lookup: std::collections::HashSet<
-        Hash,
-        std::hash::BuildHasherDefault<RevisionHasher>,
-    > = other_line.iter().copied().collect();
+    )?;
 
     let mut self_ended = false;
     let mut other_ended = false;
     let mut self_loaded = 0;
     let mut other_loaded = 0;
+    let mut passed = (0, 0);
 
     loop {
-        // Scanning the line rather than the lookup is what makes this the newest
-        // shared revision: the line is in history order, a set is in neither.
-        if let Some(shared) = self_line[self_loaded..]
-            .iter()
-            .find(|revision| other_lookup.contains(*revision))
-            .copied()
-        {
-            return Ok(Some(shared));
-        }
-        if let Some(shared) = other_line[other_loaded..]
-            .iter()
-            .find(|revision| self_lookup.contains(*revision))
-            .copied()
-        {
-            return Ok(Some(shared));
+        for (line, loaded) in [(&self_line, self_loaded), (&other_line, other_loaded)] {
+            if let Some((number, revision)) =
+                history::out_of_order(|index| line.get(index).copied(), loaded)
+            {
+                return Err(BranchError::internal(format!(
+                    "the history line is out of order at revision {revision}, numbered {number}"
+                )));
+            }
         }
         self_loaded = self_line.len();
         other_loaded = other_line.len();
 
-        if self_ended && other_ended {
-            return Ok(None);
+        if let Some((shared, _)) = history::meet(
+            |index| self_line.get(index).copied(),
+            |index| other_line.get(index).copied(),
+            &mut passed,
+        ) {
+            return Ok(self_line.get(shared).map(|&(_, revision)| revision));
         }
 
-        let extend_self = self_line.len() < MAX_DIVERGENT_HISTORY_LENGTH && !self_ended;
-        let extend_other = other_line.len() < MAX_DIVERGENT_HISTORY_LENGTH && !other_ended;
-        if !extend_self && !extend_other {
+        let self_waits = passed.0 == self_line.len();
+        let other_waits = passed.1 == other_line.len();
+        if (self_waits && self_ended) || (other_waits && other_ended) {
+            return Ok(None);
+        }
+        if (self_waits && self_line.len() >= MAX_DIVERGENT_HISTORY_LENGTH)
+            || (other_waits && other_line.len() >= MAX_DIVERGENT_HISTORY_LENGTH)
+        {
             lore_warn!(
                 "Reached maximum history depth of {MAX_DIVERGENT_HISTORY_LENGTH} following {self_revision} and {other_revision} back to a shared revision"
             );
             return Ok(None);
         }
 
-        // Two round trips that need not wait on each other.
-        join!(
+        // Two round trips that need not wait on each other, where both lines wait.
+        try_join!(
             async {
-                if extend_self {
+                if self_waits {
                     self_ended =
-                        load_additional_history(repository.clone(), &mut self_line, 0).await;
-                    self_lookup.extend(self_line[self_loaded..].iter().copied());
+                        load_additional_history(repository.clone(), &mut self_line).await?;
                 }
+                Ok::<_, BranchError>(())
             },
             async {
-                if extend_other {
+                if other_waits {
                     other_ended =
-                        load_additional_history(repository.clone(), &mut other_line, 0).await;
-                    other_lookup.extend(other_line[other_loaded..].iter().copied());
+                        load_additional_history(repository.clone(), &mut other_line).await?;
                 }
+                Ok::<_, BranchError>(())
             }
-        );
+        )?;
     }
 }
 
-/// A revision hash is already uniformly distributed, so its leading bytes are as
-/// good a bucket index as anything derived from all 32 - and free. Hashing the
-/// hash again is the cost this avoids.
-#[derive(Default)]
-struct RevisionHasher(u64);
-
-impl std::hash::Hasher for RevisionHasher {
-    fn write(&mut self, bytes: &[u8]) {
-        let mut leading = [0u8; 8];
-        let taken = bytes.len().min(leading.len());
-        leading[..taken].copy_from_slice(&bytes[..taken]);
-        self.0 = u64::from_ne_bytes(leading);
-    }
-
-    fn finish(&self) -> u64 {
-        self.0
-    }
-}
-
-/// Load a line of revisions from `revision` backwards through self parents. Falls
-/// back to a local walk when the batch load comes back empty, so a repository
-/// with no reachable remote still contributes the line it has cached.
+/// Load a line of revisions from `revision` backwards through self parents, each
+/// with its revision number. Falls back to a local walk when the batch load comes
+/// back empty, so a repository with no reachable remote still contributes the line
+/// it has cached. Fails where the batch load does, as [`find::batch_load_history`]
+/// describes.
 #[lore_macro::test_pub]
-async fn load_history_line(repository: Arc<RepositoryContext>, revision: Hash) -> Vec<Hash> {
-    let mut history = find::batch_load_history(repository.clone(), revision).await;
+async fn load_history_line(
+    repository: Arc<RepositoryContext>,
+    revision: Hash,
+) -> Result<Vec<(u64, Hash)>, BranchError> {
+    let mut history = find::batch_load_history(repository.clone(), revision)
+        .await
+        .forward::<BranchError>("loading the first batch of a history line")?;
     if !history.is_empty() {
         // The caller extends this a batch at a time up to the search depth, so
         // take the growth in one allocation rather than a copy per doubling.
         history.reserve(MAX_DIVERGENT_HISTORY_LENGTH.saturating_sub(history.len()));
-        return history;
+        return Ok(history);
     }
 
     lore_debug!("Found no revision from {revision}, walking locally");
 
     let mut history = Vec::new();
     let Ok(mut state_iter) = state::State::deserialize(repository.clone(), revision).await else {
-        return history;
+        return Ok(history);
     };
-    history.push(revision);
+    history.push((state_iter.revision_number(), revision));
 
     while history.len() < find::BATCH_COUNT && !state_iter.parent_self().is_zero() {
         let revision_next = state_iter.parent_self();
@@ -3627,66 +3723,53 @@ async fn load_history_line(repository: Arc<RepositoryContext>, revision: Hash) -
         else {
             break;
         };
-        history.push(revision_next);
+        history.push((state_next.revision_number(), revision_next));
         state_iter = state_next;
     }
 
-    history
+    Ok(history)
 }
 
-/// Whether a line has been followed to or past `floor_revision_number`, leaving
-/// nothing below it worth loading. A line that cannot be read any further counts
-/// as reached for the same reason.
+/// Whether the oldest revision of `history` is numbered at or below
+/// `floor_revision_number`. An empty line counts as reached.
 #[lore_macro::test_pub]
-async fn history_reached_floor(
-    repository: Arc<RepositoryContext>,
-    history: &[Hash],
-    floor_revision_number: u64,
-) -> bool {
-    let Some(oldest) = history.last() else {
-        return true;
-    };
-
-    let Ok(state) = State::deserialize(repository, *oldest).await else {
-        return true;
-    };
-
-    state.revision_number() <= floor_revision_number
+fn history_reached_floor(history: &[(u64, Hash)], floor_revision_number: u64) -> bool {
+    history
+        .last()
+        .is_none_or(|&(number, _)| number <= floor_revision_number)
 }
 
 /// Extend a line with the next batch of older revisions. Returns whether the line
-/// has nothing further worth loading, either because it reached the floor or
-/// because it ran out.
+/// ran out: nothing below its oldest revision could be loaded. Fails where the
+/// batch load does, as [`find::batch_load_history`] describes.
 #[lore_macro::test_pub]
 async fn load_additional_history(
     repository: Arc<RepositoryContext>,
-    history: &mut Vec<Hash>,
-    floor_revision_number: u64,
-) -> bool {
-    let Some(&last) = history.last() else {
-        return true;
+    history: &mut Vec<(u64, Hash)>,
+) -> Result<bool, BranchError> {
+    let Some(&(_, last)) = history.last() else {
+        return Ok(true);
     };
 
-    let additional = find::batch_load_history(repository.clone(), last).await;
+    let additional = find::batch_load_history(repository.clone(), last)
+        .await
+        .forward::<BranchError>("loading the next batch of a history line")?;
 
     // `batch_load_history` yields its start revision first, and that revision is
     // already the tail of `history`. Appending it again both duplicates work for
     // the caller's comparison and, once the line is exhausted, keeps reporting
     // progress that does not exist.
     let fresh = match additional.split_first() {
-        Some((first, rest)) if *first == last => rest,
+        Some((first, rest)) if first.1 == last => rest,
         _ => additional.as_slice(),
     };
 
     if fresh.is_empty() {
-        return true;
+        return Ok(true);
     }
 
-    // Appended before the floor is tested, since this batch still has to be
-    // compared - it can hold the revision being searched for.
     history.extend_from_slice(fresh);
-
-    history_reached_floor(repository, history, floor_revision_number).await
+    Ok(false)
 }
 
 struct WalkVisit {

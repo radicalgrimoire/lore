@@ -71,13 +71,6 @@ pub fn client_main() -> ExitCode {
         lore::set_thread_limit(max_threads);
     }
 
-    // After the thread limit, which this reads, and before the first command: the
-    // handlers below build the runtime themselves and then call the async API, so
-    // by the time the library could decide this the runtime it would size exists.
-    if !runs_the_service(cli_command) {
-        lore::size_threads_for_relaying();
-    }
-
     let mut globals = match lore_globals_from_args(&cli) {
         Ok(globals) => globals,
         Err(err) => {
@@ -90,9 +83,29 @@ pub fn client_main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // After the thread limit, which this reads, and before the first command: the
+    // handlers below build the runtime themselves and then call the async API, so
+    // by the time the library could decide this the runtime it would size exists.
+    if runs_the_service(cli_command) {
+        lore::size_threads_for_service();
+    } else {
+        // A process that relays its calls builds its runtime here, sized for relaying, and
+        // sizing for its connections then finds it built.
+        lore::size_threads_for_relaying();
+        lore::size_threads_for_connections(globals.max_connections);
+    }
+
+    // This executable runs the service with `service run`, so a command only the service may
+    // carry out, such as one in a virtual clone, can start one from it.
+    lore::serve_from_this_executable();
+
     let result = handle_lore_commands(cli_command, globals);
 
     lore::shutdown();
+
+    if lore::memory_stats_requested() {
+        crate::eprintln!("{}", lore::memory_summary());
+    }
 
     if cli.time {
         crate::println!("Executed in {:.2}s", time_start.elapsed().as_secs_f32());

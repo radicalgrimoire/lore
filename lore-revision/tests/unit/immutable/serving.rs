@@ -15,15 +15,16 @@ use lore_base::types::Context;
 use lore_base::types::Fragment;
 use lore_base::types::Hash;
 use lore_base::types::HealResult;
+use lore_base::types::KeyType;
 use lore_base::types::Partition;
 use lore_base::types::VerifyResult;
 use lore_revision::repository::RemoteState;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::test_util::context_with_state;
 use lore_transport::Connection;
 use lore_transport::ProtocolError;
 use lore_transport::StorageSession;
 
-use super::session_tests::context_with_state;
 use super::session_tests::under_execution_context;
 
 /// How a [`ServingStorage`] departs from serving what it holds: the address it answers with its
@@ -31,10 +32,11 @@ use super::session_tests::under_execution_context;
 /// though it reports the heal made; the address whose first get it answers `SlowDown`; whether it
 /// answers every get `NotSupported`, as a remote that does not support the request; whether it
 /// fails every get on the first session it started, as a server that lost its sessions; the gate
-/// it holds each get at until as many as the gate takes are in; and the content whose first get it
-/// holds for a notification.
+/// it holds each get at until as many as the gate takes are in; the content whose first get it
+/// holds for a notification; and the refusal of the credentials it answers every verify and
+/// mutable load with.
 #[derive(Default)]
-pub(super) struct Serving {
+pub(crate) struct Serving {
     pub(super) tampered: Option<Address>,
     pub(super) heals: bool,
     pub(super) heal_fails: bool,
@@ -43,12 +45,13 @@ pub(super) struct Serving {
     pub(super) forgets_first_session: bool,
     pub(super) gate: Option<Arc<tokio::sync::Barrier>>,
     pub(super) hold: Option<(Hash, Arc<tokio::sync::Notify>)>,
+    pub(super) refusal: Option<ProtocolError>,
 }
 
 /// A remote serving what `source` stores as `serving` says, recording each address asked of it, the
 /// sessions started on it, numbered from 1, the verifies asked of it and the most gets it held at
 /// once.
-pub(super) struct ServingStorage {
+pub(crate) struct ServingStorage {
     source: Arc<RepositoryContext>,
     serving: Serving,
     asked: std::sync::Mutex<Vec<Address>>,
@@ -140,6 +143,9 @@ impl lore_transport::Storage for ServingStorage {
         heal: bool,
     ) -> Result<VerifyResult, ProtocolError> {
         self.verifies.fetch_add(1, Ordering::SeqCst);
+        if let Some(refusal) = &self.serving.refusal {
+            return Err(refusal.clone());
+        }
         if !(heal && self.serving.heals && self.serving.tampered == Some(*address)) {
             return Err(ProtocolError::internal("the serving remote heals nothing"));
         }
@@ -162,6 +168,19 @@ impl lore_transport::Storage for ServingStorage {
         Err(ProtocolError::internal(
             "the serving remote takes no copies",
         ))
+    }
+
+    async fn mutable_load(
+        &self,
+        _session_id: u32,
+        _key: &Hash,
+        _key_type: KeyType,
+    ) -> Result<Hash, ProtocolError> {
+        Err(self
+            .serving
+            .refusal
+            .clone()
+            .unwrap_or_else(|| ProtocolError::internal("the serving remote holds no mutable keys")))
     }
 }
 
@@ -222,7 +241,7 @@ impl ServingStorage {
 }
 
 /// A remote serving what `source` stores as `serving` says.
-pub(super) fn serving_remote(
+pub(crate) fn serving_remote(
     source: &Arc<RepositoryContext>,
     serving: Serving,
 ) -> Arc<ServingStorage> {
@@ -259,7 +278,7 @@ pub(super) async fn serving_session(
 
 /// `content` stored with its payload under `flags` in a repository of its own, standing in for the
 /// remote's copy, and its address and fragment.
-pub(super) async fn remote_copy(
+pub(crate) async fn remote_copy(
     content: &'static [u8],
     seed: u8,
     flags: u32,

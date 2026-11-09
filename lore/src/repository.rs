@@ -63,6 +63,8 @@ pub enum LoreVfsType {
     Default = 1,
     /// Use SWFS as a VFS
     Swfs = 2,
+    /// Use a Linux FUSE mount served by the Lore service as a VFS
+    Fuse = 3,
 }
 
 impl LoreVfsType {
@@ -70,8 +72,24 @@ impl LoreVfsType {
         VfsConfig {
             vfs_type: match self {
                 LoreVfsType::None => VfsType::None,
-                LoreVfsType::Swfs | LoreVfsType::Default => VfsType::Swfs,
+                LoreVfsType::Swfs => VfsType::Swfs,
+                LoreVfsType::Fuse => VfsType::Fuse,
+                LoreVfsType::Default => {
+                    #[cfg(target_os = "linux")]
+                    {
+                        VfsType::Fuse
+                    }
+                    #[cfg(target_family = "windows")]
+                    {
+                        VfsType::Swfs
+                    }
+                    #[cfg(not(any(target_os = "linux", target_family = "windows")))]
+                    {
+                        VfsType::None
+                    }
+                }
             },
+            base_time: None,
         }
     }
 }
@@ -80,6 +98,7 @@ impl LoreVfsType {
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(clone_local)]
+#[requires_service]
 pub struct LoreRepositoryCloneArgs {
     /// URL to the repository
     pub repository_url: LoreString,
@@ -97,10 +116,14 @@ pub struct LoreRepositoryCloneArgs {
     pub layer: LoreString,
     /// (Optional) Layer metadata key to link revisions with
     pub layer_metadata: LoreString,
-    /// (Optional) File containing list of files to prefetch
+    /// (Optional) Access recording whose paths a virtual clone warms in the background: one
+    /// repository-relative path per line, a directory ending with `/`, `/` for the root. A
+    /// relative file path resolves against the caller's working directory.
     pub prefetch: LoreString,
     /// Whether to use the shared store instead of a local immutable store. Zero-initialized
-    /// (`LORE_SHARED_STORE_MODE_INHERIT`) follows the machine's global setting.
+    /// (`LORE_SHARED_STORE_MODE_INHERIT`) follows the machine's global setting, except where `vfs`
+    /// is a virtual one, which always uses a shared store and refuses
+    /// `LORE_SHARED_STORE_MODE_DISABLED` with `InvalidArguments`.
     pub use_shared_store: LoreSharedStoreMode,
     /// [Optional] Path to use for the shared store, an empty string means to use the default
     pub shared_store_path: LoreString,
@@ -121,8 +144,8 @@ pub struct LoreRepositoryCloneArgs {
 /// A clone needs the remote, so the offline flag does not keep it from connecting: it prepares the
 /// clone for working offline instead. With it, as with the cache flag, a clone that writes its
 /// files caches every file metadata block of the cloned revision, which staging and committing
-/// write to, so both work without the remote, and fails if it cannot. A bare clone writes no files
-/// and reads them from the remote when a command needs them.
+/// write to, so both work without the remote, and fails if it cannot. A bare or virtual clone writes
+/// no files and reads them from the remote when a command needs them.
 ///
 /// # Events
 ///
@@ -221,18 +244,28 @@ async fn clone_impl(
     } else {
         None
     };
-    let prefetch = args.prefetch.clone().into();
+    let prefetch = if args.prefetch.length > 0 {
+        Some(
+            util::path::make_absolute(args.prefetch.as_str())
+                .forward_with::<CloneError, _>(|| format!("Invalid path: {}", args.prefetch))?
+                .display()
+                .to_string(),
+        )
+    } else {
+        None
+    };
 
     let global_config = GlobalConfig::load()
         .await
         .forward::<CloneError>("Couldn't load global config")?;
+    let vfs_options = args.vfs.to_config();
     let shared_store_options = SharedStoreToUseConfig::from_api_args(
         &global_config,
-        args.use_shared_store,
+        args.use_shared_store.for_vfs(vfs_options.vfs_type)?,
         &args.shared_store_path,
     )
     .forward_with::<CloneError, _>(|| format!("Invalid path: {}", args.shared_store_path))?;
-    let vfs_options = Some(args.vfs.to_config());
+    let vfs_options = Some(vfs_options);
 
     let root_files: Vec<String> = args
         .root_files
@@ -252,6 +285,7 @@ async fn clone_impl(
         ignore_existing,
         direct_file_write,
         prefetch,
+        tree_prefetch: None,
         shared_store_options,
         vfs_options,
         no_tracking,
@@ -264,9 +298,9 @@ async fn clone_impl(
 
     let layer = if !args.layer.is_empty() {
         Some(CloneLayer {
-            module: args.layer.to_string(),
-            module_path: String::default(),
-            layer_path: String::default(),
+            repository: args.layer.to_string(),
+            source_path: String::default(),
+            mount_path: String::default(),
             metadata: args.layer_metadata.clone().into(),
         })
     } else {
@@ -439,6 +473,7 @@ async fn dump_impl(
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(create_local)]
+#[requires_service]
 pub struct LoreRepositoryCreateArgs {
     /// URL to the repository. Treated as the repository name instead when the call is
     /// offline or local, where an empty value names it after the directory it is
@@ -451,7 +486,9 @@ pub struct LoreRepositoryCreateArgs {
     /// Which VFS to use, if any
     pub vfs: LoreVfsType,
     /// Whether to use the shared store instead of a local immutable store. Zero-initialized
-    /// (`LORE_SHARED_STORE_MODE_INHERIT`) follows the machine's global setting.
+    /// (`LORE_SHARED_STORE_MODE_INHERIT`) follows the machine's global setting, except where `vfs`
+    /// is a virtual one, which always uses a shared store and refuses
+    /// `LORE_SHARED_STORE_MODE_DISABLED` with `InvalidArguments`.
     pub use_shared_store: LoreSharedStoreMode,
     /// [Optional] Path to use for the shared store, an empty string means to use the default
     pub shared_store_path: LoreString,
@@ -520,6 +557,7 @@ async fn create_impl(args: &LoreRepositoryCreateArgs) -> Result<(), CreateError>
         .await
         .forward::<CreateError>("loading global config")?;
 
+    let vfs_options = args.vfs.to_config();
     let options = CreateOptions {
         id: if !id.is_zero() { Some(id) } else { None },
         description: if !args.description.is_empty() {
@@ -529,11 +567,11 @@ async fn create_impl(args: &LoreRepositoryCreateArgs) -> Result<(), CreateError>
         },
         shared_store_options: SharedStoreToUseConfig::from_api_args(
             &global_config,
-            args.use_shared_store,
+            args.use_shared_store.for_vfs(vfs_options.vfs_type)?,
             &args.shared_store_path,
         )
         .forward::<CreateError>("resolving shared store config")?,
-        vfs_options: args.vfs.to_config(),
+        vfs_options,
     };
 
     lore_revision::repository::create::create_boxed(repository_url, repository_path, options).await
@@ -584,6 +622,7 @@ async fn create_with_metadata_impl(
         .await
         .forward::<CreateError>("loading global config")?;
 
+    let vfs_options = args.vfs.to_config();
     let options = CreateOptions {
         id: if !id.is_zero() { Some(id) } else { None },
         description: if !args.description.is_empty() {
@@ -593,11 +632,11 @@ async fn create_with_metadata_impl(
         },
         shared_store_options: SharedStoreToUseConfig::from_api_args(
             &global_config,
-            args.use_shared_store,
+            args.use_shared_store.for_vfs(vfs_options.vfs_type)?,
             &args.shared_store_path,
         )
         .forward::<CreateError>("resolving shared store config")?,
-        vfs_options: args.vfs.to_config(),
+        vfs_options,
     };
     let metadata = Some(CreateMetadata {
         creator: metadata.creator.to_string(),
@@ -1445,6 +1484,78 @@ fn update_path_local(
         repository_update_path,
         move |repository, _token, _args| lore_revision::instance::update_path(repository),
     )
+}
+
+/// Arguments for deleting the current repository instance.
+#[repr(C)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[handler(instance_delete_local)]
+pub struct LoreRepositoryInstanceDeleteArgs {}
+
+pub async fn instance_delete(
+    globals: LoreGlobalArgs,
+    args: LoreRepositoryInstanceDeleteArgs,
+    callback: LoreEventCallback,
+) -> i32 {
+    dispatch_call(globals, args, callback, instance_delete_local).await
+}
+
+async fn instance_delete_local(
+    globals: LoreGlobalArgs,
+    args: LoreRepositoryInstanceDeleteArgs,
+    callback: LoreEventCallback,
+) -> i32 {
+    repository_call_no_store(
+        globals,
+        callback,
+        args,
+        instance_delete,
+        move |repository, _args| lore_revision::instance::instance_delete(repository),
+    )
+    .await
+}
+
+/// Arguments for moving the current repository instance to a new path.
+#[repr(C)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[handler(instance_move_local)]
+pub struct LoreRepositoryInstanceMoveArgs {
+    /// Target path for the instance.
+    pub target_path: LoreString,
+}
+
+pub async fn instance_move(
+    globals: LoreGlobalArgs,
+    args: LoreRepositoryInstanceMoveArgs,
+    callback: LoreEventCallback,
+) -> i32 {
+    dispatch_call(globals, args, callback, instance_move_local).await
+}
+
+async fn instance_move_local(
+    globals: LoreGlobalArgs,
+    mut args: LoreRepositoryInstanceMoveArgs,
+    callback: LoreEventCallback,
+) -> i32 {
+    // A relative target is relative to the caller's working directory, which for a call relayed
+    // to a service is not this process's. Left as given when it cannot be resolved.
+    if let Ok(target) = util::path::make_absolute_from(
+        args.target_path.as_str(),
+        globals.working_directory().map(std::path::Path::new),
+    ) {
+        args.target_path = target.display().to_string().into();
+    }
+    repository_call_no_store(
+        globals,
+        callback,
+        args,
+        instance_move,
+        move |repository, args| {
+            let target = args.target_path.as_str().to_string();
+            async move { lore_revision::instance::instance_move(repository, &target).await }
+        },
+    )
+    .await
 }
 
 /// Arguments for reading a value from the repository config.

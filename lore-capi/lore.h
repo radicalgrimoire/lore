@@ -66,7 +66,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-#define LORE_INTERFACE_VERSION "0.12.1-nightly"
+#define LORE_INTERFACE_VERSION "0.13.1-nightly"
 
 // The kind of value held by a metadata entry.
 //
@@ -216,6 +216,16 @@ typedef enum lore_file_audit_outcome_t {
   LORE_FILE_AUDIT_OUTCOME_UNRESOLVED = 7,
 } lore_file_audit_outcome_t;
 
+// Phase of an instance delete operation.
+typedef enum lore_repository_instance_delete_phase_t {
+  // Unmounting the instance, an SWFS instance or a virtual clone
+  LORE_REPOSITORY_INSTANCE_DELETE_PHASE_UNMOUNTING = 0,
+  // Removing instance keys from mutable store
+  LORE_REPOSITORY_INSTANCE_DELETE_PHASE_DEREGISTERING = 1,
+  // Deleting external directories or repository directory
+  LORE_REPOSITORY_INSTANCE_DELETE_PHASE_DELETING_FILES = 2,
+} lore_repository_instance_delete_phase_t;
+
 // Which authentication path a client takes if a server advertises both its
 // gRPC auth service and an OIDC issuer. A path the server does not
 // advertise cannot be taken.
@@ -240,6 +250,8 @@ typedef enum lore_vfs_type_t {
   LORE_VFS_TYPE_DEFAULT = 1,
   // Use SWFS as a VFS
   LORE_VFS_TYPE_SWFS = 2,
+  // Use a Linux FUSE mount served by the Lore service as a VFS
+  LORE_VFS_TYPE_FUSE = 3,
 } lore_vfs_type_t;
 
 // Whether a repository being created or cloned should be backed by a shared store.
@@ -531,14 +543,22 @@ typedef struct lore_auth_user_token_event_data_t {
   struct lore_string_t id;
   // Display name for the user
   struct lore_string_t name;
-  // The token string
+  // The token string, or empty when the caller did not ask for it
   struct lore_string_t token;
   // Preferred username from the token
   struct lore_string_t preferred_username;
   // Non-zero if the identity is a service account
   uint8_t flag_service_account;
-  // Expiry time in milliseconds since UNIX epoch, or 0 if unavailable
+  // Expiry time of `token` in milliseconds since UNIX epoch, or 0 if unavailable
   uint64_t expires;
+  // When the stored refresh token stops working, in milliseconds since the UNIX epoch. 0
+  // if there is no refresh token, or if the provider did not give a deadline.
+  uint64_t refresh_expires;
+  // Non-zero if a refresh token is stored for the identity
+  uint8_t refreshable;
+  // Non-zero if `token` has not expired, or if it has but the stored refresh token can still
+  // renew it
+  uint8_t session_valid;
 } lore_auth_user_token_event_data_t;
 
 // Event data describing a stored authentication identity.
@@ -2823,9 +2843,10 @@ typedef struct lore_revision_tree_resolve_path_complete_event_data_t {
   enum lore_error_code_t error_code;
 } lore_revision_tree_resolve_path_complete_event_data_t;
 
-// Per-child event from `list_children`. One event is emitted per entry;
-// the caller correlates entries by `id` and detects end-of-list via the
-// trailing `Complete` event.
+// Per-child event from `list_children`, one per child the listing reaches;
+// moves and deletions on the same handle beside the listing may have a child
+// reported twice (`lore_revision_tree_list_children`). The caller correlates
+// entries by `id` and detects end-of-list via the trailing `Complete` event.
 typedef struct lore_revision_tree_child_event_data_t {
   // Correlation id of the originating call.
   uint64_t id;
@@ -2925,7 +2946,7 @@ typedef struct lore_revision_tree_delete_complete_event_data_t {
   // Correlation id of the entry this reports, not of the call.
   uint64_t entry_id;
   // How many nodes the entry's subtree removed, staged and discarded
-  // together. Zero on failure, since nothing was removed.
+  // together. Zero on failure, whatever part of the subtree was removed.
   uint64_t node_count;
   // The outcome of the call.
   enum lore_error_code_t error_code;
@@ -3280,9 +3301,10 @@ typedef struct lore_fragment_stats_data_t {
   // asked for. Branch latest history is one such write, which the server does
   // not store, so a commit against a remote has exactly one.
   uint64_t local_only_writes;
-  // Fragments whose upload did not land, leaving them stored only locally for
-  // a later push to offer again. Their payloads are counted under
-  // `local_payload_writes` too, indistinguishably from those kept by request.
+  // Fragments stored only locally for a later push to offer again. Either the
+  // upload failed or the peer throttled the copy and no upload was attempted.
+  // Their payloads also count toward `local_payload_writes`, which does not
+  // distinguish them from payloads kept locally by request.
   uint64_t remote_upload_failed;
 } lore_fragment_stats_data_t;
 
@@ -3396,6 +3418,46 @@ typedef struct lore_file_audit_event_data_t {
   // What the range resolved to, or why it did not resolve.
   enum lore_file_audit_outcome_t outcome;
 } lore_file_audit_event_data_t;
+
+// Event data for the start of an instance delete operation.
+typedef struct lore_repository_instance_delete_begin_event_data_t {
+  // Identifier of the instance being deleted
+  struct lore_instance_id_t instance_id;
+  // Filesystem path of the instance
+  struct lore_string_t path;
+  // Whether this is a SWFS-backed instance
+  uint8_t is_swfs;
+} lore_repository_instance_delete_begin_event_data_t;
+
+// Event data for progress during an instance delete operation.
+typedef struct lore_repository_instance_delete_progress_event_data_t {
+  // Current phase of the delete operation
+  enum lore_repository_instance_delete_phase_t phase;
+} lore_repository_instance_delete_progress_event_data_t;
+
+// Event data for the completion of an instance delete operation.
+typedef struct lore_repository_instance_delete_complete_event_data_t {
+  // Identifier of the deleted instance
+  struct lore_instance_id_t instance_id;
+} lore_repository_instance_delete_complete_event_data_t;
+
+// Event data for the start of an instance move operation.
+typedef struct lore_repository_instance_move_begin_event_data_t {
+  // Identifier of the instance being moved
+  struct lore_instance_id_t instance_id;
+  // Original filesystem path of the instance
+  struct lore_string_t source_path;
+  // New filesystem path for the instance
+  struct lore_string_t target_path;
+} lore_repository_instance_move_begin_event_data_t;
+
+// Event data for the completion of an instance move operation.
+typedef struct lore_repository_instance_move_complete_event_data_t {
+  // Identifier of the moved instance
+  struct lore_instance_id_t instance_id;
+  // New filesystem path of the instance
+  struct lore_string_t target_path;
+} lore_repository_instance_move_complete_event_data_t;
 
 // An event delivered to a callback. Each variant names a kind of event and
 // carries the data for that event.
@@ -3878,6 +3940,16 @@ enum lore_event_id_t {
   LORE_EVENT_STORAGE_GET_FRAGMENT,
   // One range of a file's lines, attributed to the revision that last changed them.
   LORE_EVENT_FILE_AUDIT,
+  // The start of an instance delete operation.
+  LORE_EVENT_REPOSITORY_INSTANCE_DELETE_BEGIN,
+  // Progress during an instance delete operation.
+  LORE_EVENT_REPOSITORY_INSTANCE_DELETE_PROGRESS,
+  // The completion of an instance delete operation.
+  LORE_EVENT_REPOSITORY_INSTANCE_DELETE_COMPLETE,
+  // The start of an instance move operation.
+  LORE_EVENT_REPOSITORY_INSTANCE_MOVE_BEGIN,
+  // The completion of an instance move operation.
+  LORE_EVENT_REPOSITORY_INSTANCE_MOVE_COMPLETE,
 };
 typedef uint32_t lore_event_tag_t;
 
@@ -4122,6 +4194,11 @@ typedef struct lore_event_t {
     struct lore_auth_pending_event_data_t auth_pending;
     struct lore_storage_get_fragment_event_data_t storage_get_fragment;
     struct lore_file_audit_event_data_t file_audit;
+    struct lore_repository_instance_delete_begin_event_data_t repository_instance_delete_begin;
+    struct lore_repository_instance_delete_progress_event_data_t repository_instance_delete_progress;
+    struct lore_repository_instance_delete_complete_event_data_t repository_instance_delete_complete;
+    struct lore_repository_instance_move_begin_event_data_t repository_instance_move_begin;
+    struct lore_repository_instance_move_complete_event_data_t repository_instance_move_complete;
   };
 } lore_event_t;
 
@@ -4303,7 +4380,7 @@ typedef struct lore_auth_local_user_info_args_t {
   struct lore_string_t auth_endpoint;
   // User identities to resolve; empty resolves the current user
   struct lore_string_array_t user_ids;
-  // Emit cached identity token details for identities with a local token
+  // Include the cached identity token string in `AuthUserToken` events
   uint8_t with_identity_token;
   // Emit the repository's authorization (access) token. Requires running
   // inside a repository
@@ -4316,6 +4393,8 @@ typedef struct lore_auth_login_interactive_args_t {
   struct lore_string_t remote_url;
   // Emit the login URL instead of opening a browser
   uint8_t no_browser;
+  // Return the stored login instead of starting a new one while its session is valid
+  uint8_t reuse_session;
 } lore_auth_login_interactive_args_t;
 
 // Arguments for creating a new branch with the given name and category.
@@ -4652,13 +4731,15 @@ typedef struct lore_file_metadata_set_args_t {
   struct lore_uint32_array_t entries;
 } lore_file_metadata_set_args_t;
 
-// Arguments for resetting files to a revision, optionally purging untracked files.
+// Arguments for resetting files to a revision, optionally deleting what the revision does not
+// hold.
 typedef struct lore_file_reset_args_t {
   // Pointer to an array of paths
   struct lore_string_array_t paths;
   // Revision to reset files into
   struct lore_string_t revision;
-  // Purge untracked files
+  // Delete what the revision does not hold within the view: untracked files, whatever the
+  // ignore file says, and files the view excludes. Nested repositories stay
   uint8_t purge;
 } lore_file_reset_args_t;
 
@@ -4668,7 +4749,8 @@ typedef struct lore_file_reset_to_last_merged_args_t {
   struct lore_string_array_t paths;
   // Branch whose last merged revision to reset to
   struct lore_string_t branch;
-  // Purge untracked files
+  // Delete what the revision does not hold within the view: untracked files, whatever the
+  // ignore file says, and files the view excludes. Nested repositories stay
   uint8_t purge;
   // Merge side to restore, 0 = resolved (the merge revision), 1 = self ("mine"), 2 = other ("theirs")
   uint32_t merge_side;
@@ -4900,10 +4982,14 @@ typedef struct lore_repository_clone_args_t {
   struct lore_string_t layer;
   // (Optional) Layer metadata key to link revisions with
   struct lore_string_t layer_metadata;
-  // (Optional) File containing list of files to prefetch
+  // (Optional) Access recording whose paths a virtual clone warms in the background: one
+  // repository-relative path per line, a directory ending with `/`, `/` for the root. A
+  // relative file path resolves against the caller's working directory.
   struct lore_string_t prefetch;
   // Whether to use the shared store instead of a local immutable store. Zero-initialized
-  // (`LORE_SHARED_STORE_MODE_INHERIT`) follows the machine's global setting.
+  // (`LORE_SHARED_STORE_MODE_INHERIT`) follows the machine's global setting, except where `vfs`
+  // is a virtual one, which always uses a shared store and refuses
+  // `LORE_SHARED_STORE_MODE_DISABLED` with `InvalidArguments`.
   enum lore_shared_store_mode_t use_shared_store;
   // [Optional] Path to use for the shared store, an empty string means to use the default
   struct lore_string_t shared_store_path;
@@ -4948,7 +5034,9 @@ typedef struct lore_repository_create_args_t {
   // Which VFS to use, if any
   enum lore_vfs_type_t vfs;
   // Whether to use the shared store instead of a local immutable store. Zero-initialized
-  // (`LORE_SHARED_STORE_MODE_INHERIT`) follows the machine's global setting.
+  // (`LORE_SHARED_STORE_MODE_INHERIT`) follows the machine's global setting, except where `vfs`
+  // is a virtual one, which always uses a shared store and refuses
+  // `LORE_SHARED_STORE_MODE_DISABLED` with `InvalidArguments`.
   enum lore_shared_store_mode_t use_shared_store;
   // [Optional] Path to use for the shared store, an empty string means to use the default
   struct lore_string_t shared_store_path;
@@ -6028,6 +6116,17 @@ typedef struct lore_repository_instance_prune_args_t {
   int _unused;
 } lore_repository_instance_prune_args_t;
 
+// Arguments for deleting the current repository instance.
+typedef struct lore_repository_instance_delete_args_t {
+  int _unused;
+} lore_repository_instance_delete_args_t;
+
+// Arguments for moving the current repository instance to a new path.
+typedef struct lore_repository_instance_move_args_t {
+  // Target path for the instance.
+  struct lore_string_t target_path;
+} lore_repository_instance_move_args_t;
+
 // Arguments for updating the recorded path of the current repository instance.
 typedef struct lore_repository_update_path_args_t {
   int _unused;
@@ -6503,20 +6602,26 @@ void lore_auth_clear_async(const struct lore_global_args_t *globals,
 
 // Resolve user identities to display names from locally stored JWT tokens.
 //
-// Decodes cached JWT tokens to extract display names without contacting the
-// auth service. For user IDs without a local token, returns the raw user
-// ID. For remote resolution with proper authorization, use
-// `lore_auth_user_info` which queries the remote authentication service.
+// Decodes cached JWT tokens to extract display names. For user IDs without a
+// local token, returns the raw user ID. For remote resolution with proper
+// authorization, use `lore_auth_user_info` which queries the remote
+// authentication service.
 //
-// When `with_identity_token` is set, identities with a locally stored token
-// are answered as `AUTH_USER_TOKEN` events carrying the cached identity
-// token instead of `AUTH_USER_INFO`.
+// When `auth_endpoint` is empty, the call reads it from the repository's
+// remote, and first refreshes an expired stored token unless the call
+// supplies a token. The refresh contacts the auth service and replaces the
+// stored tokens; a refused or failed refresh removes the stored refresh token.
+//
+// Every identity is answered with an `AUTH_USER_INFO` event, and an identity
+// with a locally stored token also with an `AUTH_USER_TOKEN` event. Its
+// `token` holds the cached identity token when `with_identity_token` is set,
+// and is empty otherwise.
 //
 // When `with_access_token` is set, the call requires a repository and
 // additionally emits one `AUTH_IDENTITY` event carrying the
 // repository-scoped authorization (access) token for the current user. A
 // valid cached token is reused. Otherwise a token exchange is performed
-// against the auth service, so this variant can contact the network.
+// against the auth service.
 //
 // # Events
 //
@@ -6538,7 +6643,7 @@ void lore_auth_clear_async(const struct lore_global_args_t *globals,
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
 // | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with the resolved user id and display name |
-// | `LORE_EVENT_AUTH_USER_TOKEN` | `lore_auth_user_token_event_data_t` | Emitted instead of `AUTH_USER_INFO` when `with_identity_token` is set and a cached token is available, includes full token details |
+// | `LORE_EVENT_AUTH_USER_TOKEN` | `lore_auth_user_token_event_data_t` | Emitted before `AUTH_USER_INFO` for an identity with a cached token, with the token details; `token` is empty unless `with_identity_token` is set |
 // | `LORE_EVENT_AUTH_IDENTITY` | `lore_auth_identity_event_data_t` | Emitted when `with_access_token` is set, carries the repository-scoped authorization token for the current user |
 int32_t lore_auth_local_user_info(const struct lore_global_args_t *globals,
                                   const struct lore_auth_local_user_info_args_t *args,
@@ -6550,6 +6655,10 @@ void lore_auth_local_user_info_async(const struct lore_global_args_t *globals,
                                      struct lore_event_callback_config_t callback);
 
 // Authenticate interactively via a browser-based login flow.
+//
+// With `reuse_session` set, a stored login whose session is still valid, as
+// `session_valid` in `lore_auth_user_token_event_data_t` reports it, is
+// returned without starting a new login.
 //
 // # Events
 //
@@ -6572,7 +6681,7 @@ void lore_auth_local_user_info_async(const struct lore_global_args_t *globals,
 // |-----|-----------|-------------|
 // | `LORE_EVENT_AUTH_URL` | `lore_auth_url_event_data_t` | Emitted with the login URL when no_browser mode is requested, and whenever the login has a code the user may need to enter or confirm at that URL, browser or not. `user_code` holds the code, or is empty |
 // | `LORE_EVENT_AUTH_PENDING` | `lore_auth_pending_event_data_t` | Emitted before each wait while the login awaits the user's approval, with the seconds elapsed, the seconds until the next poll, and the seconds left before the session expires. |
-// | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with user id and display name after successful interactive authentication |
+// | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with user id and display name after successful interactive authentication, or for the stored login it reuses |
 int32_t lore_auth_login_interactive(const struct lore_global_args_t *globals,
                                     const struct lore_auth_login_interactive_args_t *args,
                                     struct lore_event_callback_config_t callback);
@@ -6600,7 +6709,7 @@ int32_t lore_auth_login_interactive(const struct lore_global_args_t *globals,
 // |-----|-----------|-------------|
 // | `LORE_EVENT_AUTH_URL` | `lore_auth_url_event_data_t` | Emitted with the login URL when no_browser mode is requested, and whenever the login has a code the user may need to enter or confirm at that URL, browser or not. `user_code` holds the code, or is empty |
 // | `LORE_EVENT_AUTH_PENDING` | `lore_auth_pending_event_data_t` | Emitted before each wait while the login awaits the user's approval, with the seconds elapsed, the seconds until the next poll, and the seconds left before the session expires. |
-// | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with user id and display name after successful interactive authentication |
+// | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with user id and display name after successful interactive authentication, or for the stored login it reuses |
 void lore_auth_login_interactive_async(const struct lore_global_args_t *globals,
                                        const struct lore_auth_login_interactive_args_t *args,
                                        struct lore_event_callback_config_t callback);
@@ -9577,8 +9686,8 @@ void lore_link_update_async(const struct lore_global_args_t *globals,
 // A clone needs the remote, so the `offline` global argument does not keep it from connecting: it
 // prepares the clone for working offline instead. With `offline` or `cache`, a clone that writes
 // its files caches every file metadata block of the cloned revision, which staging and committing
-// write to, so both work without the remote, and fails if it cannot. A bare clone writes no files
-// and reads them from the remote when a call needs them.
+// write to, so both work without the remote, and fails if it cannot. A bare or virtual clone writes
+// no files and reads them from the remote when a call needs them.
 //
 // # Events
 //
@@ -12703,6 +12812,32 @@ void lore_repository_instance_prune_async(const struct lore_global_args_t *globa
                                           const struct lore_repository_instance_prune_args_t *args,
                                           struct lore_event_callback_config_t callback);
 
+// Delete the current repository instance: unmount (if SWFS and in service),
+// deregister from the mutable store, and delete associated directories.
+// With `dry_run` set in `globals`, emits events describing what would be deleted
+// without performing any changes.
+int32_t lore_repository_instance_delete(const struct lore_global_args_t *globals,
+                                        const struct lore_repository_instance_delete_args_t *args,
+                                        struct lore_event_callback_config_t callback);
+
+// Asynchronous version of `lore_repository_instance_delete`.
+void lore_repository_instance_delete_async(const struct lore_global_args_t *globals,
+                                           const struct lore_repository_instance_delete_args_t *args,
+                                           struct lore_event_callback_config_t callback);
+
+// Move the current repository instance to a new path: update registry metadata
+// and remap mount (for SWFS in service context) or move directory (for regular
+// instances).
+// With `dry_run` set in `globals`, checks that the move can be made without performing it.
+int32_t lore_repository_instance_move(const struct lore_global_args_t *globals,
+                                      const struct lore_repository_instance_move_args_t *args,
+                                      struct lore_event_callback_config_t callback);
+
+// Asynchronous version of `lore_repository_instance_move`.
+void lore_repository_instance_move_async(const struct lore_global_args_t *globals,
+                                         const struct lore_repository_instance_move_args_t *args,
+                                         struct lore_event_callback_config_t callback);
+
 // Update the recorded path of the current repository instance to its present
 // location.
 int32_t lore_repository_update_path(const struct lore_global_args_t *globals,
@@ -12780,9 +12915,15 @@ void lore_revision_tree_resolve_path_async(const struct lore_global_args_t *glob
 
 // Stream the children of a directory node in a loaded revision tree.
 //
+// Moves and deletions on the same handle may run beside the listing: a child
+// moved away meanwhile may be left out, and a child may be reported twice. A
+// caller that needs each child once drops repeats by `node_id`. A listing the
+// tree gave up on under load, heavy changes beside it or a store asking it to
+// slow down, completes with `LORE_ERROR_CODE_SLOW_DOWN`, which a caller can retry.
+//
 // | Terminal event                       | Payload                                | Notes                                                          |
 // |--------------------------------------|----------------------------------------|----------------------------------------------------------------|
-// | `LORE_EVENT_REVISION_TREE_CHILD`     | `lore_revision_tree_child_event_data_t` | One per child; an empty directory emits none before `Complete` |
+// | `LORE_EVENT_REVISION_TREE_CHILD`     | `lore_revision_tree_child_event_data_t` | One per child reached; an empty directory emits none before `Complete` |
 int32_t lore_revision_tree_list_children(const struct lore_global_args_t *globals,
                                          const struct lore_revision_tree_list_children_args_t *args,
                                          struct lore_event_callback_config_t callback);
@@ -12841,7 +12982,12 @@ void lore_revision_tree_node_path_async(const struct lore_global_args_t *globals
 // entry is checked before any node is created, so one bad entry rejects the
 // call and creates nothing; the reason names the offending entry's batch index,
 // which a caller leaving `entry_id` at zero has no other way to identify. A failure
-// after those checks pass is internal and may leave part of the batch created.
+// after those checks pass reports `LORE_ERROR_CODE_INTERNAL` and may leave part of
+// the batch created. An entry the tree gave up on under load, in its checks or
+// after, reports `LORE_ERROR_CODE_SLOW_DOWN` instead, and so do the entries parented
+// onto it. The load is heavy concurrent change on the handle, or a store asking the
+// tree to slow down, and a caller can retry. The batch reports
+// `LORE_ERROR_CODE_SLOW_DOWN` where every failed entry did.
 //
 // A link entry's target revision is not resolved here, so a link naming a
 // revision that cannot be read is accepted and fails only when something later
@@ -12866,32 +13012,44 @@ void lore_revision_tree_add_async(const struct lore_global_args_t *globals,
 // is checked before any node is touched, so one bad entry rejects the call and
 // leaves every subtree in place; the reason names the offending entry's batch
 // index, which a caller leaving `entry_id` at zero has no other way to
-// identify. A failure after those checks pass is internal and may leave part of
-// the batch removed.
+// identify. A failure after those checks pass reports `LORE_ERROR_CODE_INTERNAL`
+// and may leave part of the batch removed. An entry the tree gave up on under
+// load, heavy concurrent change on the handle or a store asking it to slow down,
+// reports `LORE_ERROR_CODE_SLOW_DOWN` instead, which a caller can retry. The batch
+// reports `LORE_ERROR_CODE_SLOW_DOWN` where every failed entry did.
 //
 // A node the loaded revision holds is **staged** for deletion and stays in the
 // tree: it keeps its name and its place among its siblings, still lists through
 // `lore_revision_tree_list_children`, and reports
 // `LORE_NODE_STAGED_ACTION_DELETE` in its `staged_action`. The commit that
 // freezes the tree is what drops it. A node added through this handle is in no
-// revision yet, so it is discarded outright instead, freeing its name and its
-// node id. A link is removed as one node — its subtree belongs to the linked
-// repository's tree.
+// revision yet, so it leaves the tree outright instead: it stops being listed,
+// `lore_revision_tree_node_info` answers for it as for a freed id, and the next
+// commit that goes ahead frees its node id. A link is removed as one node — its
+// subtree belongs to the linked repository's tree.
 //
 // A staged deletion is reversible: `lore_revision_tree_add` of the same name
 // under the same parent with the same kind restores the node. A zero
 // `address.context` on that add preserves the node's `file_id`; supplying one
 // replaces it, as on `lore_revision_tree_modify`. Only the named node comes back
 // — restoring a directory leaves its children staged for deletion, so each has to
-// be added back in turn. A discarded node is not restorable, since its id is
-// gone.
+// be added back in turn. An added node that left the tree is not restorable:
+// adding its name again creates a new node.
 //
-// Staging fans out one depth level at a time; discarding an added node rewrites
-// sibling pointers and so runs serially, deepest first. Memory while the call
-// runs is proportional to the widest level of the subtrees being removed rather
-// than to the entry count, since a level is collected before it is staged. The
-// root cannot be deleted, and an entry whose ancestor another entry deletes is
-// rejected rather than removed twice.
+// Staging fans out one depth level at a time over at most one task per
+// processor. Each added subtree is checked whole, then detached from its
+// directory in one step; detaches from one directory run one after another. An
+// added subtree holding a live node the loaded revision holds, moved there, fails
+// its entry with nothing detached. Memory while the call runs is proportional to
+// the entry count times the tasks the work spreads over, plus two adjacent depth
+// levels of the tracked subtrees being removed, plus one record per added subtree
+// root found. Entries report in entry order once the whole batch has been walked.
+// The root cannot be deleted, and an entry whose ancestor another entry deletes
+// is rejected rather than removed twice.
+//
+// A delete or move call waits for any other delete or move call on the same handle
+// to finish, so they apply one after the other, each checking its entries against
+// the tree the one before left.
 //
 // | Terminal event                              | Payload                                           | Notes                                                    |
 // |---------------------------------------------|---------------------------------------------------|----------------------------------------------------------|
@@ -12910,8 +13068,11 @@ void lore_revision_tree_delete_async(const struct lore_global_args_t *globals,
 // revision tree. Every entry is checked before any node is rewritten, so one bad
 // entry rejects the call and leaves every target untouched; the reason names the
 // offending entry's batch index, which a caller leaving `entry_id` at zero has no
-// other way to identify. A failure after those checks pass is internal and may
-// leave part of the batch rewritten.
+// other way to identify. A failure after those checks pass reports
+// `LORE_ERROR_CODE_INTERNAL` and may leave part of the batch rewritten. An entry
+// the tree gave up on under load, a store asking it to slow down, reports
+// `LORE_ERROR_CODE_SLOW_DOWN` instead, which a caller can retry. The batch reports
+// `LORE_ERROR_CODE_SLOW_DOWN` where every failed entry did.
 //
 // Only a file is modifiable: a directory's size and address are derived at
 // commit and a link's address is its target. A zero `address.context` preserves
@@ -12938,7 +13099,11 @@ void lore_revision_tree_modify_async(const struct lore_global_args_t *globals,
 // before any node is moved, so one bad entry rejects the call and leaves every node
 // where it was; the reason names the offending entry's batch index, which a caller
 // leaving `entry_id` at zero has no other way to identify. A failure after those checks
-// pass is internal and may leave earlier entries applied.
+// pass reports `LORE_ERROR_CODE_INTERNAL` and may leave earlier entries applied. An entry
+// the tree gave up on under load, in its checks or after, reports
+// `LORE_ERROR_CODE_SLOW_DOWN` instead. The load is heavy concurrent change on the handle,
+// or a store asking the tree to slow down, and a caller can retry. The batch reports
+// `LORE_ERROR_CODE_SLOW_DOWN` where every failed entry did.
 //
 // A move keeps the node: its node id, its `file_id` and its children come along, and
 // the change is recorded as a move rather than as a deletion and an addition, so the
@@ -12960,10 +13125,9 @@ void lore_revision_tree_modify_async(const struct lore_global_args_t *globals,
 //
 // Entries apply one at a time, in batch order, because a move rewrites the parent and
 // sibling pointers of two child chains where `lore_revision_tree_add` only prepends to
-// one. For the same reason concurrent calls have more to lose here than on `add` or
-// `modify`: two calls moving nodes that share a parent chain can interleave their
-// unlinks, which the pre-commit validator then refuses. Moves that may touch one parent
-// chain belong in one call.
+// one. A delete or move call waits for any other delete or move call on the same handle
+// to finish, so they apply one after the other, each checking its entries against the
+// tree the one before left.
 //
 // | Terminal event                            | Payload                                          | Notes                                                       |
 // |-------------------------------------------|--------------------------------------------------|-------------------------------------------------------------|

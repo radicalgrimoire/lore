@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT
 """Shared test utility functions."""
 
+import json
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -34,8 +35,11 @@ def to_posix(path: str | Path) -> str:
     return str(path).replace("\\", "/")
 
 
-def working_tree_files(repo: "Lore", root: str = "") -> list[str]:
-    """Every file the working tree holds below `root`, repo-relative and sorted.
+def working_tree_files(
+    repo: "Lore", root: str = "", directories: bool = False
+) -> list[str]:
+    """Every file the working tree holds below `root`, and every directory where
+    `directories`, repo-relative and sorted.
 
     Lore's own directories are left out, so the result is the content a
     consumer of the working tree sees. A missing `root` holds nothing.
@@ -46,8 +50,8 @@ def working_tree_files(repo: "Lore", root: str = "") -> list[str]:
         sub_directories[:] = [
             name for name in sub_directories if name not in _LORE_DIRECTORIES
         ]
-        for file_name in file_names:
-            found.append(to_posix(Path(directory, file_name).relative_to(base)))
+        for name in file_names + (sub_directories if directories else []):
+            found.append(to_posix(Path(directory, name).relative_to(base)))
     return sorted(found)
 
 
@@ -73,6 +77,20 @@ def status_by_path(repo: "Lore", **kwargs) -> dict[str, dict]:
     return {
         e.get("path"): e for e in parse_status_json(repo.status(json=True, **kwargs))
     }
+
+
+def has_staged_anchor(repo: "Lore") -> bool:
+    """Whether `status` reports a staged revision, the state every staged or dirty mark lives in."""
+    zero_hash = "0" * 64
+    for line in repo.status(json=True, offline=True).splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        revision_staged = event.get("data", {}).get("revisionStaged", "")
+        if revision_staged and revision_staged != zero_hash:
+            return True
+    return False
 
 
 def revision_metadata_keys(repo: "Lore") -> set[str]:

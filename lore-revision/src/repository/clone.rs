@@ -72,7 +72,9 @@ use crate::repository;
 use crate::repository::FileConfig;
 use crate::repository::RepositoryConfig;
 use crate::repository::StoreConfig;
+use crate::repository::VfsType;
 use crate::repository::prefetch;
+use crate::repository::prefetch::TreePrefetch;
 use crate::revision;
 use crate::state;
 use crate::state::FileModification;
@@ -311,8 +313,12 @@ pub struct CloneOptions {
     pub ignore_existing: bool,
     /// Use direct file write
     pub direct_file_write: bool,
-    /// File containing list of files to prefetch
+    /// Access recording whose paths a virtual clone warms in the background: one
+    /// repository-relative path per line, directories ending with `/`
     pub prefetch: Option<String>,
+    /// How much of the tree a virtual clone warms in the background; `None` takes the
+    /// environment's setting ([`prefetch::plan`])
+    pub tree_prefetch: Option<TreePrefetch>,
     /// Whether to use the shared store and options configuring it if desired
     pub shared_store_options: Option<SharedStoreToUseConfig>,
     /// Whether to use VFS
@@ -377,8 +383,10 @@ struct BlockDiscoverItem {
     depth: u32,
     /// Cycle detector state, carried across block boundaries.
     cycle: SiblingCycleGuard,
-    /// Whether any child has been visited, carried across block boundaries.
-    visited_child: bool,
+    /// Whether any child the view itself includes has been visited, carried across block
+    /// boundaries. Content below such a child creates the directory; with none, the walk creates
+    /// a directory the view includes itself.
+    kept_child: bool,
 }
 
 impl BlockDiscoverItem {
@@ -400,7 +408,7 @@ impl BlockDiscoverItem {
             follow_deps: false,
             depth: depth.saturating_add(1),
             cycle: SiblingCycleGuard::new(parent),
-            visited_child: false,
+            kept_child: false,
         }
     }
 }
@@ -678,7 +686,7 @@ async fn process_block_item(
     let mut current_node_id = item.node_id;
     let expected_parent = item.expected_parent;
     let mut cycle = item.cycle;
-    let mut visited_child = item.visited_child;
+    let mut kept_child = item.kept_child;
 
     loop {
         let node_index = Node::index(current_node_id);
@@ -707,7 +715,7 @@ async fn process_block_item(
                 FilterMode::View,
             );
             if !excluded {
-                visited_child = true;
+                kept_child |= !node_states.excluded(FilterMode::View);
                 match &dispatcher.walk {
                     Walk::Warm(warm) => {
                         warm.directories.fetch_add(1, Ordering::Relaxed);
@@ -774,7 +782,8 @@ async fn process_block_item(
                     }
                     Walk::Clone(clone) if node.is_directory() => {
                         let dry_run = execution_context().globals().dry_run();
-                        if dry_run {
+                        let kept = !node_states.excluded(FilterMode::View);
+                        if dry_run && kept {
                             lore_info!("{}", node_path);
                         }
 
@@ -786,7 +795,7 @@ async fn process_block_item(
                                 node_states,
                                 item.depth,
                             ));
-                        } else if !dry_run {
+                        } else if !dry_run && kept {
                             create_empty_directory::<CloneError>(&clone.operation, &node_path)
                                 .await?;
                         }
@@ -813,14 +822,15 @@ async fn process_block_item(
                     follow_deps: false,
                     depth: item.depth,
                     cycle,
-                    visited_child,
+                    kept_child,
                 });
                 break;
             }
             None => {
                 if let Walk::Clone(clone) = &dispatcher.walk
-                    && !visited_child
+                    && !kept_child
                     && !item.repository_path.is_empty()
+                    && !item.states.excluded(FilterMode::View)
                     && !execution_context().globals().dry_run()
                 {
                     create_empty_directory::<CloneError>(&clone.operation, &item.repository_path)
@@ -950,7 +960,7 @@ async fn process_block_item_dependency(
                 follow_deps: dep_ctx.recursive,
                 depth: item.depth + 1,
                 cycle: SiblingCycleGuard::new(INVALID_NODE),
-                visited_child: false,
+                kept_child: false,
             });
         }
     }
@@ -962,21 +972,21 @@ async fn process_block_item_dependency(
 #[derive(Default, Debug)]
 pub struct CloneLayer {
     /// Repository name or ID
-    pub module: String,
-    /// Path in module
-    pub module_path: String,
+    pub repository: String,
+    /// Path in the layer repository
+    pub source_path: String,
     /// Path in current repository
-    pub layer_path: String,
+    pub mount_path: String,
     /// Metadata to use to link layer revisions
     pub metadata: Option<String>,
 }
 
 pub struct VirtualLayer {
-    pub module: Arc<RepositoryContext>,
-    /// Path in module
-    pub module_path: RelativePath,
+    pub repository: Arc<RepositoryContext>,
+    /// Path in the layer repository
+    pub source_path: RelativePath,
     /// Path in current repository
-    pub layer_path: RelativePath,
+    pub mount_path: RelativePath,
     /// Revision
     pub state: Arc<State>,
 }
@@ -994,23 +1004,32 @@ pub async fn clone(
     let context = execution_context();
     let call = context.globals();
 
-    // An SWFS clone mounts the repository, and a mount cannot be removed again.
-    if call.dry_run()
-        && options
-            .vfs_options
-            .as_ref()
-            .is_some_and(|vfs| vfs.vfs_type.is_swfs())
-    {
+    let vfs = options
+        .vfs_options
+        .as_ref()
+        .map_or(VfsType::None, |vfs| vfs.vfs_type);
+    let swfs = vfs == VfsType::Swfs;
+    // A VFS clone mounts the repository, and a mount cannot be removed again.
+    if call.dry_run() && vfs.is_virtual() {
+        let kind = if swfs { "an SWFS" } else { "a FUSE" };
         return Err(CloneError::from(InvalidArguments {
-            reason: "--dry-run is not supported for an SWFS clone".to_string(),
+            reason: format!("--dry-run is not supported for {kind} clone"),
         }));
     }
+    repository::refuse_nesting_in_swfs_mount(path)?;
+    if swfs {
+        repository::refuse_swfs_nested_in_repository(path)?;
+        repository::refuse_swfs_past_mount_limit()?;
+    }
+
+    // Read before anything below can create the path, so cleanup only removes what this call created.
+    let mount_point_preexisted = path.exists();
 
     let existing_dot_dir = get_dot_lore_path(path)?;
     if existing_dot_dir.exists() {
         let existing_repository_is_swfs =
             load_repository_config_from_dot_dir(existing_dot_dir.as_path())
-                .is_ok_and(|config| config.is_swfs());
+                .is_ok_and(|config| config.vfs_type() == VfsType::Swfs);
         if call.force() && !existing_repository_is_swfs {
             // A dry run could not set up the clone without replacing the repository it would
             // only report on, and a repository it removed cannot be restored afterwards.
@@ -1075,10 +1094,12 @@ pub async fn clone(
         store: Some(StoreConfig::client_default()),
         file: Some(FileConfig::default()),
         vfs: options.vfs_options.clone(),
+        sync: None,
     };
     repository_config
         .validate()
         .forward::<CloneError>("Error validating repository config")?;
+    let is_fuse = repository_config.vfs_type() == VfsType::Fuse;
 
     let repository_metadata = {
         // Dummy repository context just to be able to load the repository
@@ -1140,7 +1161,7 @@ pub async fn clone(
     };
 
     let local_init_fut = async move {
-        let created = repository::create_local(
+        let created = match repository::create_local(
             path,
             &write_token,
             repository_id,
@@ -1150,7 +1171,12 @@ pub async fn clone(
             no_tracking,
         )
         .await
-        .forward::<CloneError>("Failed to initialize repository on disk")?;
+        .forward::<CloneError>("Failed to initialize repository on disk")
+        {
+            Ok(repository) => repository,
+            Err(error) => return (None, Err(error)),
+        };
+        let instance_id = created.instance_id;
         lore_debug!("Initialized repository on disk in {}", path.display());
 
         // Share the outer write token to whichever context we load. The Client
@@ -1168,12 +1194,24 @@ pub async fn clone(
         // Kept until the loaded context has claimed the stores, so it joins the created
         // context's claims and finds the stores current rather than reading them again.
         drop(created);
-        loaded
+        (Some(instance_id), loaded)
     };
 
-    let (repository, prefetched_branch) = tokio::try_join!(local_init_fut, prefetch_branch_fut)?;
+    // Not `try_join!`: a prefetch failure must not drop the instance id of a mount to undo.
+    let ((created_instance_id, local_result), prefetch_result) =
+        tokio::join!(local_init_fut, prefetch_branch_fut);
 
-    clone_into(
+    if let Some(instance_id) = created_instance_id
+        && (local_result.is_err() || prefetch_result.is_err())
+    {
+        abandon_failed_fuse_clone(path, is_fuse, mount_point_preexisted, instance_id).await;
+    }
+
+    let repository = local_result?;
+    let instance_id = repository.instance_id;
+    let prefetched_branch = prefetch_result?;
+
+    let result = clone_into(
         repository,
         remote,
         repository_metadata,
@@ -1186,7 +1224,45 @@ pub async fn clone(
         &mut repository_path_guard,
         &mut dot_directory_guard,
     )
-    .await
+    .await;
+
+    if result.is_err() {
+        abandon_failed_fuse_clone(path, is_fuse, mount_point_preexisted, instance_id).await;
+    }
+
+    result
+}
+
+/// Undoes a FUSE clone's mount after a failure past a successful `create_local`. A no-op off
+/// Linux and when `is_fuse` is false; best-effort otherwise, logged and never allowed to shadow
+/// the original failure it is cleaning up after.
+#[cfg_attr(not(target_os = "linux"), allow(clippy::unused_async))]
+async fn abandon_failed_fuse_clone(
+    path: &Path,
+    is_fuse: bool,
+    mount_point_preexisted: bool,
+    instance_id: InstanceId,
+) {
+    #[cfg(target_os = "linux")]
+    {
+        if is_fuse
+            && let Some(mount_manager) =
+                crate::fs::mount_manager_state::MountManagerState::mount_manager()
+            && let Err(error) = mount_manager
+                .fuse()
+                .abandon_clone(path, instance_id, !mount_point_preexisted)
+                .await
+        {
+            lore_warn!(
+                "Failed to undo FUSE clone mount at {}: {error}",
+                path.display()
+            );
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (path, is_fuse, mount_point_preexisted, instance_id);
+    }
 }
 
 /// Completes [`clone`] once the repository exists locally and its branch is fetched: applies the
@@ -1311,20 +1387,20 @@ async fn clone_into(
                 .await
                 .forward::<CloneError>("Failed to resolve given layer repository")?;
             let response = repository_service
-                .query(None, Some(layer.module.as_str()))
+                .query(None, Some(layer.repository.as_str()))
                 .await
                 .forward::<CloneError>("Failed to resolve given layer repository")?;
             response.id
         };
         lore_info!(
             "Resolved layer repository: {} -> {}",
-            layer.module,
+            layer.repository,
             repository_id
         );
 
         lore_info!("Resolving layer revisions");
-        let module = repository.to_layer_context(repository_id).await;
-        let layer_latest = layer::latest_revision(module.clone(), branch_id)
+        let layer_repository = repository.to_layer_context(repository_id).await;
+        let layer_latest = layer::latest_revision(layer_repository.clone(), branch_id)
             .await
             .forward::<CloneError>("Failed to get layer latest revision")?;
         let state_target = state::State::deserialize(repository.clone(), revision)
@@ -1332,7 +1408,7 @@ async fn clone_into(
             .forward::<CloneError>("Failed to load revision state")?;
         let (layer_revision, main_revision) = layer::find_revision_match(
             repository.clone(),
-            module.clone(),
+            layer_repository.clone(),
             branch_id,
             state_target.clone(),
             layer_latest,
@@ -1497,8 +1573,11 @@ fn refuse_on_held_state(
     Err(hold::refused("restrict a clone to a dependency set").into())
 }
 
-/// Hands `ctx.state` to the operation to hold ([`InstanceOperationImpl::hold_state`]), for a
-/// provider that holds its state in a `State` ([`InstanceOperationImpl::holds_state`]).
+/// The short-circuit `clone_materialize` takes when the provider holds its state in a `State`
+/// ([`InstanceOperationImpl::holds_state`]): hands it `ctx.state` to hold
+/// ([`InstanceOperationImpl::hold_state`]) instead of walking a tree that does not exist, then
+/// starts the background prefetch that `ctx.options` asks for and returns without waiting for
+/// it. The provider loads whatever the prefetch has not yet warmed on demand.
 ///
 /// A bare clone, or one of an empty repository, hands it nothing, as either writes no tree, and
 /// so does a dry run.
@@ -1517,7 +1596,24 @@ async fn clone_materialize_hold(ctx: &CloneContext) -> Result<(), CloneError> {
             HoldOptions::default(),
         )
         .await
-        .forward::<CloneError>("Holding the cloned revision")
+        .forward::<CloneError>("Holding the cloned revision")?;
+    let plan = prefetch::plan(ctx.options.tree_prefetch, ctx.options.prefetch.as_deref()).await;
+    if !plan.is_empty() {
+        ctx.operation.start_prefetch(plan);
+    }
+    Ok(())
+}
+
+/// Caches `state`'s own records, and with `file_metadata` its file metadata blocks, in a task of
+/// its own ([`State::cache_fragments`]).
+fn spawn_fragment_cache(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    file_metadata: bool,
+) -> tokio::task::JoinHandle<Result<(), crate::state::StateError>> {
+    let repository = repository.clone();
+    let state = state.clone();
+    lore_spawn!(async move { state.cache_fragments(repository, file_metadata).await })
 }
 
 /// Materializes `revision` in the working tree and records it, and `branch_id`, as the instance's
@@ -1541,6 +1637,16 @@ async fn clone_materialize(
 
     if ctx.operation.holds_state() {
         clone_materialize_hold(&ctx).await?;
+        // The tree loads on demand, but the state's own records, and the file metadata blocks
+        // where asked, are made local as an ordinary clone makes them, so the state reads and
+        // commits offline.
+        if !options.bare && !revision.is_zero() {
+            cache_task = Some(spawn_fragment_cache(
+                &repository,
+                &state,
+                options.cache_file_metadata,
+            ));
+        }
     } else if !options.bare && !revision.is_zero() {
         lore_info!("Pull state {revision}");
         let correlation_id = execution_context().globals().correlation_id.to_string();
@@ -1565,14 +1671,11 @@ async fn clone_materialize(
             }
         }));
 
-        let cache_repository = repository.clone();
-        let cache_state = state.clone();
-        let cache_file_metadata = options.cache_file_metadata;
-        cache_task = Some(lore_spawn!(async move {
-            cache_state
-                .cache_fragments(cache_repository, cache_file_metadata)
-                .await
-        }));
+        cache_task = Some(spawn_fragment_cache(
+            &repository,
+            &state,
+            options.cache_file_metadata,
+        ));
 
         clone_result = clone_in_path(ctx).await;
     }
@@ -1685,7 +1788,7 @@ async fn clone_in_path(ctx: CloneContext) -> Result<(), CloneError> {
                 follow_deps: true,
                 depth: 0,
                 cycle: SiblingCycleGuard::new(INVALID_NODE),
-                visited_child: false,
+                kept_child: false,
             });
         }
 
@@ -2342,9 +2445,14 @@ async fn spawn_clone_directory(
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let future = async move {
-        if !execution_context().globals().dry_run() {
-            let result = ctx.operation.create_dir_all(&repository_path).await;
-            if result.is_err()
+        if !states.excluded(FilterMode::View) {
+            if execution_context().globals().dry_run() {
+                lore_info!("{}", repository_path);
+            } else if ctx
+                .operation
+                .create_dir_all(&repository_path)
+                .await
+                .is_err()
                 && !ctx
                     .operation
                     .file_info(&repository_path)
@@ -2358,8 +2466,6 @@ async fn spawn_clone_directory(
                     "Failed to create directory {repository_path}"
                 )));
             }
-        } else {
-            lore_info!("{}", repository_path);
         }
 
         let result = clone_child_node(ctx, storage, repository_path, node, states).await;

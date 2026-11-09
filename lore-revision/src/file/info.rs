@@ -174,9 +174,11 @@ pub async fn info(
             execution_context().globals().search_location(),
         )
         .await
-        .map_err(|_err| {
-            InfoError::from(RevisionNotFound {
-                revision: revision_spec,
+        .map_err(|err| {
+            forward_refusal_or(err, "resolving the revision", |_err| {
+                InfoError::from(RevisionNotFound {
+                    revision: revision_spec,
+                })
             })
         })?
     } else {
@@ -239,26 +241,32 @@ async fn info_path(
     local: bool,
     filtered: bool,
 ) -> Result<(), InfoError> {
-    if let Ok(node_link) = state_current
-        .find_node_link(repository.clone(), path.as_str())
-        .await
-    {
+    if let Some(node_link) = absent_unless_refused::<_, _, InfoError>(
+        state_current
+            .find_node_link(repository.clone(), path.as_str())
+            .await,
+        "finding the node",
+    )? {
         // TODO(vri): UCS-19229 - Links: Handle link nodes in file info lookup
         let node_path = state_current
             .node_path(repository.clone(), node_link.node)
             .await
-            .map_err(|_err| {
-                InfoError::from(FileNotFound {
-                    resource: path.to_string(),
+            .map_err(|err| {
+                forward_refusal_or(err, "reading the node path", |_err| {
+                    InfoError::from(FileNotFound {
+                        resource: path.to_string(),
+                    })
                 })
             })?;
 
         let node = state_current
             .node(repository.clone(), node_link.node)
             .await
-            .map_err(|_err| {
-                InfoError::from(FileNotFound {
-                    resource: path.to_string(),
+            .map_err(|err| {
+                forward_refusal_or(err, "reading the node", |_err| {
+                    InfoError::from(FileNotFound {
+                        resource: path.to_string(),
+                    })
                 })
             })?;
 
@@ -294,15 +302,19 @@ async fn info_path(
 
         let mut is_deleted = false;
         if local_filtered.local_size == 0 {
-            match operation.file_info(&path).await {
-                Ok(info) if info.is_file() => {
+            let described = operation
+                .file_info(&path)
+                .await
+                .forward_any::<InfoError>("Failed to describe a file")?;
+            match described {
+                info if info.is_file() => {
                     let (comparison, local_hash) =
                         compare_to_node(&operation, &repository, &node, info.size(), &path).await?;
                     local_filtered.local_size = info.size();
                     local_filtered.local_hash = local_hash;
                     local_filtered.comparison = Some(comparison);
                 }
-                Ok(info) if info.exists() => {}
+                info if info.exists() => {}
                 _ => is_deleted = true,
             }
         }
@@ -363,7 +375,7 @@ async fn info_path(
         let info = operation
             .file_info(&path)
             .await
-            .unwrap_or(FileInfo::NotExist);
+            .forward_any::<InfoError>("Failed to describe a path")?;
         if info.exists() {
             event::LoreEvent::FileInfo(LoreFileInfoEventData {
                 path: path.into(),
@@ -477,7 +489,7 @@ async fn calculate_local_filtered_size_hash(
         let info = operation
             .file_info(&relative_path)
             .await
-            .unwrap_or(FileInfo::NotExist);
+            .forward_any::<InfoError>("Failed to describe a file")?;
         if !info.is_file() {
             return Ok(LocalFiltered {
                 filtered_size: node.size,
@@ -510,7 +522,7 @@ async fn calculate_local_filtered_size_hash(
                 let local_info = local_size_operation
                     .file_info(&local_size_relative_path)
                     .await
-                    .unwrap_or(FileInfo::NotExist);
+                    .forward_any::<InfoError>("Failed to describe a path")?;
                 calculate_local_size_recurse(
                     local_size_operation,
                     local_size_repository,
@@ -760,11 +772,17 @@ fn calculate_filtered_size_recurse(
             let repository = repository.clone();
             let state = state.clone();
             let relative_path = relative_path.clone();
-            let Ok(child_node) = state.node(repository.clone(), child).await else {
-                failure = Some(InfoError::internal(
-                    "Failed to calculate filtered size, encountered an invalid node",
-                ));
-                break;
+            let child_node = match state.node(repository.clone(), child).await {
+                Ok(child_node) => child_node,
+                Err(err) => {
+                    failure = Some(forward_refusal_or(err, "reading a node block", |err| {
+                        InfoError::internal_with_context(
+                            err,
+                            "Failed to calculate filtered size, encountered an invalid node",
+                        )
+                    }));
+                    break;
+                }
             };
             if let Err(err) = child_node
                 .walk_step(child, node_id, &mut cycle)

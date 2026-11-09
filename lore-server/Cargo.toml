@@ -30,6 +30,7 @@ parking_lot = { workspace = true }
 pin-project = { workspace = true }
 prost-types = { workspace = true }
 quinn = { workspace = true }
+quinn-proto = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
 ring = { workspace = true }
@@ -83,6 +84,7 @@ tonic-prost-build = { workspace = true }
 # The unit-test binary's store policies, set before the harness starts; see tests/unit/main.rs.
 ctor = { workspace = true }
 lore-base = { workspace = true, features = ["test-util"] }
+lore-credential = { workspace = true }
 axum-test = { version = "18.1.0", default-features = false }
 rcgen = { workspace = true }
 http-body = "1.0.1"
@@ -91,6 +93,8 @@ indexmap = { workspace = true }
 mockall = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 temp-env = { workspace = true }
+# `start_paused` for the tests that time push phases on a virtual clock.
+tokio = { workspace = true, features = ["test-util"] }
 lore-server = { workspace = true, features = ["test-util"] }
 
 [features]

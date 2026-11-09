@@ -19,6 +19,7 @@ from pathlib import Path
 from time import sleep
 from typing import TypedDict, Unpack, overload
 
+from cleanup_util import lore_mount_instance
 from error_types import (
     ServerConnectionError,
     UnknownLoreError,
@@ -40,6 +41,7 @@ from lore_parsers import (
     parse_branch_info,
     parse_branch_list,
     parse_file_info,
+    parse_jsonl,
     parse_lock_acquire,
     parse_lock_query,
     parse_lock_release,
@@ -48,10 +50,17 @@ from lore_parsers import (
     parse_revision_list,
     parse_shared_store_info,
     parse_shared_store_list,
+    parse_status_json,
 )
-from service_util import name_service_executable
+from service_util import LORE_TEST_VFS_VAR, name_service_executable
 
 logger = logging.getLogger(__name__)
+
+
+def run_vfs(vfs: str | None) -> str | None:
+    """`vfs`, or the VFS `LORE_TEST_VFS` names for the run where the test names
+    none."""
+    return vfs or os.environ.get(LORE_TEST_VFS_VAR) or None
 
 
 def lore_test_env(global_dir: str) -> dict[str, str]:
@@ -72,6 +81,11 @@ def lore_test_env(global_dir: str) -> dict[str, str]:
     # developer or CI already exports would win and the command would read
     # that store.
     env["LORE_AUTH_PATH"] = global_dir
+    # Keep the token store's key in that directory as well, as the Rust tests
+    # do, rather than in the OS keyring: a headless run started over ssh holds a
+    # session keyring that is revoked when the login ends, and a live keyring
+    # would share one key across every test.
+    env["LORE_AUTH_STORE"] = "fallback"
     return env
 
 
@@ -245,7 +259,15 @@ class Lore:
         return ".lore"
 
     def dot_path(self) -> str:
-        """Return the full path to the repository metadata directory."""
+        """Return the full path to the repository metadata directory.
+
+        A virtual clone keeps it outside its mount, in the external directory the
+        global data directory holds for its instance, which is where Lore finds it
+        through the mount table."""
+        instance = lore_mount_instance(self.path)
+        if instance is not None:
+            global_dir = self.sandboxed_env()["LORE_GLOBAL_PATH"]
+            return os.path.join(global_dir, "data", "external", instance, ".lore")
         return os.path.join(self.path, self.dot_dir())
 
     def ignore_file(self) -> str:
@@ -416,7 +438,9 @@ class Lore:
                     sleep(attempt)
                     if attempt < max_attempts:
                         continue
-                raise error_type(f"Command: {command_string}\n{output}") from None
+                error = error_type(f"Command: {command_string}\n{output}")
+                error.returncode = e.returncode
+                raise error from None
             except Exception as e:
                 logger.critical(f"Unknown error: {e}")
                 raise UnknownLoreError(str(e)) from None
@@ -445,6 +469,20 @@ class Lore:
     def repository_list(self, url: str | None = None, **kwargs: Unpack[GlobalOptions]):
         return self.run(["repository", "list"] + ([url] if url else []), **kwargs)
 
+    def _own_shared_store(
+        self, asked_vfs: str | None, vfs: str | None, repo_path: str
+    ) -> str | None:
+        """A shared store of its own, beside `repo_path`, for a repository that
+        `LORE_TEST_VFS` makes virtual where the test asked for no shared store, or
+        `None` for any other. A virtual clone always uses a shared store, and one
+        of its own keeps the repository apart from the test's others, as the store
+        in its own `.lore` did: a branch it commits to doesn't advance in theirs."""
+        if asked_vfs or vfs in (None, "none"):
+            return None
+        store = f"{repo_path}.store"
+        self.created_paths.append(store)
+        return store
+
     def repository_create(
         self,
         remote_path: str | None = None,
@@ -455,6 +493,10 @@ class Lore:
         shared_store_path: str | None = None,
         **kwargs: Unpack[GlobalOptions],
     ):
+        asked_vfs = vfs
+        vfs = run_vfs(vfs)
+        if not (use_shared_store or shared_store_path):
+            shared_store_path = self._own_shared_store(asked_vfs, vfs, self.path)
         output = self.run(
             ["repository", "create", remote_path if remote_path else self.remote_path]
             + (["--description", description] if description else [])
@@ -541,6 +583,32 @@ class Lore:
 
     def repository_gc(self, **kwargs: Unpack[GlobalOptions]):
         return self.run(["repository", "gc"], **kwargs)
+
+    def repository_instance_list(self, **kwargs: Unpack[GlobalOptions]):
+        return self.run(["repository", "instance", "list"], **kwargs)
+
+    def repository_instance_prune(self, **kwargs: Unpack[GlobalOptions]):
+        return self.run(["repository", "instance", "prune"], **kwargs)
+
+    def repository_instance_delete(
+        self, dry_run: bool = False, **kwargs: Unpack[GlobalOptions]
+    ):
+        return self.run(
+            ["repository", "instance", "delete"] + (["--dry-run"] if dry_run else []),
+            **kwargs,
+        )
+
+    def repository_instance_move(
+        self,
+        target_path: str,
+        dry_run: bool = False,
+        **kwargs: Unpack[GlobalOptions],
+    ):
+        return self.run(
+            ["repository", "instance", "move", target_path]
+            + (["--dry-run"] if dry_run else []),
+            **kwargs,
+        )
 
     def repository_store(self, **kwargs: Unpack[GlobalOptions]):
         return self.run(["repository", "store"], **kwargs)
@@ -1770,6 +1838,13 @@ class Lore:
             **kwargs,
         )
 
+    def auth_user_token_event(self) -> dict:
+        """The data of the one `authUserToken` event `auth info` emits for the
+        current user."""
+        output = self.run(["auth", "info", "--with-identity-token"], json=True)
+        [data] = parse_jsonl(output, "authUserToken")
+        return data
+
     def _capi_driver_output(
         self, library_path: str, command: str, *args: str
     ) -> tuple[int, str]:
@@ -2083,6 +2158,10 @@ class Lore:
         no_tracking: bool = False,
         **kwargs: Unpack[GlobalOptions],
     ):
+        asked_vfs = vfs
+        # A bare, untracked or dry-run clone has no virtual form, so it stays as asked.
+        if not (bare or no_tracking or kwargs.get("dry_run")):
+            vfs = run_vfs(vfs)
         new_repo_name = name if name else self.generate_random_name()
         if path is None:
             parent = Path(self.path).parent
@@ -2092,6 +2171,10 @@ class Lore:
         # Recorded before the directory exists, so a clone that fails partway
         # through still has its half-written tree removed with the test.
         self.created_paths.append(str(new_repo_path))
+        if not (use_shared_store or shared_store_path):
+            shared_store_path = self._own_shared_store(
+                asked_vfs, vfs, str(new_repo_path)
+            )
         if not kwargs.get("dry_run") and vfs != "swfs":
             new_repo_path.mkdir(exist_ok=True)
         root_file_args = []
@@ -2757,9 +2840,17 @@ class Lore:
     def clear_local_files(self):
         """
         Remove all local repository files for this repository
+
+        A virtual clone's files and `.lore` are the service's, so its instance is
+        deleted, which unmounts it, before the mount point goes. The delete runs
+        from outside the mount, which a working directory inside would hold busy.
         """
         import shutil
 
+        if lore_mount_instance(self.path) is not None:
+            self.repository_instance_delete(
+                cwd=os.path.dirname(os.path.realpath(self.path))
+            )
         shutil.rmtree(self.path, ignore_errors=True)
 
     def make_dirs(self, path):
@@ -2778,7 +2869,7 @@ class Lore:
     def list_paths(self, prefix: Path | None = None) -> list[Path]:
         if prefix is None:
             prefix = Path()
-        if prefix == Path(".lore"):
+        if prefix == Path(self.dot_dir()):
             return []
         path = pathlib.Path(self.path)
         prefixed_path = path / prefix
@@ -2787,6 +2878,22 @@ class Lore:
             for child in prefixed_path.iterdir():
                 result.extend(self.list_paths(child.relative_to(path)))
         return result
+
+    def read_files(self) -> dict[str, str]:
+        """The text of every file the working tree holds, by path."""
+        return {
+            path.as_posix(): pathlib.Path(self.path, path).read_text()
+            for path in self.list_paths()
+            if self.file_exists(path)
+        }
+
+    def unresolved_paths(self, **kwargs: Unpack[GlobalOptions]) -> set[str]:
+        """The paths of the merge conflicts not yet resolved."""
+        return {
+            e["path"]
+            for e in parse_status_json(self.status(json=True, **kwargs))
+            if e.get("flagConflictUnresolved")
+        }
 
     @staticmethod
     def generate_random_name(base=""):

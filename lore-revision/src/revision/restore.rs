@@ -225,7 +225,10 @@ pub(crate) async fn restore(
         .await
         .forward::<RestoreError>("loading current anchor")?;
 
-    let remote_head = if let Ok(remote) = repository.remote().await {
+    let remote_head = if let Some(remote) = absent_unless_refused::<_, _, RestoreError>(
+        repository.remote().await,
+        "connecting to the remote",
+    )? {
         branch::load_remote(remote.clone(), repository.id, current_branch)
             .await
             .forward::<RestoreError>("loading remote head")?
@@ -522,7 +525,7 @@ pub(crate) async fn restore(
             execution_context().push_stats(),
         )
         .await
-        .forward::<RestoreError>("querying missing fragments from server")?;
+        .forward_any::<RestoreError>("querying missing fragments from server")?;
 
         let mut push_task = lore_spawn!({
             let repository = repository.clone();
@@ -544,7 +547,7 @@ pub(crate) async fn restore(
                 }
             }
         };
-        result.forward::<RestoreError>("pushing fragments to remote")?;
+        result.forward_any::<RestoreError>("pushing fragments to remote")?;
 
         LoreEvent::RevisionRestoreFragmentEnd(LoreRevisionRestoreFragmentEndEventData {
             fragments: stats.complete(),

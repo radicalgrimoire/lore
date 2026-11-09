@@ -29,6 +29,7 @@ use lore_storage::options::ReadOptions;
 use lore_storage::read::*;
 use lore_storage::store_types::PayloadRead;
 use lore_storage::write::try_acquire_in_flight;
+use lore_transport::ProtocolError;
 use lore_transport::StorageSession;
 
 async fn make_test_store() -> (TempDir, Arc<dyn ImmutableStore>) {
@@ -1690,6 +1691,224 @@ async fn a_failed_defragment_leaves_no_temporary_file() {
     assert!(
         leftovers.is_empty(),
         "temporary files left behind: {leftovers:?}"
+    );
+}
+
+/// The four shapes a file read writes: one fragment, the empty content, a list staged beside the
+/// target, and a list written in place. Each is a name, an address, the content it reads to, and
+/// `direct_write`.
+async fn file_read_shapes(
+    store: &Arc<dyn ImmutableStore>,
+    partition: Partition,
+    context: Context,
+) -> [(&'static str, Address, Vec<u8>, bool); 4] {
+    let whole = Bytes::from((0u8..=255).collect::<Vec<u8>>());
+    let whole_address = put_whole(store, partition, context, &whole).await;
+    let (list_address, list_content) = put_two_leaf_list(store, partition, context).await;
+    let empty = Address {
+        hash: Hash::default(),
+        context,
+    };
+    [
+        ("whole", whole_address, whole.to_vec(), false),
+        ("empty", empty, Vec::new(), false),
+        ("staged", list_address, list_content.clone(), false),
+        ("in-place", list_address, list_content, true),
+    ]
+}
+
+/// A file read asked to create its parent lands below directories that are not there, one level
+/// or several deep, and leaves no temporary file.
+#[tokio::test]
+async fn a_file_read_creating_its_parent_creates_the_missing_directories() {
+    let (_store_dir, store) = make_test_store().await;
+    let target_dir = TempDir::new("lore-storage-read-missing-parent-");
+    let partition = Partition::from([0xA2; 16]);
+    let context = Context::from([0xA2; 16]);
+
+    for (shape, address, content, direct_write) in
+        file_read_shapes(&store, partition, context).await
+    {
+        for parent in ["one", "two/levels/deep"] {
+            let directory = PathBuf::from(target_dir.as_ref()).join(shape).join(parent);
+            let target = directory.join("content.bin");
+            let options = ReadOptions {
+                direct_write,
+                ..no_remote().creating_parent()
+            };
+            read_into_file(
+                store.clone(),
+                partition,
+                address,
+                target.as_path(),
+                ".~loretemp",
+                None,
+                options,
+                None,
+            )
+            .await
+            .unwrap_or_else(|err| panic!("{shape} below {parent}: {err}"));
+
+            assert_eq!(
+                std::fs::read(&target).expect("read the target"),
+                content,
+                "{shape} below {parent} holds the content"
+            );
+            let names: Vec<_> = std::fs::read_dir(&directory)
+                .expect("list the created directory")
+                .map(|entry| entry.expect("an entry").file_name())
+                .collect();
+            assert_eq!(
+                names,
+                ["content.bin"],
+                "{shape} below {parent} leaves no temporary file"
+            );
+        }
+    }
+}
+
+/// A file read asked to create its parent below a file, over which no directory can be created,
+/// fails at once rather than retrying, and leaves the file as it was.
+#[tokio::test]
+async fn a_file_read_creating_its_parent_below_a_file_fails_at_once() {
+    let (_store_dir, store) = make_test_store().await;
+    let target_dir = TempDir::new("lore-storage-read-file-parent-");
+    let partition = Partition::from([0xA3; 16]);
+    let context = Context::from([0xA3; 16]);
+    let blocker = PathBuf::from(target_dir.as_ref()).join("blocker");
+    std::fs::write(&blocker, b"kept").expect("write the blocking file");
+    let target = blocker.join("content.bin");
+
+    for (shape, address, _content, direct_write) in
+        file_read_shapes(&store, partition, context).await
+    {
+        let options = ReadOptions {
+            direct_write,
+            ..no_remote().creating_parent()
+        };
+        let read = read_into_file(
+            store.clone(),
+            partition,
+            address,
+            target.as_path(),
+            ".~loretemp",
+            None,
+            options,
+            None,
+        );
+        let result = tokio::time::timeout(Duration::from_secs(5), read)
+            .await
+            .unwrap_or_else(|_| panic!("{shape} fails without waiting out the retries"));
+
+        assert!(result.is_err(), "{shape} cannot land below a file");
+        assert_eq!(
+            std::fs::read(&blocker).expect("read the blocking file"),
+            b"kept",
+            "{shape} leaves the file as it was"
+        );
+    }
+}
+
+/// A file read not asked to create its parent creates no directory: it keeps retrying the open
+/// of the missing one.
+#[tokio::test]
+async fn a_file_read_leaves_a_missing_parent_missing() {
+    let (_store_dir, store) = make_test_store().await;
+    let target_dir = TempDir::new("lore-storage-read-no-parent-");
+    let partition = Partition::from([0xA4; 16]);
+    let context = Context::from([0xA4; 16]);
+    let whole = Bytes::from_static(b"whole content");
+    let address = put_whole(&store, partition, context, &whole).await;
+    let parent = PathBuf::from(target_dir.as_ref()).join("missing");
+    let target = parent.join("content.bin");
+
+    let read = read_into_file(
+        store,
+        partition,
+        address,
+        target.as_path(),
+        ".~loretemp",
+        None,
+        no_remote(),
+        None,
+    );
+    tokio::time::timeout(Duration::from_millis(300), read)
+        .await
+        .expect_err("the read keeps retrying the open of a missing directory");
+
+    assert!(!parent.exists(), "the read created the missing directory");
+}
+
+/// Reads asked to create their parent that run at once into one missing directory each land
+/// there, whichever of them creates it, and leave no temporary file.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_file_reads_creating_one_parent_all_land() {
+    const READS: usize = 16;
+
+    let (_store_dir, store) = make_test_store().await;
+    let target_dir = TempDir::new("lore-storage-read-shared-parent-");
+    let partition = Partition::from([0xA5; 16]);
+    let context = Context::from([0xA5; 16]);
+    let whole = Bytes::from((0u8..=255).collect::<Vec<u8>>());
+    let whole_address = put_whole(&store, partition, context, &whole).await;
+    let (list_address, list_content) = put_two_leaf_list(&store, partition, context).await;
+    let directory = PathBuf::from(target_dir.as_ref())
+        .join("shared")
+        .join("parent");
+
+    let mut reads = tokio::task::JoinSet::new();
+    for index in 0..READS {
+        let (address, content) = if index % 2 == 0 {
+            (whole_address, whole.to_vec())
+        } else {
+            (list_address, list_content.clone())
+        };
+        let store = store.clone();
+        let target = directory.join(format!("content-{index}.bin"));
+        lore_base::lore_spawn!(reads, async move {
+            let read = read_into_file(
+                store,
+                partition,
+                address,
+                target.as_path(),
+                ".~loretemp",
+                None,
+                no_remote().creating_parent(),
+                None,
+            )
+            .await;
+            (target, content, read)
+        });
+    }
+    while let Some(joined) = reads.join_next().await {
+        let (target, content, read) = joined.expect("the read task completes");
+        read.unwrap_or_else(|err| panic!("{}: {err}", target.display()));
+        assert_eq!(
+            std::fs::read(&target).expect("read the target"),
+            content,
+            "{} holds the content",
+            target.display()
+        );
+    }
+
+    let mut names: Vec<String> = std::fs::read_dir(&directory)
+        .expect("list the shared directory")
+        .map(|entry| {
+            entry
+                .expect("an entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    let mut expected: Vec<String> = (0..READS)
+        .map(|index| format!("content-{index}.bin"))
+        .collect();
+    expected.sort();
+    assert_eq!(
+        names, expected,
+        "the directory holds every target and no temporary file"
     );
 }
 
@@ -4407,6 +4626,191 @@ async fn a_failing_remote_fetch_into_a_buffer_fetches_once() {
 
     assert!(read.is_err());
     assert_eq!(lore_storage::test_util::counts().0, 1, "fetches");
+}
+
+/// Whether a storage error reports a given refusal.
+type ReportsRefusal = fn(&StorageError) -> bool;
+
+/// The refusals a remote answers, each with a reason on its trace as the transport gives one, and
+/// the predicate a storage error reporting it meets.
+fn refusals() -> [(ProtocolError, ReportsRefusal); 2] {
+    use lore_error_set::ErrorSet;
+    let with_reason = |mut refusal: ProtocolError| {
+        refusal.push_trace(lore_error_set::Location::with_context(
+            file!(),
+            line!(),
+            column!(),
+            Arc::from("the token expired"),
+        ));
+        refusal
+    };
+    [
+        (
+            with_reason(ProtocolError::from(lore_base::error::NotAuthorized)),
+            StorageError::is_not_authorized,
+        ),
+        (
+            with_reason(ProtocolError::from(lore_base::error::NotAuthenticated)),
+            StorageError::is_not_authenticated,
+        ),
+    ]
+}
+
+/// A session that answers every resolution with `error`, and the count of its resolutions. A
+/// failed resolution is held until the session is invalidated, so each resolution after the first
+/// is a request made on a fresh session.
+fn failing_session(error: ProtocolError) -> (Arc<StorageSession>, Arc<AtomicU64>) {
+    let resolutions = Arc::new(AtomicU64::new(0));
+    let counted = resolutions.clone();
+    let session = Arc::new(StorageSession::pending(move || {
+        counted.fetch_add(1, Ordering::Relaxed);
+        let error = error.clone();
+        async move { Err(error) }
+    }));
+    (session, resolutions)
+}
+
+/// A fetch the remote refuses is retried once, at once, on a fresh session, since an expired token
+/// is refused and a fresh session can carry a fresh one, and then fails with the refusal and its
+/// trace.
+#[tokio::test(start_paused = true)]
+async fn a_refused_remote_get_is_retried_once() {
+    let (_dir, store) = make_test_store().await;
+    let (partition, address, _, _) = make_input(0xF3);
+    for (refusal, reports_refusal) in refusals() {
+        let source = refusal.trace().locations().to_vec();
+        let (session, resolutions) = failing_session(refusal);
+        let start = tokio::time::Instant::now();
+
+        let err = load_fragment(
+            store.clone(),
+            partition,
+            address,
+            ReadOptions::default(),
+            Some(session),
+        )
+        .await
+        .expect_err("the remote refuses the fetch");
+
+        assert_eq!(
+            resolutions.load(Ordering::Relaxed),
+            2,
+            "gets, failing with {err:?}"
+        );
+        assert_eq!(start.elapsed(), Duration::ZERO, "the refusal backed off");
+        assert!(reports_refusal(&err), "{err:?}");
+        assert!(err.trace().locations().starts_with(&source), "{err:?}");
+    }
+}
+
+/// A fetch failing with `NotConnected` is retried five times on a fresh session, backing off
+/// before each retry, and then fails with `NotConnected`.
+#[tokio::test(start_paused = true)]
+async fn a_not_connected_remote_get_is_retried_five_times_with_back_off() {
+    let (_dir, store) = make_test_store().await;
+    let (partition, address, _, _) = make_input(0xF5);
+    let (session, resolutions) =
+        failing_session(ProtocolError::internal("the server knows no such session"));
+    let start = tokio::time::Instant::now();
+
+    let err = load_fragment(
+        store,
+        partition,
+        address,
+        ReadOptions::default(),
+        Some(session),
+    )
+    .await
+    .expect_err("the session never resolves");
+
+    assert_eq!(
+        resolutions.load(Ordering::Relaxed),
+        6,
+        "gets, failing with {err:?}"
+    );
+    assert!(
+        start.elapsed() > Duration::ZERO,
+        "the retries did not back off"
+    );
+    assert!(err.is_not_connected(), "{err:?}");
+}
+
+/// A resolve the remote refuses is retried once, at once, on a fresh session, as a fetch is, and
+/// then fails with the refusal and its trace.
+#[tokio::test(start_paused = true)]
+async fn a_refused_remote_resolve_is_retried_once() {
+    let (dir, store) = make_test_store().await;
+    let mutable = test_mutable_store(&dir, &store).await;
+    let partition = Partition::from([0xF4; 16]);
+    let context = Context::from([0xF4; 16]);
+    let key = hash::hash_slice(b"a key the remote refuses to resolve");
+    for (refusal, reports_refusal) in refusals() {
+        let source = refusal.trace().locations().to_vec();
+        let (session, resolutions) = failing_session(refusal);
+        let start = tokio::time::Instant::now();
+
+        let Err(err) = resolve_root(
+            store.clone(),
+            mutable.clone(),
+            partition,
+            key,
+            context,
+            0,
+            ReadOptions::default(),
+            Some(session),
+        )
+        .await
+        else {
+            panic!("the remote refuses the resolve");
+        };
+
+        assert_eq!(
+            resolutions.load(Ordering::Relaxed),
+            2,
+            "resolves, failing with {err:?}"
+        );
+        assert_eq!(start.elapsed(), Duration::ZERO, "the refusal backed off");
+        assert!(reports_refusal(&err), "{err:?}");
+        assert!(err.trace().locations().starts_with(&source), "{err:?}");
+    }
+}
+
+/// A resolve failing with `NotConnected` is retried five times on a fresh session, backing off
+/// before each retry, as a fetch is, and then fails with `NotConnected`.
+#[tokio::test(start_paused = true)]
+async fn a_not_connected_remote_resolve_is_retried_five_times_with_back_off() {
+    let (dir, store) = make_test_store().await;
+    let mutable = test_mutable_store(&dir, &store).await;
+    let key = hash::hash_slice(b"a key resolved on a session the server does not know");
+    let (session, resolutions) =
+        failing_session(ProtocolError::internal("the server knows no such session"));
+    let start = tokio::time::Instant::now();
+
+    let Err(err) = resolve_root(
+        store,
+        mutable,
+        Partition::from([0xF6; 16]),
+        key,
+        Context::from([0xF6; 16]),
+        0,
+        ReadOptions::default(),
+        Some(session),
+    )
+    .await
+    else {
+        panic!("the session never resolves");
+    };
+
+    assert_eq!(
+        resolutions.load(Ordering::Relaxed),
+        6,
+        "resolves, failing with {err:?}"
+    );
+    assert!(
+        start.elapsed() > Duration::ZERO,
+        "the retries did not back off"
+    );
+    assert!(err.is_not_connected(), "{err:?}");
 }
 
 /// One fetch, one decode, one hash: the content a remote fetch verified is the content handed

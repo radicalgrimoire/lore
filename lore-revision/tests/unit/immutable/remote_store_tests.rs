@@ -1,13 +1,27 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! `RemoteImmutableStore` checking what a remote serves on receipt, and healing what fails.
+//! Requests that reach a remote's storage. `RemoteImmutableStore` checks what the remote serves
+//! and heals what fails the check. `RemoteMutableStore` reads and `repository::verify` pass on the
+//! remote's refusal of the credentials.
 
 use std::sync::Arc;
 
+use lore_base::error::NotAuthenticated;
+use lore_base::error::NotAuthorized;
+use lore_base::types::Hash;
+use lore_base::types::KeyType;
+use lore_revision::interface::LoreString;
+use lore_revision::repository::RemoteState;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::repository::verify::VerifyFragmentArgs;
+use lore_revision::repository::verify::verify_fragment_boxed;
 use lore_revision::store::remote::RemoteImmutableStore;
+use lore_revision::store::remote::RemoteMutableStore;
+use lore_revision::test_util::context_with_state;
 use lore_storage::ImmutableStore;
+use lore_storage::MutableStore;
 use lore_transport::Connection;
+use lore_transport::ProtocolError;
 
 use super::serving::Serving;
 use super::serving::ServingStorage;
@@ -48,6 +62,31 @@ async fn a_payload_failing_its_check_is_served_as_healed() {
 
     assert_eq!(served.payload.as_deref(), Some(&content[..]));
     assert_eq!((remote.gets(), remote.verifies()), (2, 1));
+}
+
+/// A store holds the session pool its reads share, so a command's reads over a connection out of
+/// the connection cache, which pins no pool, still share one: two reads start one session.
+#[tokio::test]
+async fn reads_over_a_connection_out_of_the_cache_share_the_pool_the_store_holds() {
+    let content = b"content read twice over a connection out of the cache";
+    let (source, address, _) = remote_copy(content, 0x73, 0).await;
+    let remote = serving_remote(&source, Serving::default());
+    let connection = Connection::detached(vec![remote.clone()]);
+    lore_transport::connection::remove_connection(connection.clone());
+    let store = Arc::new(RemoteImmutableStore::with_connection(source.id, connection));
+
+    under_execution_context(|| async {
+        for _ in 0..2 {
+            store
+                .clone()
+                .get(source.id, address)
+                .await
+                .expect("the payload is served");
+        }
+    })
+    .await;
+
+    assert_eq!(remote.starts(), 1, "each read started a pool of its own");
 }
 
 /// A payload still altered after a heal the remote reports as made is refused, after that one
@@ -126,4 +165,65 @@ async fn a_get_the_remote_does_not_support_is_an_internal_failure() {
         "got {served:?}"
     );
     assert_eq!((remote.gets(), remote.verifies()), (1, 0));
+}
+
+/// A remote answering every verify and mutable load with `refusal`, and the context it serves
+/// from.
+async fn refusing_remote(refusal: ProtocolError) -> (Arc<RepositoryContext>, Arc<ServingStorage>) {
+    let source = context_with_state(RemoteState::Offline).await;
+    let remote = serving_remote(
+        &source,
+        Serving {
+            refusal: Some(refusal),
+            ..Serving::default()
+        },
+    );
+    (source, remote)
+}
+
+/// A mutable-store read the remote refuses fails with the refusal, as a write does.
+#[tokio::test]
+async fn a_mutable_load_the_remote_refuses_fails_with_the_refusal() {
+    let (source, remote) = refusing_remote(ProtocolError::from(NotAuthorized)).await;
+    let store = Arc::new(RemoteMutableStore::with_connection(
+        source.id,
+        Connection::detached(vec![remote]),
+    ));
+
+    let loaded = under_execution_context(|| {
+        store
+            .clone()
+            .load(source.id, Hash::from([0x75; 32]), KeyType::Resolve)
+    })
+    .await;
+
+    assert!(
+        loaded.as_ref().is_err_and(|err| err.is_not_authorized()),
+        "got {loaded:?}"
+    );
+}
+
+/// A fragment verification the remote refuses fails with the refusal.
+#[tokio::test]
+async fn a_verification_the_remote_refuses_fails_with_the_refusal() {
+    let (_, remote) = refusing_remote(ProtocolError::from(NotAuthenticated)).await;
+    let repository = context_with_state(RemoteState::Connected(Connection::detached(vec![
+        remote.clone(),
+    ])))
+    .await;
+    let args = VerifyFragmentArgs {
+        hash: LoreString::from(Hash::from([0x76; 32]).to_string()),
+        context: LoreString::default(),
+        heal: false,
+    };
+
+    let verified = under_execution_context(|| verify_fragment_boxed(repository, args)).await;
+
+    assert!(
+        verified
+            .as_ref()
+            .is_err_and(|err| err.is_not_authenticated()),
+        "got {verified:?}"
+    );
+    assert_eq!(remote.verifies(), 1);
 }

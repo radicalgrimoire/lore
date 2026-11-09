@@ -15,6 +15,8 @@ use base64::prelude::BASE64_STANDARD;
 use base64::prelude::Engine as _;
 use lore_base::directories::project_directory;
 use lore_base::env::AUTH_PATH_VAR;
+use lore_base::error::Disconnected;
+use lore_base::error::NotAuthenticated;
 use lore_base::error::TokenNotFound;
 use lore_base::fs::lock::FSLock;
 use lore_base::lore_debug;
@@ -57,6 +59,13 @@ pub enum TokenStoreError {
     TokenNotFound,
 }
 
+#[error_set]
+pub enum RefreshError {
+    TokenNotFound,
+    NotAuthenticated,
+    Disconnected,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IdentityToken {
     /// User identity
@@ -71,9 +80,17 @@ pub struct IdentityToken {
     /// lifecycle: consumed on use and replaced atomically.
     #[serde(default)]
     refresh_token: Option<String>,
+    /// When `refresh_token` stops working, in milliseconds since the UNIX epoch, or 0 when the
+    /// issuer named no deadline. Stored, removed and restored with `refresh_token`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    refresh_expires: u64,
     /// The scope the issuer granted, space-delimited as RFC 6749 §3.3 has it.
     #[serde(default)]
     scope: Option<String>,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -502,7 +519,8 @@ pub async fn store_user_token(
     store_identity_token(auth_endpoint, identity_token, RefreshToken::Keep).await
 }
 
-/// Stores `token` with `refresh_token` and the `scope` it was granted for. Unlike
+/// Stores `token` with `refresh_token`, the time in milliseconds since the UNIX epoch it
+/// `refresh_expires` at (0 for unknown), and the `scope` it was granted for. Unlike
 /// [`store_user_token`], it replaces the refresh token and the scope of the entry, so a
 /// `refresh_token` of `None` leaves none behind.
 pub async fn store_user_token_and_refresh_token(
@@ -511,12 +529,14 @@ pub async fn store_user_token_and_refresh_token(
     token: &str,
     acceptable_root_domains: Vec<String>,
     refresh_token: Option<&str>,
+    refresh_expires: u64,
     scope: Option<&str>,
 ) -> Result<(), TokenStoreError> {
     let mut identity_token =
         new_identity_token(auth_endpoint, identity, token, acceptable_root_domains).await?;
     if let Some(refresh_token) = refresh_token {
         identity_token.refresh_token = Some(encrypt_token(refresh_token).await?);
+        identity_token.refresh_expires = refresh_expires;
     }
     identity_token.scope = scope.map(str::to_owned);
     store_identity_token(auth_endpoint, identity_token, RefreshToken::Replace).await
@@ -545,6 +565,7 @@ async fn new_identity_token(
         token: encrypt_token(token).await?,
         acceptable_root_domains,
         refresh_token: None,
+        refresh_expires: 0,
         scope: None,
     })
 }
@@ -579,6 +600,7 @@ async fn store_identity_token(
                 if refresh_token == RefreshToken::Keep {
                     let existing = &mut remote.token[existing_index];
                     new_token.refresh_token = existing.refresh_token.take();
+                    new_token.refresh_expires = existing.refresh_expires;
                     new_token.scope = existing.scope.take();
                 }
                 remote.token[existing_index] = new_token;
@@ -950,6 +972,7 @@ async fn remove_user_token_where(
 }
 
 pub async fn load_identities(auth_endpoint: &str) -> Result<Vec<String>, TokenStoreError> {
+    let auth_endpoint = auth_endpoint.trim_end_matches('/');
     lore_trace!("Load user identities for endpoint {auth_endpoint}");
 
     let mut identities = vec![];
@@ -982,14 +1005,33 @@ pub async fn load_identities(auth_endpoint: &str) -> Result<Vec<String>, TokenSt
     Ok(identities)
 }
 
+/// When `identity`'s stored refresh token for `auth_endpoint` stops working, in milliseconds
+/// since the UNIX epoch, or `Some(0)` when the issuer named no deadline. `None` without a stored
+/// refresh token.
+pub async fn load_refresh_expires(auth_endpoint: &str, identity: &str) -> Option<u64> {
+    let auth_endpoint = auth_endpoint.trim_end_matches('/');
+    let mut store = cached_token_map().await;
+    if store.is_none()
+        && let Ok(guard) = lock_token_map().await
+        && let Ok(loaded_map) = load_token_map(&guard)
+    {
+        store.replace(loaded_map);
+    }
+    let entry = identity_entry(&mut store, auth_endpoint, identity)?;
+    entry.refresh_token.as_ref()?;
+    Some(entry.refresh_expires)
+}
+
 /// What a refresh grant answered with.
 pub enum Refreshed<E> {
     /// A new authentication token. A `refresh_token` of `None` keeps the one presented, as RFC
     /// 6749 §6 has a client do when the issuer rotates none, and a `scope` of `None` keeps the
-    /// stored scope.
+    /// stored scope. `refresh_expires` replaces the stored deadline either way, since a refresh
+    /// moves the idle deadline: milliseconds since the UNIX epoch, or 0 for unknown.
     Token {
         token: String,
         refresh_token: Option<String>,
+        refresh_expires: u64,
         scope: Option<String>,
     },
     /// The issuer refused the refresh token as spent, expired or revoked.
@@ -1011,29 +1053,36 @@ pub enum Refreshed<E> {
 /// stored token other than `expired` has been replaced already, and is returned without a grant.
 /// An answer naming another identity is refused.
 ///
-/// Returns `TokenStoreError::TokenNotFound` when there is no refresh token to present.
+/// Fails with `TokenNotFound` when there is no refresh token to present, with
+/// `NotAuthenticated` when the grant was [`Refreshed::Refused`] or [`Refreshed::Failed`], and
+/// with `Disconnected` when it was [`Refreshed::Unsent`].
 pub async fn refresh_user_token<E, F, Fut>(
     auth_endpoint: &str,
     identity: &str,
     expired: &str,
     refresh: F,
-) -> Result<String, TokenStoreError>
+) -> Result<String, RefreshError>
 where
-    E: std::error::Error + Send + Sync + 'static,
+    E: std::error::Error + HasTrace + Send + Sync + 'static,
     F: FnOnce(String) -> Fut,
     Fut: Future<Output = Refreshed<E>>,
 {
     let auth_endpoint = auth_endpoint.trim_end_matches('/');
-    let key = get_token_encryption_key().await?;
+    let key = get_token_encryption_key()
+        .await
+        .forward::<RefreshError>("reading the token encryption key")?;
 
     let mut store = cached_token_map().await;
-    let guard = lock_token_map().await?;
+    let guard = lock_token_map()
+        .await
+        .forward::<RefreshError>("locking the token store")?;
     reload_token_map(&guard, &mut store);
 
     let Some(entry) = identity_entry(&mut store, auth_endpoint, identity) else {
         return Err(TokenNotFound.into());
     };
-    let current = open_token(&key, &entry.token)?;
+    let current =
+        open_token(&key, &entry.token).forward::<RefreshError>("opening the stored token")?;
     if current != expired {
         lore_debug!("The token of {identity} at {auth_endpoint} was replaced already");
         return Ok(current);
@@ -1041,21 +1090,24 @@ where
     let Some(sealed_refresh_token) = entry.refresh_token.take() else {
         return Err(TokenNotFound.into());
     };
-    let refresh_token = open_token(&key, &sealed_refresh_token)?;
+    let presented_refresh_expires = std::mem::take(&mut entry.refresh_expires);
+    let refresh_token = open_token(&key, &sealed_refresh_token)
+        .forward::<RefreshError>("opening the stored refresh token")?;
     if let Some(map) = store.as_ref()
         && let Err(err) = store_token_map(&guard, map)
     {
         if let Some(entry) = identity_entry(&mut store, auth_endpoint, identity) {
             entry.refresh_token = Some(sealed_refresh_token);
+            entry.refresh_expires = presented_refresh_expires;
         }
-        return Err(err);
+        return Err(err.forward::<RefreshError>("removing the refresh token before the grant"));
     }
 
     lore_debug!("Refreshing the token of {identity} at {auth_endpoint}");
     let refreshed = refresh(refresh_token).await;
 
     let Some(entry) = identity_entry(&mut store, auth_endpoint, identity) else {
-        return Err(TokenStoreError::internal(
+        return Err(RefreshError::internal(
             "Token store entry vanished while the store was locked",
         ));
     };
@@ -1063,6 +1115,7 @@ where
         Refreshed::Token {
             token,
             refresh_token,
+            refresh_expires,
             scope,
         } => {
             let claims = crate::jwt::insecure_decode_token(&token).map(|decoded| decoded.claims);
@@ -1070,41 +1123,54 @@ where
                 Ok(claims) if claims.identity() == Some(identity) => {
                     let mut acceptable_root_domains = claims.acceptable_root_domains();
                     acceptable_root_domains.push(get_domain_or_empty(auth_endpoint));
-                    entry.token = seal_token(&key, &token)?;
+                    entry.token = seal_token(&key, &token)
+                        .forward::<RefreshError>("sealing the refreshed token")?;
                     entry.acceptable_root_domains = acceptable_root_domains;
                     entry.refresh_token = match refresh_token {
-                        Some(refresh_token) => Some(seal_token(&key, &refresh_token)?),
+                        Some(refresh_token) => Some(
+                            seal_token(&key, &refresh_token)
+                                .forward::<RefreshError>("sealing the new refresh token")?,
+                        ),
                         None => Some(sealed_refresh_token),
                     };
+                    entry.refresh_expires = refresh_expires;
                     if scope.is_some() {
                         entry.scope = scope;
                     }
                     Ok(token)
                 }
-                _ => Err(TokenStoreError::internal(format!(
+                _ => Err(RefreshError::internal(format!(
                     "The refreshed token for {identity} at {auth_endpoint} does not name them"
                 ))),
             }
         }
-        Refreshed::Refused(source) => Err(TokenStoreError::internal_with_context(
-            source,
-            "The issuer refused the refresh token",
-        )),
-        Refreshed::Unsent(source) => {
-            entry.refresh_token = Some(sealed_refresh_token);
-            Err(TokenStoreError::internal_with_context(
-                source,
-                "Failed to send the refresh token grant",
+        // The chained error keeps the grant error's trace, not its message, so the message is
+        // logged here.
+        Refreshed::Refused(source) => {
+            lore_debug!("The issuer refused the refresh token of {identity}: {source}");
+            Err(RefreshError::NotAuthenticated(
+                NotAuthenticated.chain_err_from(source, "The issuer refused the refresh token"),
             ))
         }
-        Refreshed::Failed(source) => Err(TokenStoreError::internal_with_context(
-            source,
-            "Failed to refresh the token",
-        )),
+        Refreshed::Unsent(source) => {
+            lore_debug!("The refresh grant for {identity} was not sent: {source}");
+            entry.refresh_token = Some(sealed_refresh_token);
+            entry.refresh_expires = presented_refresh_expires;
+            Err(RefreshError::Disconnected(Disconnected.chain_err_from(
+                source,
+                "Failed to send the refresh token grant",
+            )))
+        }
+        Refreshed::Failed(source) => {
+            lore_warn!("Failed to refresh the token of {identity} at {auth_endpoint}: {source}");
+            Err(RefreshError::NotAuthenticated(
+                NotAuthenticated.chain_err_from(source, "Failed to refresh the token"),
+            ))
+        }
     };
 
     if let Some(map) = store.as_ref() {
-        store_token_map(&guard, map)?;
+        store_token_map(&guard, map).forward::<RefreshError>("storing the grant's answer")?;
     }
     result
 }
@@ -1460,6 +1526,7 @@ pub mod test_util {
                 token: token.into(),
                 acceptable_root_domains,
                 refresh_token,
+                refresh_expires: 0,
                 scope,
             }
         }
@@ -1478,6 +1545,17 @@ pub mod test_util {
 
         pub fn scope(&self) -> Option<&str> {
             self.scope.as_deref()
+        }
+
+        pub fn refresh_expires(&self) -> u64 {
+            self.refresh_expires
+        }
+
+        pub fn with_refresh_expires(self, refresh_expires: u64) -> Self {
+            Self {
+                refresh_expires,
+                ..self
+            }
         }
     }
 
