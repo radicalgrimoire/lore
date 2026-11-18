@@ -7,9 +7,11 @@ use bytes::Bytes;
 use dashmap::DashSet;
 use lore_base::types::Address;
 use lore_base::types::Fragment;
+use lore_error_set::ForwardAny;
 use lore_error_set::WrapInternal;
 use lore_error_set::error_set;
 
+use crate::fs::filesystem_provider::CloneAnswer;
 use crate::fs::filesystem_provider::DirectoryListing;
 use crate::fs::filesystem_provider::FileInfo;
 use crate::fs::filesystem_provider::FilesystemDiffContext;
@@ -22,6 +24,7 @@ use crate::fs::os::OsFilesystem;
 use crate::fs::os::OsOperation;
 use crate::fs::swfs::api_interface::SwfsInterface;
 use crate::fs::swfs::mount_resources::SwfsExecutionToken;
+use crate::fs::swfs::operation_lock::OperationGuard;
 use crate::fs::swfs::paths::RelativePathKey;
 use crate::fs::swfs::state::tracked_file_info;
 use crate::immutable;
@@ -30,6 +33,7 @@ use crate::repository::RepositoryContext;
 use crate::state::ChangeStream;
 use crate::state::FilesystemDiffStats;
 use crate::state::NodeComparison;
+use crate::state::StateError;
 use crate::util::path::RelativePath;
 
 #[error_set]
@@ -55,12 +59,17 @@ impl SwfsFilesystem {
 
     #[allow(clippy::unused_async)]
     pub async fn begin_operation(&self) -> Result<SwfsOperation, FsError> {
-        self.mount
-            .freeze(SwfsExecutionToken {})
+        // Held until the operation has thawed, so no other command freezes the mount, or thaws it,
+        // while this one reads it (ADR-00026).
+        let guard = self.mount.lock_operation().await?;
+        let guard = self
+            .mount
+            .freeze(SwfsExecutionToken {}, guard)
             .await
-            .internal("Freezing SWFS file system")?;
+            .forward_any::<FsError>("Freezing SWFS file system")?;
         Ok(SwfsOperation {
             mount: self.mount.clone(),
+            operation: parking_lot::Mutex::new(Some(guard)),
             _repo_path: self.repo_path.clone(),
             touched_nodes: Default::default(),
             os: OsFilesystem::begin_operation(&self.os),
@@ -77,11 +86,24 @@ impl FilesystemProvider for SwfsFilesystem {
             holds_state,
         )))
     }
+
+    async fn clone_answer(
+        &self,
+        _source: &Path,
+        _dot_path: &Path,
+        _destination: &Path,
+    ) -> Result<CloneAnswer, crate::fs::filesystem_provider::InstanceCloneError> {
+        Ok(CloneAnswer::Unsupported {
+            reason: "this virtual filesystem provider can't clone instances".to_string(),
+        })
+    }
 }
 
 /// SWFS-backed filesystem operation context.
 pub struct SwfsOperation {
     mount: Arc<SwfsInterface>,
+    /// The mount's operation, held from before the freeze until the thaw has ended.
+    operation: parking_lot::Mutex<Option<OperationGuard>>,
     _repo_path: PathBuf,
     /// Paths this operation has written or removed, for thaw to describe to SWFS. Whether a path
     /// was added or deleted makes no difference to that, so they share the set.
@@ -99,15 +121,27 @@ impl SwfsOperation {
     }
 
     /// Thaws the frozen filesystem, clearing the write cache where the operation wrote.
+    ///
+    /// Always attempts the thaw, whatever failed before it, as every caller that begins an
+    /// operation finalizes it, [`with_operation`] among them: an operation's freeze is ended here
+    /// or, as a last resort where SWFS couldn't finish the thaw, by the next command's freeze.
+    /// Where the files the operation wrote can't be described, the thaw applies none and the
+    /// failure is returned.
+    ///
+    /// [`with_operation`]: crate::fs::filesystem_provider::with_operation
     pub(crate) async fn finalize(&self, changes_made: bool) -> Result<(), FsError> {
         let token = SwfsExecutionToken {};
+        // The thaw releases the operation once SWFS has answered.
+        let Some(operation) = self.operation.lock().take() else {
+            return Err(FsError::internal("SWFS operation already thawed"));
+        };
         let result = self
             .mount
-            .thaw(token, changes_made, &self.touched_nodes)
+            .thaw(token, changes_made, &self.touched_nodes, operation)
             .await;
         // Whatever the outcome, none of these writes are pending any longer.
         self.touched_nodes.clear();
-        result.internal("Thawing SWFS file system")?;
+        result.forward_any::<FsError>("Thawing SWFS file system")?;
         Ok(())
     }
 }
@@ -179,6 +213,36 @@ impl InstanceOperation for SwfsOperation {
         self.record_written(from);
         self.record_written(to);
         Ok(())
+    }
+
+    /// Both resolve to one node of the served State, which finds a child by any spelling of its
+    /// name, compared by its whole link. A path the State holds no node at names nothing, as does
+    /// every path before the mount serves a State.
+    async fn names_one_entry(
+        &self,
+        from: &RelativePath,
+        to: &RelativePath,
+    ) -> Result<Option<bool>, FsError> {
+        let resources = self.mount.resources();
+        let Some(state) = resources.current_read_state() else {
+            return Ok(None);
+        };
+        let repository = resources.repository();
+        let node_at = async |path: &RelativePath| match state
+            .find_node_link(repository.clone(), path.as_str())
+            .await
+        {
+            Ok(link) if link.is_valid() => Ok(Some((link.repository, link.node, link.revision))),
+            Ok(_) | Err(StateError::NodeNotFound(_)) => Ok(None),
+            Err(err) => Err(FsError::internal_with_context(
+                err,
+                "finding the node a path names",
+            )),
+        };
+        let Some(from) = node_at(from).await? else {
+            return Ok(None);
+        };
+        Ok(Some(node_at(to).await? == Some(from)))
     }
 
     async fn copy_file(

@@ -13,6 +13,7 @@ pub mod fragment_engine;
 pub mod fragment_flags;
 pub mod fs_util;
 pub mod gc_event;
+#[cfg(feature = "test-util")]
 pub mod mutable_conformance;
 
 use std::sync::OnceLock;
@@ -31,6 +32,7 @@ pub mod read;
 mod read_flight;
 #[cfg(feature = "test-util")]
 pub mod read_flight;
+pub(crate) mod resume;
 pub mod store_types;
 #[cfg(feature = "test-util")]
 pub mod test_util;
@@ -98,6 +100,7 @@ pub use hash::hash_slice;
 pub use hash::hash_string;
 pub use hash::hash_string_bytes;
 // Re-export store traits
+pub use immutable_store::CorrelationHold;
 pub use immutable_store::ImmutableStore;
 pub use immutable_store::StoreError;
 pub(crate) use immutable_store::payload_is_content;
@@ -119,12 +122,15 @@ pub use lore_base::retry::DEFAULT_JITTER;
 pub use lore_base::retry::Retry;
 pub use lore_base::retry::retry;
 pub use lore_base::retry::retry_with_jitter;
+pub use lore_io::DataCursor;
 // Re-export maintenance functions
 pub use maintenance::compactor;
 pub use maintenance::evictor;
 pub use maintenance::gc;
 pub use mutable_store::MutableStore;
+pub use mutable_store::flush_stores;
 // Re-export options types
+pub use options::FlushOptions;
 pub use options::ReadOptions;
 pub use options::WriteOptions;
 // Re-export packstore
@@ -136,6 +142,7 @@ pub use read::REMOTE_FETCH_INFLIGHT;
 pub use read::check_payload_sizes;
 pub use read::expand_payload;
 pub use read::load_fragment;
+pub use read::load_root;
 pub use read::read;
 pub use read::read_into;
 pub use read::read_into_buffer;
@@ -148,6 +155,7 @@ pub use read::read_resolved_stream;
 pub use read::read_stream;
 pub use read::remote_fetch_bytes;
 pub use read::remote_fetch_inflight;
+pub use read::stream_root;
 pub use read::write_all_to_file;
 // Re-export store types
 pub use store_types::KeyType;

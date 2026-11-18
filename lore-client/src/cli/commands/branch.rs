@@ -111,7 +111,7 @@ pub struct BranchSwitchArgs {
     #[clap(long, action)]
     reset: bool,
 
-    /// Only update anchor tracking without modifying or verifying files, useful for bare repositories
+    /// Only update anchor tracking without modifying or verifying files, useful for bare repositories. Don't commit after merging, reverting or cherry-picking in such an instance: the commit can delete a directory the instance never had on disk, with everything in it
     #[clap(long, action)]
     bare: bool,
 }
@@ -820,8 +820,47 @@ fn handle_branch_switch(globals: LoreGlobalArgs, args: &BranchSwitchArgs) -> u8 
     return run_command(globals, switch_args.into(), callback) as u8;
 }
 
+/// The fragments one branch of a push has registered, of the revisions it finished and of the
+/// one in flight.
+#[derive(Default)]
+struct FragmentProgress {
+    finished: u64,
+    finished_count: u64,
+    complete: u64,
+    count: u64,
+}
+
+impl FragmentProgress {
+    fn begin(&mut self, count: u64) {
+        self.complete = 0;
+        self.count = count;
+    }
+
+    fn progress(&mut self, complete: u64, count: u64) {
+        self.complete = complete;
+        self.count = count;
+    }
+
+    fn end(&mut self) {
+        self.finished += self.complete;
+        self.finished_count += self.count;
+        self.begin(0);
+    }
+
+    fn complete(&self) -> u64 {
+        self.finished + self.complete
+    }
+
+    fn count(&self) -> u64 {
+        self.finished_count + self.count
+    }
+}
+
 pub fn handle_branch_push(globals: LoreGlobalArgs, args: &BranchPushArgs) -> u8 {
     let response_message = Arc::new(Mutex::new(String::new()));
+    // Reported once the push succeeds: a push that finds the remote past its revision can still
+    // fail as diverged.
+    let remote_moved_forward = Arc::new(Mutex::new(false));
 
     // The push events identify a branch by ID, so keep the names reported by the
     // `BranchPush` event of every branch the cascade visits — it precedes that
@@ -846,6 +885,19 @@ pub fn handle_branch_push(globals: LoreGlobalArgs, args: &BranchPushArgs) -> u8 
 
     let debug = progress_debug();
     let progress_bar = ProgressBar::new(0);
+    // Branches push at once, so the bar shows the fragments of every branch together.
+    let fragments = Mutex::new(BTreeMap::<(Partition, Context), FragmentProgress>::new());
+    let show_fragments = move |update: &dyn Fn(&mut FragmentProgress), repository, branch| {
+        let mut fragments = fragments.lock();
+        update(fragments.entry((repository, branch)).or_default());
+        let (complete, count) = fragments
+            .values()
+            .fold((0, 0), |(complete, count), branch| {
+                (complete + branch.complete(), count + branch.count())
+            });
+        progress_bar.set_max_progress(count);
+        progress_bar.set_progress(complete);
+    };
 
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
@@ -862,8 +914,13 @@ pub fn handle_branch_push(globals: LoreGlobalArgs, args: &BranchPushArgs) -> u8 
                     if data.flag_link == 0 && data.flag_layer == 0 {
                         println!("Revision is already pushed and at remote latest");
                     }
-                } else if data.local_history == 0 && main_branch_prints {
-                    println!("Revision is already pushed and remote has moved forward");
+                } else if data.local_history == 0
+                    && !data.remote_revision.is_zero()
+                    && globals.force == 0
+                {
+                    if data.flag_link == 0 && data.flag_layer == 0 {
+                        *remote_moved_forward.lock() = true;
+                    }
                 } else if data.remote_history == 0 && main_branch_prints {
                     println!(
                         "Local branch is {} revision(s) ahead of remote, pushing all revisions",
@@ -891,7 +948,11 @@ pub fn handle_branch_push(globals: LoreGlobalArgs, args: &BranchPushArgs) -> u8 
                 if data.fragments > 0 {
                     println!("Pushing {} fragment(s)", data.fragments);
                 }
-                progress_bar.set_max_progress(data.fragments);
+                show_fragments(
+                    &|branch| branch.begin(data.fragments),
+                    data.repository,
+                    data.branch,
+                );
             }
             LoreEvent::BranchPushFragmentProgress(data) => {
                 if debug {
@@ -903,11 +964,15 @@ pub fn handle_branch_push(globals: LoreGlobalArgs, args: &BranchPushArgs) -> u8 
                         format_bytes_to_string(data.bytes_total)
                     );
                 }
-                progress_bar.set_max_progress(data.count);
-                progress_bar.set_progress(data.complete);
+                show_fragments(
+                    &|branch| branch.progress(data.complete, data.count),
+                    data.repository,
+                    data.branch,
+                );
             }
-            LoreEvent::BranchPushFragmentEnd(data)
-                if data.fragments > 0 => {
+            LoreEvent::BranchPushFragmentEnd(data) => {
+                show_fragments(&FragmentProgress::end, data.repository, data.branch);
+                if data.fragments > 0 {
                     if data.bytes_transferred > 0 {
                         println!(
                             "Pushed {} fragment(s), {}",
@@ -918,6 +983,7 @@ pub fn handle_branch_push(globals: LoreGlobalArgs, args: &BranchPushArgs) -> u8 
                         println!("Pushed {} fragment(s)", data.fragments);
                     }
                 }
+            }
             LoreEvent::BranchPushStats(data) => {
                 stats_display::print_push_totals(data);
             }
@@ -969,6 +1035,9 @@ pub fn handle_branch_push(globals: LoreGlobalArgs, args: &BranchPushArgs) -> u8 
             }
             LoreEvent::Complete(data)
                 if data.status == 0 => {
+                    if *remote_moved_forward.lock() {
+                        println!("Revision is already pushed and remote has moved forward");
+                    }
                     let message = response_message.lock();
                     if !message.is_empty() {
                         println!("{}", *message);
@@ -1221,7 +1290,7 @@ fn handle_branch_merge_resolve_impl(
 
                 count_atomic.fetch_add(1, Ordering::Relaxed);
             }
-            LoreEvent::Complete(_) => {
+            LoreEvent::Complete(data) if data.status == 0 => {
                 let count = count_atomic.load(Ordering::Relaxed);
                 if count == 0 {
                     println!("No conflicts resolved");
@@ -1757,8 +1826,7 @@ pub fn handle_branch_metadata_clear(globals: LoreGlobalArgs, args: &BranchMetada
     let keys: Vec<LoreString> = args
         .keys
         .as_ref()
-        .map(|k| k.iter().map(|s| LoreString::from(s.as_str())).collect())
-        .unwrap_or_default();
+        .map_or_default(|k| k.iter().map(|s| LoreString::from(s.as_str())).collect());
 
     let clear_args = LoreBranchMetadataClearArgs {
         branch: resolve_branch_arg(&args.branch),

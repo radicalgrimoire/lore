@@ -12,6 +12,7 @@ mod batch_load_history {
     use lore_revision::immutable::is_stored_local;
 
     use crate::branch::write_line;
+    use crate::branch::write_not_a_state;
     use crate::helper::setup_test_execution;
     use crate::immutable::serving::Serving;
     use crate::immutable::serving::remote_copy;
@@ -136,6 +137,408 @@ mod batch_load_history {
                         case.position
                     );
                 }
+            })
+            .await;
+    }
+
+    /// A batch stops its walk of the local store at a blob that is not a revision state, as at a
+    /// state the store lacks, whether the start or a parent names it, rather than listing it with
+    /// the number its bytes give. With no remote to list the line from there, the batch holds the
+    /// revisions the walk read above it.
+    #[tokio::test]
+    async fn a_batch_stops_at_a_blob_that_is_not_a_state() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let stores = client_stores().await;
+                let not_a_state = write_not_a_state(&stores.writer).await;
+                let start = write_line(&stores.writer, not_a_state, 2, 1).await[0];
+
+                for (named_by, revision, read) in [
+                    ("the start", not_a_state, vec![]),
+                    ("a parent", start, vec![(2, start)]),
+                ] {
+                    let history = batch_load_history(stores.writer.clone(), revision)
+                        .await
+                        .expect("a batch without a remote to list the line from there succeeds");
+
+                    assert_eq!(history, read, "named by {named_by}");
+                }
+            })
+            .await;
+    }
+
+    /// A batch whose walk of the local store stops at a revision the store lacks, with no remote to
+    /// list the line from there, holds the revisions the walk read, whether the context has no
+    /// remote or one whose list of the line is not found.
+    #[tokio::test]
+    async fn a_batch_without_a_remote_to_list_the_line_holds_the_local_revisions() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let stores = client_stores().await;
+                let line = write_line(&stores.writer, Hash::from([9; 32]), 2, 3).await;
+                let unlisted = Arc::new(PagedRemote::new(BranchId::from([7; 16]), line[2]));
+
+                for (remote, client, lists) in [
+                    ("none", stores.writer.clone(), 0),
+                    ("not listing", client_on(&stores, unlisted.clone()), 1),
+                ] {
+                    let history = batch_load_history(client, line[2])
+                        .await
+                        .expect("a batch without a remote to list the line from there succeeds");
+
+                    assert_eq!(
+                        (history, unlisted.lists()),
+                        (vec![(4, line[2]), (3, line[1]), (2, line[0])], lists),
+                        "remote: {remote}"
+                    );
+                }
+            })
+            .await;
+    }
+}
+
+mod revision_by_number_local {
+    use bytes::Bytes;
+    use lore_base::error::Disconnected;
+    use lore_base::error::Oversized;
+    use lore_base::runtime::LORE_CONTEXT;
+    use lore_base::types::Context;
+    use lore_base::types::Hash;
+    use lore_revision::find::NumberWalk;
+    use lore_revision::find::revision_by_number_local;
+    use lore_revision::lore::RepositoryId;
+    use lore_storage::WriteOptions;
+
+    use crate::branch::write_branch_revision;
+    use crate::branch::write_line;
+    use crate::branch::write_not_a_state;
+    use crate::helper::setup_test_execution;
+    use crate::paged_remote::Reads;
+    use crate::paged_remote::counted_client_stores;
+    use crate::repository::test_helpers::built_context;
+    use crate::repository::test_helpers::caused_by;
+    use crate::repository::test_helpers::counted_endpoint;
+
+    /// The reads of a walk of `steps` states: one payload read each, and no query.
+    fn reads(steps: usize) -> Reads {
+        Reads {
+            payloads: steps,
+            queries: 0,
+        }
+    }
+
+    /// A walk finds each number on the line, the start's and the first revision's included,
+    /// reading one state per revision it walks.
+    #[tokio::test]
+    async fn number_walk_finds_the_numbered_revision() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let (stores, counting) = counted_client_stores().await;
+                let line = write_line(&stores.writer, Hash::default(), 1, 3).await;
+                counting.take_reads();
+
+                for (index, &revision) in line.iter().enumerate() {
+                    let number = index as u64 + 1;
+
+                    let walk = revision_by_number_local(&stores.writer, line[2], number)
+                        .await
+                        .expect("the store holds every state on the line");
+
+                    assert_eq!(
+                        walk,
+                        NumberWalk::Found {
+                            revision,
+                            metadata: Hash::default()
+                        },
+                        "number {number}"
+                    );
+                    assert_eq!(counting.take_reads(), reads(3 - index), "number {number}");
+                }
+            })
+            .await;
+    }
+
+    /// A walk reports the metadata hash the found revision's state records, read in the step that
+    /// finds it, whether that is the start or a revision the walk reaches below it.
+    #[tokio::test]
+    async fn number_walk_reports_the_found_revisions_metadata() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let (stores, counting) = counted_client_stores().await;
+                let first = write_branch_revision(&stores.writer, Hash::default(), 1, 6).await;
+                let second = write_branch_revision(&stores.writer, first, 2, 7).await;
+                counting.take_reads();
+
+                for (number, revision, metadata, steps) in [
+                    (2, second, Hash::from([7; 32]), 1),
+                    (1, first, Hash::from([6; 32]), 2),
+                ] {
+                    let walk = revision_by_number_local(&stores.writer, second, number)
+                        .await
+                        .expect("the store holds every state on the line");
+
+                    assert_eq!(
+                        walk,
+                        NumberWalk::Found { revision, metadata },
+                        "number {number}"
+                    );
+                    assert_eq!(counting.take_reads(), reads(steps), "number {number}");
+                }
+            })
+            .await;
+    }
+
+    /// A walk that reaches a revision numbered below the target stops there, without reading its
+    /// parent, here one the store lacks.
+    #[tokio::test]
+    async fn number_walk_stops_below_the_target() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let (stores, counting) = counted_client_stores().await;
+                let below = write_line(&stores.writer, Hash::from([0xA0; 32]), 2, 1).await[0];
+                let start = write_line(&stores.writer, below, 5, 1).await[0];
+                counting.take_reads();
+
+                let walk = revision_by_number_local(&stores.writer, start, 3)
+                    .await
+                    .expect("the walk reads only states the store holds");
+                assert_eq!(walk, NumberWalk::Absent);
+                assert_eq!(counting.take_reads(), reads(2));
+
+                let walk = revision_by_number_local(&stores.writer, start, 6)
+                    .await
+                    .expect("the walk reads only the start");
+                assert_eq!(walk, NumberWalk::Absent);
+                assert_eq!(counting.take_reads(), reads(1));
+            })
+            .await;
+    }
+
+    /// A walk past the line's first revision, or from no revision, finds nothing.
+    #[tokio::test]
+    async fn number_walk_ends_at_the_first_revision() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let (stores, counting) = counted_client_stores().await;
+                let line = write_line(&stores.writer, Hash::default(), 2, 2).await;
+                counting.take_reads();
+
+                let walk = revision_by_number_local(&stores.writer, line[1], 1)
+                    .await
+                    .expect("the store holds every state on the line");
+                assert_eq!(walk, NumberWalk::Absent);
+                assert_eq!(counting.take_reads(), reads(2));
+
+                let walk = revision_by_number_local(&stores.writer, Hash::default(), 1)
+                    .await
+                    .expect("a walk from no revision reads nothing");
+                assert_eq!(walk, NumberWalk::Absent);
+                assert_eq!(counting.take_reads(), reads(0));
+            })
+            .await;
+    }
+
+    /// A walk that reaches a revision whose state the store lacks reports that revision, whether
+    /// it is a parent or the start.
+    #[tokio::test]
+    async fn number_walk_reports_a_missing_parent() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let (stores, _counting) = counted_client_stores().await;
+                let missing = Hash::from([0xA0; 32]);
+                let start = write_line(&stores.writer, missing, 2, 1).await[0];
+
+                let walk = revision_by_number_local(&stores.writer, start, 1)
+                    .await
+                    .expect("a state the store lacks is not a failed read");
+                assert_eq!(walk, NumberWalk::Missing(missing));
+
+                let walk = revision_by_number_local(&stores.writer, missing, 1)
+                    .await
+                    .expect("a state the store lacks is not a failed read");
+                assert_eq!(walk, NumberWalk::Missing(missing));
+            })
+            .await;
+    }
+
+    /// A read that fails other than for a state the store lacks fails the walk: here the start
+    /// names content too large to be a state.
+    #[tokio::test]
+    async fn number_walk_fails_on_a_read_that_is_not_a_miss() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let (stores, _counting) = counted_client_stores().await;
+                let oversized = lore_revision::immutable::write(
+                    stores.writer.clone(),
+                    Context::default(),
+                    Bytes::from(vec![7u8; 400]),
+                    WriteOptions::default(),
+                )
+                .await
+                .expect("writes the content");
+
+                let walk = revision_by_number_local(&stores.writer, oversized.hash, 1).await;
+
+                let error = walk.expect_err("content too large to be a state fails the walk");
+                assert!(caused_by::<Oversized>(&error), "{error:?}");
+            })
+            .await;
+    }
+
+    /// A walk that reaches a blob that is not a revision state fails with an internal error,
+    /// whether the start or a parent names it, rather than reading the blob as a number and a
+    /// parent.
+    #[tokio::test]
+    async fn number_walk_fails_on_a_blob_that_is_not_a_state() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let (stores, _counting) = counted_client_stores().await;
+                let not_a_state = write_not_a_state(&stores.writer).await;
+                let start = write_line(&stores.writer, not_a_state, 2, 1).await[0];
+
+                for (named_by, revision) in [("the start", not_a_state), ("a parent", start)] {
+                    let walk = revision_by_number_local(&stores.writer, revision, 1).await;
+
+                    assert!(
+                        walk.as_ref().is_err_and(|error| error.is_internal()),
+                        "named by {named_by}: {walk:?}"
+                    );
+                }
+            })
+            .await;
+    }
+
+    /// A failed store read fails the walk with the store's error on a strict-local context, and is
+    /// a state the store lacks on any other.
+    #[tokio::test]
+    async fn number_walk_fails_on_a_failed_read_where_reads_are_strict() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let (stores, counting) = counted_client_stores().await;
+                let start = write_line(&stores.writer, Hash::default(), 1, 1).await[0];
+                let strict_reader = stores.strict_reader();
+                counting.fail_reads();
+
+                let strict = revision_by_number_local(&strict_reader, start, 1).await;
+                let lenient = revision_by_number_local(&stores.writer, start, 1).await;
+
+                let error = strict.expect_err("a strict-local context fails a failed read");
+                assert!(caused_by::<Disconnected>(&error), "{error:?}");
+                assert_eq!(
+                    lenient.expect("a failed read is a miss where reads are not strict"),
+                    NumberWalk::Missing(start)
+                );
+            })
+            .await;
+    }
+
+    /// A walk on a context whose remote is in reach asks it for nothing: a state the local store
+    /// lacks is `Missing`, and no session is started.
+    #[tokio::test]
+    async fn number_walk_leaves_the_remote_off() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let (endpoint, connection) = counted_endpoint(RepositoryId::default()).await;
+                let context = built_context(|context| context.with_remote_endpoint(endpoint)).await;
+                assert!(!context.is_offline());
+                let missing = Hash::from([0xA0; 32]);
+
+                let walk = revision_by_number_local(&context, missing, 1).await;
+
+                assert_eq!(connection.storage_session_starts(), 0);
+                assert_eq!(
+                    walk.expect("a state the store lacks is not a failed read"),
+                    NumberWalk::Missing(missing)
+                );
+            })
+            .await;
+    }
+}
+
+mod verified_state {
+    use bytes::Bytes;
+    use lore_base::types::Hash;
+    use lore_revision::find::verified_state;
+    use lore_revision::state::StateData;
+    use lore_transport::RevisionItem;
+
+    /// A page item whose bytes hash to its signature but lack the state magic carries no state of
+    /// its own, as a read of the same blob as a state finds none.
+    #[test]
+    fn an_item_whose_state_lacks_the_magic_has_no_verified_state() {
+        let state = Bytes::from(vec![0u8; size_of::<StateData>()]);
+        let item = RevisionItem {
+            number: 0,
+            signature: Hash::hash_buffer(&state),
+            metadata: Hash::default(),
+            state,
+        };
+
+        assert!(verified_state(&item).is_none());
+    }
+}
+
+mod revision_state {
+    use lore_base::runtime::LORE_CONTEXT;
+    use lore_base::types::Hash;
+    use lore_revision::find::StateMiss;
+    use lore_revision::find::revision_state;
+    use lore_revision::immutable::read_options_from_repository;
+
+    use crate::branch::write_line;
+    use crate::branch::write_not_a_state;
+    use crate::helper::setup_test_execution;
+    use crate::paged_remote::Reads;
+    use crate::paged_remote::counted_client_stores;
+
+    /// A read of a revision's state tells its three answers apart: the state, a hash the store
+    /// lacks, and a blob that is not a revision state. A zero revision is missing, and reads
+    /// nothing.
+    #[tokio::test]
+    async fn a_state_read_tells_a_missing_state_from_a_blob_that_is_not_one() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let (stores, counting) = counted_client_stores().await;
+                let revision = write_line(&stores.writer, Hash::default(), 3, 1).await[0];
+                let not_a_state = write_not_a_state(&stores.writer).await;
+                let options = read_options_from_repository(&stores.writer);
+
+                let state = revision_state(&stores.writer, revision, options)
+                    .await
+                    .expect("the read succeeds")
+                    .expect("the store holds the state");
+                assert_eq!(state.revision_number, 3);
+                for (named, hash, miss) in [
+                    (
+                        "a hash the store lacks",
+                        Hash::from([0xA0; 32]),
+                        StateMiss::Missing,
+                    ),
+                    (
+                        "a blob that is not a state",
+                        not_a_state,
+                        StateMiss::NotAState,
+                    ),
+                ] {
+                    let read = revision_state(&stores.writer, hash, options)
+                        .await
+                        .expect("a miss is not a failed read");
+                    assert_eq!(read.err(), Some(miss), "{named}");
+                }
+                counting.take_reads();
+
+                let zero = revision_state(&stores.writer, Hash::default(), options)
+                    .await
+                    .expect("the read succeeds");
+
+                assert_eq!(zero.err(), Some(StateMiss::Missing));
+                assert_eq!(
+                    counting.take_reads(),
+                    Reads {
+                        payloads: 0,
+                        queries: 0
+                    }
+                );
             })
             .await;
     }

@@ -1,15 +1,36 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 # SPDX-License-Identifier: MIT
 
+import os
+
 import pytest
-from error_types import ImproperArgumentsError
+from error_types import (
+    ImproperArgumentsError,
+    NotSupportedError,
+    UnresolvedConflictError,
+)
 from link_helpers import (
+    LINK_MOVES,
+    MERGE_LINKS,
+    SUBTREE_LINK,
+    assert_link_holds,
+    assert_linked_main_merged_settings,
+    diverged_link_branches,
     link_pin,
     make_parent_with_link,
     make_repo,
+    merge_a_branch_moving_a_link,
+    merge_a_branch_removing_a_link,
+    mount_part_inside_the_second_link_on_feature,
+    parent_with_a_link_merging_into_a_failure,
+    remove_the_second_link,
+    resolve_the_only_conflict,
     setup_link_merge_conflict,
+    start_the_merge_failing_at_the_second_link,
+    subtree_link_with_outside_change,
 )
-from test_utils import revision_metadata_keys
+from lore_parsers import parse_status_json
+from test_utils import registered_links, revision_metadata_keys
 
 pytestmark = pytest.mark.own_vfs(
     "links a repository, which a virtual clone does not hold"
@@ -64,6 +85,101 @@ def test_link_merge_all_conflict_in_a_link_exposing_a_subtree(new_lore_repo):
 
     with urc.open_file(conflict_file, "r") as f:
         assert "resolved through the mount" in f.read()
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("inside_change", [False, True], ids=["outside", "both"])
+def test_link_merge_all_commits_changes_outside_a_subtree_link(
+    new_lore_repo, inside_change
+):
+    """A merge of a link mounting a subtree commits what it merged outside the subtree into
+    the linked repository, beside what it merged through the mount."""
+    parent, linked = subtree_link_with_outside_change(
+        new_lore_repo, inside_change, conflicting=False
+    )
+
+    parent.branch_merge_start("feature", message="Merge feature")
+    parent.push()
+
+    assert_linked_main_merged_settings(parent, linked)
+    with parent.open_file(f"{SUBTREE_LINK}/a.txt") as f:
+        assert f.read() == ("a on feature\n" if inside_change else "a base\n")
+
+
+@pytest.mark.smoke
+def test_link_commit_link_commits_changes_outside_a_subtree_link(new_lore_repo):
+    """A commit of the link alone, during a merge, commits what the merge staged outside the
+    subtree the link mounts."""
+    parent, linked = subtree_link_with_outside_change(
+        new_lore_repo, inside_change=False, conflicting=False
+    )
+
+    parent.branch_merge_start("feature", message="Merge feature", no_commit=True)
+    parent.commit("Merge the linked feature branch", link=SUBTREE_LINK)
+    parent.commit("Merge feature")
+    parent.push()
+
+    assert_linked_main_merged_settings(parent, linked)
+
+
+@pytest.mark.smoke
+def test_link_merge_all_refuses_a_conflict_outside_a_subtree_link(new_lore_repo):
+    """A conflict a merge leaves outside the subtree a link mounts refuses the commit, and an
+    abort restores the pin and the mount, leaving both repositories' branches where they were."""
+    parent, linked = subtree_link_with_outside_change(
+        new_lore_repo, inside_change=False, conflicting=True
+    )
+    pin_before = link_pin(parent, linked.get_id())
+    latest_before = parent.branch_info().local_latest
+    linked_latest_before = linked.branch_info("main").remote_latest
+
+    parent.branch_merge_start("feature", message="Merge feature")
+    with pytest.raises(UnresolvedConflictError):
+        parent.commit("Merge feature")
+
+    parent.branch_merge_abort()
+    assert link_pin(parent, linked.get_id()) == pin_before
+    assert parent.branch_info().local_latest == latest_before
+    assert linked.branch_info("main").remote_latest == linked_latest_before
+    assert parse_status_json(parent.status(json=True)) == []
+    with parent.open_file(f"{SUBTREE_LINK}/a.txt") as f:
+        assert f.read() == "a base\n"
+    with parent.open_file("root.txt") as f:
+        assert f.read() == "root\n"
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("link", [None, SUBTREE_LINK], ids=["all", "link"])
+def test_link_merge_all_refuses_deleting_the_subtree_a_link_mounts(new_lore_repo, link):
+    """A merge, of every link or of the link alone, whose linked branch deletes the directory
+    holding the subtree a link mounts is refused before it stages anything, leaving the working
+    tree and the pin as they were."""
+    parent, linked = make_parent_with_link(
+        new_lore_repo,
+        SUBTREE_LINK,
+        {"content/assets/a.txt": "a base\n", "config/settings.txt": "settings base\n"},
+        {"root.txt": "root\n"},
+        source_path="content/assets",
+    )
+    parent.branch_create("feature")
+    parent.write_commit_push("Feature change", {"root.txt": "root on feature\n"})
+    linked.branch_switch("feature")
+    linked.rmtree("content")
+    linked.stage(scan=True)
+    linked.commit("Delete content")
+    linked.push()
+    parent.branch_switch("main")
+    pin_before = link_pin(parent, linked.get_id())
+
+    with pytest.raises(NotSupportedError):
+        parent.branch_merge_start("feature", message="Merge feature", link=link)
+
+    assert parse_status_json(parent.status(json=True)) == []
+    assert link_pin(parent, linked.get_id()) == pin_before
+    with parent.open_file(f"{SUBTREE_LINK}/a.txt") as f:
+        assert f.read() == "a base\n"
+    with parent.open_file("root.txt") as f:
+        assert f.read() == "root\n"
 
 
 @pytest.mark.smoke
@@ -1649,49 +1765,21 @@ def test_link_merge_abort_all_then_resume_multiple_links(new_lore_repo):
     )
 
 
-_MERGE_LINKS = ["linked/repo", "linked/other"]
-
-
-def _diverged_link_branches(new_lore_repo):
-    urc, first_link = make_parent_with_link(new_lore_repo, _MERGE_LINKS[0])
-    link_repos = [first_link]
-    for link_path in _MERGE_LINKS[1:]:
-        link_repo = make_repo(new_lore_repo, {"linked.txt": "linked content\n"})
-        urc.link_add(link_path, link_repo.get_id(), "/")
-        link_repos.append(link_repo)
-    urc.commit("Add more links")
-    urc.push()
-
-    urc.branch_create("feature-branch")
-    urc.write_commit_push(
-        "Feature changes",
-        {"feature.txt": "feature\n"}
-        | {f"{link_path}/feature.txt": "feature\n" for link_path in _MERGE_LINKS},
-    )
-    urc.branch_switch("main")
-    urc.write_commit_push(
-        "Main changes",
-        {"main.txt": "main\n"}
-        | {f"{link_path}/main.txt": "main\n" for link_path in _MERGE_LINKS},
-    )
-    return urc, link_repos
-
-
 @pytest.mark.smoke
 @pytest.mark.parametrize(
     "link_scoped, message_paths",
-    [(False, _MERGE_LINKS), (True, ["./linked/repo/"])],
+    [(False, MERGE_LINKS), (True, ["./linked/repo/"])],
     ids=["all-links", "link-scoped-unnormalized-path"],
 )
 def test_link_merge_per_link_message(new_lore_repo, link_scoped, message_paths):
     """An auto-committed merge gives each linked repository its own message."""
-    urc, link_repos = _diverged_link_branches(new_lore_repo)
+    urc, link_repos = diverged_link_branches(new_lore_repo)
     link_messages = {path: f"Merge into {path}" for path in message_paths}
 
     urc.branch_merge_start(
         "feature-branch",
         message="Merge parent",
-        link=_MERGE_LINKS[0] if link_scoped else None,
+        link=MERGE_LINKS[0] if link_scoped else None,
         link_messages=link_messages,
     )
     urc.push()
@@ -1709,7 +1797,7 @@ def test_link_merge_per_link_message(new_lore_repo, link_scoped, message_paths):
 @pytest.mark.parametrize("message_path", ["not/a/link", "main.txt"])
 def test_link_merge_rejects_unknown_link_message_path(new_lore_repo, message_path):
     """A per-link message for a path that is not a link fails before merging."""
-    urc, _link_repos = _diverged_link_branches(new_lore_repo)
+    urc, _link_repos = diverged_link_branches(new_lore_repo)
     revision_before = urc.revision_info(check=True, no_pager=True).revision
 
     with pytest.raises(ImproperArgumentsError):
@@ -1720,3 +1808,277 @@ def test_link_merge_rejects_unknown_link_message_path(new_lore_repo, message_pat
         )
 
     assert urc.revision_info(check=True, no_pager=True).revision == revision_before
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("pinned", [False, True], ids=["tracking", "pinned"])
+@pytest.mark.parametrize(
+    "added", [False, True], ids=["removed", "removed and added elsewhere"]
+)
+def test_link_merge_all_of_a_branch_removing_a_link_with_incoming_changes(
+    new_lore_repo, pinned, added
+):
+    """A default merge of a branch that removes a link whose repository has incoming changes
+    carries the removal. A link the branch adds to the same repository elsewhere is merged in
+    the repository, so it holds main's changes to the repository as well."""
+    urc, link_repo = merge_a_branch_removing_a_link(new_lore_repo, added, pinned)
+    urc.push()
+
+    assert registered_links(urc) == ({"libs/new": link_repo.get_id()} if added else {})
+    exposed = ["feature.txt", "linked.txt", "main.txt", "shared.txt"]
+    for repo in [urc, urc.clone()]:
+        assert not repo.path_exists("libs/old"), "the merge should remove the old mount"
+        if added:
+            assert sorted(os.listdir(os.path.join(repo.path, "libs/new"))) == exposed, (
+                "the added link should expose the revision the merged branch pins"
+            )
+
+
+@pytest.mark.smoke
+def test_link_merge_all_of_a_branch_removing_a_link_leaves_out_its_message(
+    new_lore_repo,
+):
+    """A per-link message naming a link the merged branch removes names no link of the merge's
+    result, so the merge leaves it out and commits."""
+    urc, _ = merge_a_branch_removing_a_link(
+        new_lore_repo,
+        added=False,
+        pinned=False,
+        link_messages={"libs/old": "Merge the removed link"},
+    )
+
+    assert parse_status_json(urc.status(json=True)) == [], (
+        "the merge should commit with nothing left staged"
+    )
+    assert registered_links(urc) == {}
+
+
+@pytest.mark.smoke
+def test_link_merge_all_of_a_branch_removing_a_link_leaves_out_its_conflicts(
+    new_lore_repo,
+):
+    """A link the merged branch removes is not merged in its own right, so a conflict between
+    the branches' changes to its repository does not stop the merge."""
+    urc, _ = merge_a_branch_removing_a_link(
+        new_lore_repo, added=False, pinned=False, conflict="shared.txt"
+    )
+
+    assert urc.unresolved_paths() == set()
+    assert parse_status_json(urc.status(json=True)) == [], (
+        "the merge should commit with nothing left staged"
+    )
+    assert registered_links(urc) == {}
+    assert not urc.path_exists("libs/old")
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("pinned", [False, True], ids=["tracking", "pinned"])
+@pytest.mark.parametrize(
+    "added", [False, True], ids=["removed", "removed and added elsewhere"]
+)
+def test_link_merge_abort_all_of_a_branch_removing_a_link(new_lore_repo, pinned, added):
+    """Aborting a merge that removes a link puts the link back where it was."""
+    urc, link_repo = merge_a_branch_removing_a_link(
+        new_lore_repo, added, pinned, conflict="main-file.txt"
+    )
+
+    urc.branch_merge_abort()
+
+    assert registered_links(urc) == {"libs/old": link_repo.get_id()}
+    assert sorted(os.listdir(os.path.join(urc.path, "libs"))) == ["old"]
+    assert sorted(os.listdir(os.path.join(urc.path, "libs/old"))) == [
+        "linked.txt",
+        "main.txt",
+        "shared.txt",
+    ]
+    assert parse_status_json(urc.status(json=True)) == [], (
+        "the abort should leave nothing staged"
+    )
+
+
+@pytest.mark.smoke
+def test_link_merge_all_resumed_after_the_merged_branch_removes_a_conflicted_link(
+    new_lore_repo,
+):
+    """A merge stopped on a conflict in a link, resumed once the merged branch has removed that
+    link, carries the removal and leaves out the link's merge."""
+    urc, _, link_path = setup_link_merge_conflict(new_lore_repo, link_path="libs/old")
+    urc.branch_merge_start("feature-branch", message="Merge feature-branch")
+    conflicted = f"{link_path}/data.txt"
+    assert urc.unresolved_paths() == {conflicted}
+
+    remover = urc.clone(branch="feature-branch")
+    remover.link_remove(link_path)
+    remover.commit("Feature removes the link")
+    remover.push()
+
+    urc.write_files({conflicted: "resolved\n"})
+    urc.branch_merge_resolve(conflicted)
+    urc.branch_merge_start("feature-branch", message="Merge feature-branch")
+
+    assert registered_links(urc) == {}
+    assert not urc.path_exists(link_path)
+    assert parse_status_json(urc.status(json=True)) == [], (
+        "the resumed merge should commit with nothing left staged"
+    )
+
+
+@pytest.mark.smoke
+def test_link_merge_all_of_a_branch_linking_another_repository_at_a_removed_link(
+    new_lore_repo,
+):
+    """A branch that removes a link and links another repository at its path replaces the link:
+    the merge leaves out the merge of the first repository, and the other one stands at the pin
+    the branch gives it."""
+    urc = make_repo(new_lore_repo, {"main-file.txt": "main base\n"})
+    link_repo = make_repo(new_lore_repo, {"linked.txt": "linked base\n"})
+    other_repo = make_repo(new_lore_repo, {"other.txt": "other\n"})
+    urc.link_add("libs/old", link_repo.get_id(), "/")
+    urc.commit("Add link")
+    urc.push()
+
+    urc.branch_create("feature-branch")
+    urc.write_commit_push("Feature changes the link", {"libs/old/feature.txt": "f\n"})
+    urc.link_remove("libs/old")
+    urc.link_add("libs/old", other_repo.get_id(), "/")
+    other_pin = link_pin(urc, other_repo.get_id())
+    urc.commit("Feature links another repository at the path")
+    urc.push()
+
+    urc.branch_switch("main")
+    urc.write_commit_push("Main changes the link", {"libs/old/main.txt": "m\n"})
+    urc.branch_merge("feature-branch", message="Merge feature-branch")
+    urc.push()
+
+    assert registered_links(urc) == {"libs/old": other_repo.get_id()}
+    assert link_pin(urc, other_repo.get_id()) == other_pin
+    for repo in [urc, urc.clone()]:
+        assert os.listdir(os.path.join(repo.path, "libs/old")) == ["other.txt"]
+
+
+@pytest.mark.smoke
+def test_link_merge_abort_of_a_merge_resumed_after_the_merged_branch_removes_a_link(
+    new_lore_repo,
+):
+    """A merge resumed after the merged branch removed a conflicted link, which then stops on a
+    conflict of the parent's own, aborts back to the link where it was."""
+    urc, link_repo, link_path = setup_link_merge_conflict(
+        new_lore_repo, link_path="libs/old"
+    )
+    urc.write_commit_push("Main changes the parent", {"main-file.txt": "main\n"})
+    remover = urc.clone(branch="feature-branch")
+    remover.write_commit_push(
+        "Feature changes the parent", {"main-file.txt": "feature\n"}
+    )
+    urc.branch_merge_start("feature-branch", message="Merge feature-branch")
+    conflicted = f"{link_path}/data.txt"
+    assert urc.unresolved_paths() == {conflicted}
+
+    remover.link_remove(link_path)
+    remover.commit("Feature removes the link")
+    remover.push()
+    urc.write_files({conflicted: "resolved\n"})
+    urc.branch_merge_resolve(conflicted)
+    urc.branch_merge_start("feature-branch", message="Merge feature-branch")
+    assert urc.unresolved_paths() == {"main-file.txt"}
+
+    urc.branch_merge_abort()
+
+    assert registered_links(urc) == {link_path: link_repo.get_id()}
+    with urc.open_file(conflicted) as f:
+        assert f.read() == "mine\n", (
+            "the abort should restore the link's pre-merge content"
+        )
+    assert parse_status_json(urc.status(json=True)) == [], (
+        "the abort should leave nothing staged"
+    )
+
+
+@pytest.mark.smoke
+def test_link_merge_all_resumed_after_a_failed_link_merges_the_links_merged_before_it(
+    new_lore_repo,
+):
+    """A merge stopped on a conflict in its first link and resolved, resumed, merges a link the
+    merged branch has changed since, conflicting, and fails at another. Resumed again once the
+    merged branch has removed that link, it merges the conflicted link again and stops on its
+    conflict, keeping the first link's resolution."""
+    urc, nested = parent_with_a_link_merging_into_a_failure(new_lore_repo)
+    urc.branch_merge_start("feature-branch", message="Merge feature-branch")
+    resolve_the_only_conflict(urc, "libs/first/data.txt")
+
+    feature = mount_part_inside_the_second_link_on_feature(urc, nested)
+    feature.write_commit_push(
+        "Feature changes the other link",
+        {"libs/other/feature.txt": "feature\n", "libs/other/other.txt": "feature\n"},
+    )
+    start_the_merge_failing_at_the_second_link(urc)
+    remove_the_second_link(feature)
+
+    urc.branch_merge_start("feature-branch", message="Merge feature-branch")
+    resolve_the_only_conflict(urc, "libs/other/other.txt")
+    urc.branch_merge_start("feature-branch", message="Merge feature-branch")
+    urc.push()
+
+    for repo in [urc, urc.clone()]:
+        assert_link_holds(
+            repo,
+            "libs/first",
+            {
+                "data.txt": "resolved\n",
+                "feature.txt": "feature\n",
+                "main.txt": "main\n",
+            },
+        )
+        assert_link_holds(
+            repo,
+            "libs/other",
+            {
+                "feature.txt": "feature\n",
+                "main.txt": "main\n",
+                "other.txt": "resolved\n",
+            },
+        )
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("pinned", [False, True], ids=["tracking", "pinned"])
+@pytest.mark.parametrize("how", LINK_MOVES.keys())
+def test_link_merge_all_of_a_branch_moving_a_link(new_lore_repo, pinned, how):
+    """A link the merged branch renames in case, or carries along with a directory renamed in
+    case, is merged in its own right where it moves to. The diff holds a directory moved elsewhere
+    as a delete and an add, so the merge carries the removal of the link inside it, and merges
+    the repository of the link the branch adds there."""
+    moved, destination, exposed = LINK_MOVES[how]
+    urc, link_repo = merge_a_branch_moving_a_link(new_lore_repo, pinned, moved)
+    urc.push()
+
+    assert registered_links(urc) == {destination: link_repo.get_id()}
+    for repo in [urc, urc.clone()]:
+        assert sorted(os.listdir(os.path.join(repo.path, destination))) == exposed
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("pinned", [False, True], ids=["tracking", "pinned"])
+@pytest.mark.parametrize("how", LINK_MOVES.keys())
+def test_link_merge_abort_of_a_branch_moving_a_link(new_lore_repo, pinned, how):
+    """Aborting a merge that moves a link, or the directory holding it, puts the link back where
+    it was."""
+    moved = LINK_MOVES[how][0]
+    urc, link_repo = merge_a_branch_moving_a_link(
+        new_lore_repo, pinned, moved, conflict=True
+    )
+    assert urc.unresolved_paths() == {"main-file.txt"}
+
+    urc.branch_merge_abort()
+
+    assert registered_links(urc) == {"libs/old": link_repo.get_id()}
+    root = os.listdir(urc.path)
+    assert "libs" in root and "Libs" not in root and "vendor" not in root
+    assert os.listdir(os.path.join(urc.path, "libs")) == ["old"]
+    assert sorted(os.listdir(os.path.join(urc.path, "libs/old"))) == [
+        "linked.txt",
+        "main.txt",
+    ]
+    assert parse_status_json(urc.status(json=True)) == [], (
+        "the abort should leave nothing staged"
+    )

@@ -311,6 +311,33 @@ async fn holds_name_exactly_true_only_for_exact_spelling() {
     .await;
 }
 
+/// Two spellings of one path name its one entry, which the served tree finds by any spelling;
+/// another entry, and a path naming nothing, do not, and a first path naming nothing is answered
+/// as naming nothing.
+#[tokio::test]
+async fn names_one_entry_only_for_spellings_of_one_path() {
+    in_context(async {
+        let m = mounted().await;
+        for (from, to, one) in [
+            ("README.md", "readme.MD", Some(true)),
+            ("dir/sub", "DIR/SUB", Some(true)),
+            ("README.md", "dir/sub/b.txt", Some(false)),
+            ("README.md", "missing", Some(false)),
+            ("missing", "README.md", None),
+        ] {
+            assert_eq!(
+                m.operation
+                    .names_one_entry(&path(from), &path(to))
+                    .await
+                    .expect("an answer"),
+                one,
+                "{from} and {to}"
+            );
+        }
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn names_folding_to_lists_case_variants() {
     in_context(async {
@@ -930,8 +957,8 @@ impl FilesystemProvider for MountedProvider {
     }
 }
 
-/// How long the held-invalidation test waits on each step.
-const HELD_WAIT: Duration = Duration::from_secs(10);
+/// How long the held-invalidation test waits on each step before calling it stuck.
+const HELD_WAIT: Duration = Duration::from_secs(60);
 
 /// Records each invalidation, holding the first until released, as the kernel holds an entry
 /// invalidation beside a LOOKUP it is waiting on.
@@ -1250,7 +1277,7 @@ impl Working {
     /// [`Self::status`] of `at` alone, or of the whole tree for `None`.
     async fn status_at(&self, at: Option<&str>) -> BTreeMap<String, (LoreFileAction, bool)> {
         let token = RepositoryWriteToken::acquire(&self.path).await;
-        staged_state::status_files_at(
+        crate::helper::test_status_files_at(
             self.command_context(&self.fs, Some(token)),
             at.map(|at| vec![path(at)]),
             false,
@@ -1338,7 +1365,7 @@ impl Working {
             filesystem_path: path(at),
             states: FilterStates::ROOT,
             from_states: FilterStates::ROOT,
-            asks_path: false,
+            named_path: None,
             filter_mode: FilterMode::Full,
             intent,
             layer_mounts: Arc::new(Vec::new()),
@@ -1671,6 +1698,102 @@ async fn a_marking_diff_marks_a_case_only_rename_as_a_move() {
             "the renamed file is marked moved, flags {:#x}",
             marked.flags
         );
+    })
+    .await;
+}
+
+/// The directory inode holding `path` and its last name.
+async fn parent_and_name<'a>(fs: &FuseFilesystem, path: &'a str) -> (u64, &'a str) {
+    match path.rsplit_once('/') {
+        Some((parent, name)) => (
+            ino_at(fs, parent)
+                .await
+                .unwrap_or_else(|| panic!("{parent} is served")),
+            name,
+        ),
+        None => (ROOT_INO, path),
+    }
+}
+
+/// Renames `from` to `to` through the mount, then marks the move dirty, as `lore dirty move` does.
+async fn dirty_moved(w: &Working, from: &str, to: &str) {
+    let (from_parent, from_name) = parent_and_name(&w.fs, from).await;
+    let (to_parent, to_name) = parent_and_name(&w.fs, to).await;
+    rename(&w.fs, from_parent, from_name, to_parent, to_name).await;
+    let token = RepositoryWriteToken::acquire(&w.path).await;
+    lore_revision::file::dirty::dirty_move(
+        w.command_context(&w.fs, Some(token)),
+        w.path.join(from).to_string_lossy().into_owned(),
+        w.path.join(to).to_string_lossy().into_owned(),
+    )
+    .await
+    .expect("the dirty move");
+}
+
+/// Moves the file at `path` to the front of its directory's children, so a walk of them meets it
+/// first: to the root and back, each move marked dirty.
+async fn to_front(w: &Working, path: &str) {
+    let through = path.replace('/', "_");
+    dirty_moved(w, path, &through).await;
+    dirty_moved(w, &through, path).await;
+}
+
+/// A status through the mount of a name `lore dirty move` took from a committed file reports that
+/// file's deletion and the move: the name the mount holds pairs with the moved file, not the one
+/// marked deleted beside it, whichever of the two the staged chain holds first. A move from another
+/// directory puts the moved file ahead, and a rename in place keeps its place, which `to_front`
+/// sets before the deletion.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_status_through_the_mount_of_a_name_a_dirty_move_took_reports_the_deletion_and_the_move()
+{
+    in_context(async {
+        let mut orders = std::collections::BTreeSet::new();
+        for (source, front) in [("b", None), ("a/g", Some("a/f")), ("a/g", Some("a/g"))] {
+            let w = working(&[("a/f", b"eff"), ("a/g", b"gee"), ("b", b"bee")]).await;
+            if let Some(front) = front {
+                to_front(&w, front).await;
+            }
+            dirty_moved(&w, source, "a/f").await;
+            let case = format!("{source} onto a/f, {front:?} at the front");
+
+            let staged = w.staged().await;
+            let a_node = staged
+                .find_node_link(w.repository.clone(), "a")
+                .await
+                .expect("a")
+                .node;
+            let first = staged
+                .node_children(w.repository.clone(), a_node)
+                .await
+                .expect("the children of a")
+                .into_iter()
+                .next()
+                .expect("a child of a");
+            orders.insert(
+                staged
+                    .node(w.repository.clone(), first)
+                    .await
+                    .expect("the first child of a")
+                    .is_deleted(),
+            );
+            let token = RepositoryWriteToken::acquire(&w.path).await;
+            let mut reported = crate::helper::test_status_events_at(
+                w.command_context(&w.fs, Some(token)),
+                None,
+                false,
+            )
+            .await;
+            reported.sort_by_key(|(path, action, _)| (path.clone(), *action as u32));
+            assert_eq!(
+                reported,
+                vec![
+                    ("a/f".to_string(), LoreFileAction::Delete, true),
+                    ("a/f".to_string(), LoreFileAction::Move, true),
+                ],
+                "{case}"
+            );
+        }
+        assert_eq!(orders.len(), 2, "both chain orders");
     })
     .await;
 }
@@ -2118,6 +2241,114 @@ async fn host_content(operation: &FuseOperation, at: &str) -> Vec<u8> {
     std::fs::read(file).expect("the host file reads")
 }
 
+/// The time the mutable store holds for `path` under the instance's modified-time key, which a
+/// context holding no records reads as its recorded time; 0 for none.
+async fn store_recorded_time(w: &Working, path: &RelativePath) -> u64 {
+    lore_revision::state::stored_modified_time(
+        &w.repository,
+        lore_revision::state::file_modified_time_key(
+            w.repository.salt(),
+            w.repository.instance_id,
+            path,
+        ),
+    )
+    .await
+}
+
+/// A virtual clone tells a file from its node by address and content, never by a recorded time:
+/// a local file of the node's size, whose time is the one recorded for its path, compares as
+/// modified, and a tracked file that compares as unmodified has no time recorded for it, even by
+/// a context that could write one.
+#[tokio::test]
+async fn a_virtual_clone_compares_files_by_content_never_by_a_recorded_time() {
+    in_context(async {
+        let w = working(FIXTURE).await;
+        let operation = InstanceOperationImpl::new(
+            StaticDispatchInstanceOperation::Fuse(FuseOperation::new(w.fs.clone())),
+            true,
+        );
+        let node_at = async |at: &RelativePath| {
+            w.current
+                .find_node(w.repository.clone(), at.as_str())
+                .await
+                .expect("the committed node")
+        };
+        let a = lookup_ino(&w.fs, ROOT_INO, "a.txt").await.expect("a.txt");
+        write_all(&w.fs, a, 0, 0, b"ALPHA").await;
+        let written = path("a.txt");
+        let info = operation.file_info(&written).await.expect("info");
+        let node = node_at(&written).await;
+        assert_eq!(info.size(), node.size, "the edit keeps the size");
+        w.mutable
+            .clone()
+            .store(
+                w.repository.root_id(),
+                lore_revision::state::file_modified_time_key(
+                    w.repository.salt(),
+                    w.repository.instance_id,
+                    &written,
+                ),
+                lore_base::types::Hash::from_u64(info.mtime()),
+                lore_base::types::KeyType::Untyped,
+            )
+            .await
+            .expect("record the file's time");
+        assert_eq!(store_recorded_time(&w, &written).await, info.mtime());
+        let compared = lore_revision::state::file_modification(
+            w.repository.clone(),
+            &node,
+            info.mtime(),
+            info.size(),
+            &written,
+            false,
+            &operation,
+            &lore_storage::ContentHashes::default(),
+        )
+        .await
+        .expect("compare the written file");
+        assert!(
+            matches!(
+                compared,
+                lore_revision::state::FileModification::ModifiedByHash
+            ),
+            "compared by content"
+        );
+
+        let tracked = path("dir/c.txt");
+        let info = operation.file_info(&tracked).await.expect("info");
+        let before = store_recorded_time(&w, &tracked).await;
+        assert_ne!(before, info.mtime(), "a time recorded now would show");
+        let token = RepositoryWriteToken::acquire(&w.path).await;
+        let writing = Arc::new(
+            w.repository
+                .without_command_locks()
+                .with_write_token(token.share()),
+        );
+        let compared = lore_revision::state::file_modified_against_node(
+            writing,
+            &node_at(&tracked).await,
+            info.mtime(),
+            info.size(),
+            &tracked,
+            true,
+            &operation,
+            &lore_storage::ContentHashes::default(),
+        )
+        .await
+        .expect("compare the tracked file");
+        assert!(matches!(
+            compared,
+            lore_revision::state::FileModification::UnmodifiedByHash
+        ));
+        assert_eq!(
+            store_recorded_time(&w, &tracked).await,
+            before,
+            "no time is recorded"
+        );
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn the_operation_reads_local_content_from_write() {
     let w = working(FIXTURE).await;
@@ -2418,6 +2649,68 @@ async fn a_tracked_file_replaced_by_a_directory_commits_as_the_directory() {
 #[tokio::test]
 async fn a_tracked_file_replaced_by_a_directory_commits_when_status_and_stage_name_it() {
     Box::pin(replace_a_tracked_file_by_a_directory_and_commit(Some("x"))).await;
+}
+
+/// Marks `paths` dirty through `w`'s provider, as `lore file dirty` does.
+async fn dirty_paths(w: &Working, paths: &[PathBuf]) {
+    let token = RepositoryWriteToken::acquire(&w.path).await;
+    let context = w.command_context(&w.fs, Some(token.share()));
+    LORE_CONTEXT
+        .scope(
+            fuse_fixture::setup_test_execution(),
+            lore_revision::file::dirty::dirty(
+                context,
+                LoreArray::from_vec(paths.iter().map(LoreString::from).collect()),
+            ),
+        )
+        .await
+        .expect("the paths are marked");
+}
+
+/// A tracked file replaced through the mount by a directory, its type change marked dirty, stages
+/// without a scan as the file deleted beside the directory added, and commits as the directory
+/// alone.
+#[tokio::test]
+async fn a_stage_of_a_marked_type_change_stages_the_file_deleted_beside_the_directory() {
+    let w = working(&[("x", b"a file first"), ("keep.txt", b"keep")]).await;
+    w.fs.unlink(&req(), ROOT_INO, b"x").await.expect("unlink");
+    let x = mkdir(&w.fs, ROOT_INO, "x").await;
+    write_new(&w.fs, x, "f.txt", b"content below").await;
+    dirty_paths(&w, &[w.path.join("x")]).await;
+    stage_paths(&w, &[w.path.join("x")], false).await;
+
+    let staged = w.staged().await;
+    let name_hash = lore_storage::hash::hash_string("x");
+    let mut held = Vec::new();
+    for child in staged
+        .node_children(w.repository.clone(), lore_revision::node::ROOT_NODE)
+        .await
+        .expect("the root's children")
+    {
+        let node = staged
+            .node(w.repository.clone(), child)
+            .await
+            .expect("a child");
+        if node.name_hash == name_hash {
+            held.push((
+                node.is_file(),
+                node.is_staged_delete(),
+                node.is_staged_add(),
+            ));
+        }
+    }
+    held.sort_unstable();
+    assert_eq!(
+        held,
+        [(false, false, true), (true, true, false)],
+        "x is not the file staged deleted beside the directory staged added"
+    );
+    let committed = stage_and_commit(&w, &[w.path.join("x")]).await;
+    assert_eq!(
+        children_named(&w.repository, &committed, "", "x").await,
+        1,
+        "the revision holds one node named x"
+    );
 }
 
 /// A tracked directory replaced through the mount by a file commits as the file: the directory's
@@ -3026,6 +3319,24 @@ async fn fastest_quiet_diff(w: &Working, from: &Arc<State>) -> std::time::Durati
     fastest
 }
 
+/// A stage of a directory removed through the provider stages it deleted whole, with a scan or
+/// without one.
+#[tokio::test]
+async fn a_stage_of_a_removed_directory_stages_it_deleted_with_or_without_a_scan() {
+    for scan in [true, false] {
+        let w = Box::pin(working(FIXTURE)).await;
+        let dir = lookup_ino(&w.fs, ROOT_INO, "dir").await.expect("dir");
+        w.fs.unlink(&req(), dir, b"c.txt").await.expect("unlink");
+        w.fs.rmdir(&req(), ROOT_INO, b"dir").await.expect("rmdir");
+        stage_paths(&w, &[w.path.join("dir")], scan).await;
+        assert_eq!(
+            staged_at(&w, &["dir"]).await,
+            [("dir".to_string(), 1, "delete")],
+            "the stage, scanning {scan}, did not stage dir deleted"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_diff_over_a_staged_deleted_directory_walks_none_of_its_children() {
     const FILES: usize = 2000;
@@ -3046,9 +3357,6 @@ async fn a_diff_over_a_staged_deleted_directory_walks_none_of_its_children() {
             .expect("unlink");
     }
     w.fs.rmdir(&req(), ROOT_INO, b"dir").await.expect("rmdir");
-    // A scan stages the missing directory's deletion whole. Staged through its dirty children
-    // instead, each child is staged deleted and the directory only located, as for named paths
-    // under a missing ancestor.
     stage_paths(&w, &[w.path.join("dir")], true).await;
     let staged = w.staged().await;
     let link = staged

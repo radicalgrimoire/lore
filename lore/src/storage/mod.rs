@@ -76,10 +76,6 @@ pub mod put_file;
 pub mod put_file_resolved;
 pub mod put_resolved;
 #[cfg(not(feature = "test-util"))]
-pub(crate) mod remote;
-#[cfg(feature = "test-util")]
-pub mod remote;
-#[cfg(not(feature = "test-util"))]
 pub(crate) mod store;
 #[cfg(feature = "test-util")]
 pub mod store;
@@ -96,46 +92,46 @@ use lore_storage::StoreResult;
 /// Close every storage handle currently registered with the library.
 ///
 /// Drains the registry atomically (no new ops can find the handles after this call enters)
-/// and runs the close sequence — mark invalid, await in-flight counter, spawn flush — for
+/// and runs the drain sequence — mark invalid, await in-flight counter, spawn flush — for
 /// each one. Per-handle drains run in parallel: with N handles, wall time is the slowest
 /// drain rather than the sum. Returns once every handle is invalidated and drained; the
-/// per-handle flush tasks continue in the background and rely on the runtime staying alive
-/// long enough for them to terminate. The library shutdown path calls this before tearing
-/// down the runtime.
+/// per-handle flushes continue in tasks the library shutdown waits for. The library shutdown
+/// path calls this before tearing down the runtime.
 ///
-/// Per-handle flush spawns pass `sync_data = false` (no fsync). Blocking on per-store fsync
-/// at shutdown would defeat the fire-and-forget contract; explicit `lore_storage_close`
-/// calls remain the path for callers that want a sync'd flush.
+/// Per-handle flushes pass `sync_data = false` (no fsync), so shutdown does not wait on a sync
+/// of every store; `lore_storage_close` is the path for callers that want a synced flush.
 pub async fn close_all_handles() {
     drain_in_parallel(handle::drain_all()).await;
 }
 
 /// Close every storage handle whose owning IPC connection matches `connection_id`.
 ///
-/// The IPC dispatcher invokes this on connection teardown — when a server-side connection
-/// drops without an explicit `lore_storage_close` for handles it opened, the dispatcher hands
-/// the connection identifier here and the registry walks itself, draining matching entries
-/// and running the close sequence on each. Client-mode handles (no connection id recorded)
-/// are unaffected. Per-handle drains run in parallel.
+/// This is the teardown of a server-side connection that drops without a `lore_storage_close`
+/// for the handles it opened. The registry walks itself, draining matching entries and running
+/// the drain sequence on each. Client-mode handles (no connection id recorded) are unaffected.
+/// Per-handle drains run in parallel.
 ///
 /// Buffers across the IPC boundary: the `LoreBytes` a `lore_storage_put` or
 /// `lore_storage_put_resolved` item views crosses as its bytes, which the service reads in the
 /// message they arrived in. A get item's `data_out` names memory the service cannot write, so it
 /// does not cross, and a relayed get answers with `GET_DATA` events instead.
 ///
-/// Revision tree handles loaded against a drained storage handle are closed too, and this
-/// is the only path that closes one for its caller: elsewhere a tree outlives its parent by
-/// design, but a dropped connection leaves nobody to release it. The cascade runs per
-/// storage handle, each draining its own trees in parallel.
+/// Revision tree handles loaded against a storage handle the connection opened are closed too,
+/// whether that storage handle is still open or was closed, and this is the only path that
+/// closes one for its caller: elsewhere a tree outlives its parent by design, but a dropped
+/// connection leaves nobody to release it. The trees drain in parallel, before the storage
+/// handles. As [`crate::revision_tree::drain_in_parallel`] describes, a tree on a storage
+/// handle still open leaves its flush to that handle's, and one on a storage handle closed
+/// flushes the stores itself. The trees' drain waits at most 10 seconds for their calls in
+/// flight; a tree whose calls end later is flushed once they have. The storage handles' drain
+/// waits for their calls without a bound.
 pub async fn close_for_connection(connection_id: u64) {
     let entries = handle::drain_for_connection(connection_id);
-    for (storage_handle_id, _) in &entries {
-        crate::revision_tree::close_for_storage_handle(*storage_handle_id).await;
-    }
+    crate::revision_tree::close_for_connection(connection_id).await;
     drain_in_parallel(entries).await;
 }
 
-/// Run the close sequence for each entry concurrently: every drain fires its own task so the
+/// Run the drain sequence for each entry concurrently: every drain fires its own task so the
 /// total wall time is bounded by the slowest drain, not the sum. The flush spawned inside is
 /// fire-and-forget; what runs in parallel here is the in-flight-counter await and the join of
 /// the claims each flush holds.
@@ -151,12 +147,11 @@ pub(crate) async fn drain_in_parallel(entries: Vec<(u64, std::sync::Arc<store::S
         lore_base::lore_spawn!(tasks, async move {
             store.mark_invalid_and_await().await;
             let claims = close::claims_for_flush(&store);
-            close::spawn_flush_stores(
-                store.immutable.clone(),
-                store.mutable.clone(),
+            drop(close::spawn_flush(
+                &store,
                 claims,
-                false,
-            );
+                lore_storage::FlushOptions::default(),
+            ));
         });
     }
     while tasks.join_next().await.is_some() {}
@@ -222,7 +217,7 @@ impl PutItemOutcome {
         LoreEvent::StoragePutItemComplete(LoreStoragePutItemCompleteEventData {
             id,
             address: placed.map_or_else(Address::default, |outcome| outcome.address),
-            error: item_detail(&result),
+            error: LoreErrorDetail::from_result(&result),
             stored_local: u8::from(placed.is_some_and(|outcome| outcome.stored_local)),
             stored_remote: u8::from(placed.is_some_and(|outcome| outcome.stored_remote)),
         })
@@ -245,16 +240,6 @@ pub(crate) fn offset_past_end(offset: u64, size_content: u64) -> StorageError {
     invalid_item(format!(
         "item offset {offset} starts past the {size_content} byte content"
     ))
-}
-
-/// The detail an item's terminal event carries: the empty default on success, and on failure the
-/// error's own FFI code, message and trace. The default detail allocates nothing, so only a
-/// failure costs anything.
-pub(crate) fn item_detail<T>(result: &Result<T, StorageError>) -> LoreErrorDetail {
-    result
-        .as_ref()
-        .err()
-        .map_or_else(LoreErrorDetail::default, LoreErrorDetail::from_error)
 }
 
 /// How actionable a failure is, highest first. A rejected argument is the caller's own bug and

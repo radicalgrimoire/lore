@@ -576,16 +576,17 @@ where
 }
 
 /// Frees, under an exclusive claim, `roots` and the nodes below them a walk collected
-/// ([`node_discard_walk`]), with no parent marked. Each root is detached first and `on_root` told
-/// its flags: a directory marked `Discarded` (H6), the rest freed, having nothing below them. Then
-/// every block a collected node or a directory root lies in is loaded, so a load error frees
-/// nothing below a root, and those nodes are freed a block at a time, under one write lock each,
-/// skipping a slot already free (`discard_node` has no guard against a second free). A root
-/// already `Discarded` is skipped. The counts cover every node freed.
+/// ([`node_discard_walk`]), with no parent marked. Each root, listed with flags of the caller's, is
+/// detached first and `on_root` told it with those flags: a directory marked `Discarded` (H6), the
+/// rest freed, having nothing below them. Then every block a collected node or a directory root
+/// lies in is loaded, so a load error frees nothing below a root, and those nodes are freed a
+/// block at a time, under one write lock each, skipping a slot already free (`discard_node` has
+/// no guard against a second free). A root already `Discarded` is skipped. The counts cover every
+/// node freed.
 pub async fn node_discard_free<F>(
     state: &Arc<State>,
     repository: &Arc<RepositoryContext>,
-    roots: &[NodeID],
+    roots: &[(NodeID, u16)],
     mut collected: Vec<NodeID>,
     mut on_root: F,
 ) -> Result<DiscardCounts, StateError>
@@ -597,7 +598,7 @@ where
     // The blocks of the last root and of its parent, as consecutive roots mostly share them.
     let mut held: Option<(usize, Arc<NodeBlock>)> = None;
     let mut parent_held: Option<(usize, Arc<NodeBlock>)> = None;
-    for &root in roots {
+    for &(root, listed) in roots {
         let block_index = NodeBlock::index(root);
         let block = match &held {
             Some((index, block)) if *index == block_index => block,
@@ -625,7 +626,7 @@ where
             &mut parent_held,
         )
         .await?;
-        on_root(root, node.flags);
+        on_root(root, listed);
     }
     #[cfg(feature = "state-hooks")]
     crate::state::node::hooks::reached(crate::state::node::hooks::Point::Discard).await;
@@ -753,7 +754,19 @@ pub(in crate::state) fn free_list_slots(data: &NodeBlockData) -> [u64; SLOT_WORD
 pub(crate) async fn apply_pending_discards(
     state: Arc<State>,
     repository: Arc<RepositoryContext>,
+    pending_discards: Vec<NodeID>,
+) -> Result<(), StateError> {
+    discard_pending(state, repository, pending_discards, false).await
+}
+
+/// [`apply_pending_discards`], where `emptied_adds` also discards each directory above a discarded
+/// node that holds nothing once it leaves and is marked dirty as added and not staged
+/// ([`discard_emptied_adds`]).
+async fn discard_pending(
+    state: Arc<State>,
+    repository: Arc<RepositoryContext>,
     mut pending_discards: Vec<NodeID>,
+    emptied_adds: bool,
 ) -> Result<(), StateError> {
     if pending_discards.is_empty() {
         return Ok(());
@@ -772,9 +785,42 @@ pub(crate) async fn apply_pending_discards(
         // The discard marks the State where a block turns dirty; a stage reads `is_dirty()` to
         // decide whether to save, so it is marked whatever the blocks were.
         state.mark_dirty();
-        clear_propagation(&state, &repository, discard_node.parent).await?;
+        let stays = if emptied_adds {
+            Box::pin(discard_emptied_adds(
+                &state,
+                &repository,
+                discard_node.parent,
+            ))
+            .await?
+        } else {
+            discard_node.parent
+        };
+        clear_propagation(&state, &repository, stays, discard_node.flags).await?;
     }
     Ok(())
+}
+
+/// Discards `directory` and each directory above it, while each holds no node and is marked dirty
+/// as added and not staged, and answers the first that stays. Boxed by its caller, as only a reset
+/// takes it.
+async fn discard_emptied_adds(
+    state: &Arc<State>,
+    repository: &Arc<RepositoryContext>,
+    mut directory: NodeID,
+) -> Result<NodeID, StateError> {
+    while directory.is_valid_node_id() {
+        let node = state.node(repository.clone(), directory).await?;
+        if !node.is_directory()
+            || !node.is_dirty_add()
+            || node.is_staged()
+            || node.child().is_some()
+        {
+            break;
+        }
+        node_discard_fused(state.clone(), repository.clone(), directory).await?;
+        directory = node.parent;
+    }
+    Ok(directory)
 }
 
 /// Nodes walks over a tree found stale, each with the tree it belongs to, held for
@@ -784,6 +830,8 @@ pub(crate) async fn apply_pending_discards(
 #[derive(Default)]
 pub struct WalkDiscards {
     batches: SegQueue<DiscardBatch>,
+    /// Whether a directory marked dirty as added and not staged leaves with the last node it held.
+    emptied_adds: bool,
 }
 
 /// Nodes of `state` a walk found stale.
@@ -794,6 +842,15 @@ pub(in crate::state) struct DiscardBatch {
 }
 
 impl WalkDiscards {
+    /// Discards held for a walk after which a directory marked dirty as added and not staged leaves
+    /// the tree with the last node it held, as one added for what the walk drops.
+    pub(crate) fn emptying_adds() -> Self {
+        Self {
+            batches: SegQueue::new(),
+            emptied_adds: true,
+        }
+    }
+
     /// Hold `nodes` of `state` for discarding.
     #[lore_macro::test_pub]
     pub(crate) fn queue(
@@ -820,7 +877,13 @@ impl WalkDiscards {
     #[lore_macro::test_pub]
     pub(crate) async fn apply(&self) -> Result<(), StateError> {
         while let Some(batch) = self.batches.pop() {
-            apply_pending_discards(batch.state, batch.repository, batch.nodes).await?;
+            discard_pending(
+                batch.state,
+                batch.repository,
+                batch.nodes,
+                self.emptied_adds,
+            )
+            .await?;
         }
         Ok(())
     }

@@ -25,7 +25,6 @@ use lore_revision::event::revision_tree::LoreRevisionTreeCommitCompleteEventData
 use lore_revision::interface::LoreError;
 use lore_revision::metadata::Metadata;
 use lore_revision::repository::RepositoryContext;
-use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::state::State;
 
 use crate::call_delegation::dispatch_call;
@@ -33,10 +32,10 @@ use crate::interface::LoreEventCallback;
 use crate::interface::LoreGlobalArgs;
 use crate::revision_tree::call::revision_tree_call;
 use crate::revision_tree::handle::ExclusiveAccess;
-use crate::revision_tree::handle::IN_MEMORY_MARKER;
 use crate::revision_tree::handle::LoreRevisionTree;
 use crate::revision_tree::handle::RevisionTreeInternal;
 use crate::storage::store::PerCallFlags;
+use crate::storage::store::StoreInternal;
 
 /// Tuneables for `lore_revision_tree_commit`.
 #[repr(C)]
@@ -275,7 +274,7 @@ async fn commit_revision(
         }
     };
 
-    let token = RepositoryWriteToken::in_memory(&IN_MEMORY_MARKER);
+    let token = StoreInternal::in_memory_write_token();
     match commit_in_memory_revision(
         repository_context.clone(),
         &token,
@@ -288,8 +287,9 @@ async fn commit_revision(
     {
         Ok(revision) => {
             // The freeze cleared the staged marks its rehash reached, those an unfinished change
-            // left among them.
+            // left among them, and left no node staged for addition.
             state.clear_unfinished_change();
+            state.clear_tracked_below_added();
             *internal.pending_metadata.write() = Metadata::default();
             emit_commit_complete(id, revision, Hash::default(), LoreErrorCode::None);
             emit_commit_telemetry(
@@ -337,8 +337,8 @@ async fn commit_revision(
 /// deserialized into a new `State` and takes its place. `serialize` left the snapshot's
 /// signature on itself and cleared its dirty flag, so both are restored — a handle with
 /// unserialized edits sitting on the revision it was loaded at is exactly the state the
-/// caller had — and so is an unfinished change the replaced State noted, which no serialization
-/// carries.
+/// caller had — and so are an unfinished change and a move below an added directory the replaced
+/// State noted, which no serialization carries.
 ///
 /// A failure here is the one case that still poisons: the handle is holding a tree
 /// neither committed nor restored, and no further call can be trusted against it. It
@@ -369,6 +369,9 @@ async fn restore_tree(
     restored.mark_dirty();
     if access.state().has_unfinished_change() {
         restored.note_unfinished_change();
+    }
+    if access.state().may_hold_tracked_below_added() {
+        restored.note_tracked_below_added();
     }
     access.replace(restored);
     Ok(())

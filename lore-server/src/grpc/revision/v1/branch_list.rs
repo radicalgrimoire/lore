@@ -152,6 +152,11 @@ pub async fn branch_list_implementation(
     Ok(Response::new(Box::pin(ReceiverStream::from(rx))))
 }
 
+/// The message of the `RESOURCE_EXHAUSTED` status that ends a throttled `BranchList` call. It tells
+/// the caller what to do in place of another call.
+#[lore_macro::test_pub]
+const OVERLOADED: &str = "Store overloaded. Do not list branches in a loop. For one branch, use `lore branch info --remote <branch>`.";
+
 async fn stream_branches(
     repository: Arc<RepositoryContext>,
     creator_filter: Option<String>,
@@ -168,6 +173,12 @@ async fn stream_branches(
     )
     .await
     {
+        // The only source of this code in `produce_branches` is a store that asks for a slow down.
+        let status = if status.code() == tonic::Code::ResourceExhausted {
+            Status::resource_exhausted(OVERLOADED)
+        } else {
+            status
+        };
         log_server_error(&status);
         let _ = tx.send(Err(status)).await;
     }
@@ -340,7 +351,7 @@ fn load_live_branch(
         let Some((metadata_hash, metadata)) = metadata? else {
             return Ok(None);
         };
-        if !creator_matches(&metadata, creator_filter.as_deref()) {
+        if !branch::metadata_creator_matches(creator_filter.as_deref(), &metadata) {
             return Ok(None);
         }
         // Used only once the branch is known to be listed, so a throttled read
@@ -408,20 +419,17 @@ fn load_deleted_branch(
                 return Ok(None);
             }
         };
-        let Ok(id_bytes) = metadata.get_binary(branch::ID) else {
+        let Ok(branch_id) = branch::id(&metadata) else {
             return Ok(None);
         };
-        let branch_id: BranchId = id_bytes.into();
-        if live_ids.contains(&branch_id) || !creator_matches(&metadata, creator_filter.as_deref()) {
+        if live_ids.contains(&branch_id)
+            || !branch::metadata_creator_matches(creator_filter.as_deref(), &metadata)
+        {
             return Ok(None);
         }
         let latest = branch::load_latest(repository, branch_id).await;
         build_record(latest, branch_id, &metadata, metadata_hash, true).map(Some)
     }
-}
-
-fn creator_matches(metadata: &Metadata, creator_filter: Option<&str>) -> bool {
-    creator_filter.is_none_or(|required| branch::creator(metadata).unwrap_or_default() == required)
 }
 
 /// Build one branch record from its metadata and the result of reading its

@@ -4,7 +4,9 @@ import logging
 import os
 import pytest
 import re
+import stat
 import subprocess
+import sys
 import tomllib
 from pathlib import Path
 from lore import Lore
@@ -224,6 +226,31 @@ def test_layer_stage_status_commit(new_lore_repo):
     )
 
     repo.push()
+
+
+@pytest.mark.smoke
+def test_layer_commit_of_a_directory_replacing_a_file_marked_deleted(new_lore_repo):
+    """A file in a layer replaced by a directory, marked dirty and the directory staged, commits as
+    the directory alone, after which status is clean: the layer's revision holds one node at the
+    name, which an instance of the layer repository syncs as a directory."""
+    repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
+
+    replaced = os.path.join(repo.path, LAYER_FILE)
+    os.remove(replaced)
+    os.makedirs(replaced)
+    with open(os.path.join(replaced, "x.txt"), "wb") as out:
+        out.write(b"below")
+    repo.dirty(LAYER_FILE)
+    repo.stage(LAYER_FILE)
+    repo.commit("Replaced by a directory")
+    repo.push()
+    status = parse_status_json(repo.status(json=True))
+    assert status == [], f"status is clean after the commit, got {status}"
+
+    layer_repo.sync()
+    assert os.path.isdir(os.path.join(layer_repo.path, LAYER_FILE))
+    with open(os.path.join(layer_repo.path, LAYER_FILE, "x.txt"), "rb") as held:
+        assert held.read() == b"below"
 
 
 @pytest.mark.smoke
@@ -2294,6 +2321,23 @@ def _stage_layer_change(repo: Lore) -> None:
 
 
 @pytest.mark.smoke
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows holds no executable bit")
+def test_layer_sync_gives_a_file_its_bit_alone(new_lore_repo):
+    """A sync that advances a layer to a revision changing only a file's executable bit gives the
+    file the bit: the working tree holds its content, so the bit is all the sync has to carry."""
+    repo, layer_repo = _setup_layer_behind(new_lore_repo, advance_layer=False)
+    os.chmod(os.path.join(layer_repo.path, LAYER_FILE), 0o755)
+    layer_repo.stage(LAYER_FILE)
+    layer_repo.commit("Give the layer file the executable bit")
+    layer_repo.push()
+
+    repo.sync()
+
+    mode = os.stat(os.path.join(repo.path, LAYER_FILE)).st_mode
+    assert mode & stat.S_IXUSR, f"{mode:o}"
+
+
+@pytest.mark.smoke
 def test_layer_sync_refused_with_staged_layer_content(new_lore_repo):
     """A sync that would advance a layer holding staged content is refused,
     naming the offending layer.
@@ -3224,6 +3268,76 @@ def test_layer_reset_mount_path_differs_from_source_path(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_layer_reset_puts_back_the_layer_spelling_below_its_mount(new_lore_repo):
+    """`reset` of a layer file the working tree spells in another case puts back the
+    spelling the layer's revision holds, while a reset naming the mount keeps the mount's
+    own name, which the layer's source directory does not share.
+    """
+    repo: Lore = new_lore_repo()
+    layer_repo: Lore = new_lore_repo(repo.name + "_layer")
+
+    repo.write_commit_push(None, {MAIN_FILE: b"main content"})
+    layer_repo.make_dirs("src")
+    layer_repo.write_commit_push(
+        None, {os.path.join("src", "Nested.txt"): b"nested v1"}
+    )
+    repo.layer_add("mnt", layer_repo, "src/")
+
+    variant = os.path.join("mnt", "nested.txt")
+    repo.move(os.path.join("mnt", "Nested.txt"), os.path.join("mnt", "nested.tmp"))
+    repo.move(os.path.join("mnt", "nested.tmp"), variant)
+    with repo.open_file(variant, mode="wb") as out:
+        out.write(b"nested v2")
+
+    repo.reset(variant)
+
+    mount = Path(repo.path) / "mnt"
+    assert os.listdir(mount) == ["Nested.txt"], (
+        f"reset should put back the layer's spelling, left {os.listdir(mount)}"
+    )
+    assert (mount / "Nested.txt").read_bytes() == b"nested v1"
+
+    repo.reset("mnt")
+
+    entries = os.listdir(repo.path)
+    assert "mnt" in entries and "src" not in entries, (
+        f"a reset of the mount should keep its name, left {entries}"
+    )
+    assert os.listdir(mount) == ["Nested.txt"]
+
+
+@pytest.mark.smoke
+def test_layer_reset_keeps_the_spelling_of_a_directory_holding_a_mount(new_lore_repo):
+    """`reset` leaves a directory the working tree holds in another case than the
+    revision where a layer is mounted below it, as the rename would carry the mount away
+    from the path the layer names, and restores what the directory holds where it stands.
+    """
+    repo: Lore = new_lore_repo()
+    layer_repo: Lore = new_lore_repo(repo.name + "_layer")
+
+    repo.write_commit_push(None, {os.path.join("Dir", "a.txt"): b"committed"})
+    layer_repo.make_dirs("src")
+    layer_repo.write_commit_push(None, {os.path.join("src", "x.txt"): b"layer"})
+
+    repo.move("Dir", "dir.tmp")
+    repo.move("dir.tmp", "dir")
+    repo.layer_add(os.path.join("dir", "mnt"), layer_repo, "src/")
+    with repo.open_file(os.path.join("dir", "a.txt"), mode="wb") as out:
+        out.write(b"edited")
+
+    repo.reset(".")
+
+    entries = sorted(entry for entry in os.listdir(repo.path) if entry != ".lore")
+    assert entries == ["dir"], (
+        f"reset should keep the directory's spelling, left {entries}"
+    )
+    with repo.open_file(os.path.join("dir", "a.txt"), mode="rb") as f:
+        assert f.read() == b"committed"
+    with repo.open_file(os.path.join("dir", "mnt", "x.txt"), mode="rb") as f:
+        assert f.read() == b"layer"
+
+
+@pytest.mark.smoke
 def test_layer_unstage_and_reset_leave_a_clean_layer_unpinned(new_lore_repo):
     """`unstage .` and `reset .` still act on the parent's own files, and pin nothing.
 
@@ -3352,3 +3466,29 @@ def _marked(repo: Lore) -> list[tuple[str, str, bool]]:
         (entry.get("path"), entry.get("action"), entry.get("flagDirty"))
         for entry in parse_status_json(repo.status(json=True))
     ]
+
+
+@pytest.mark.smoke
+def test_layer_commit_deletes_a_staged_file_gone_from_its_mount_and_keeps_the_mount(
+    new_lore_repo,
+):
+    """A commit of a staged edit of a layer's file, the layer's whole mount removed from the
+    working tree since, deletes that file from the layer and keeps the rest of what it draws in,
+    the layer mounted: the commit of a layer never deletes the directory it draws from."""
+    repo: Lore = new_lore_repo()
+    layer_repo: Lore = new_lore_repo(repo.name + "_layer")
+    repo.write_commit_push("Base", {"root.txt": "root\n"})
+    layer_repo.write_commit_push(
+        "Layer base", {"third/a.txt": "a\n", "third/o.txt": "o\n"}
+    )
+    repo.layer_add("thr", layer_repo, "third/")
+
+    repo.write_files({os.path.join("thr", "a.txt"): "edited\n"})
+    repo.stage(os.path.join("thr", "a.txt"))
+    repo.rmtree("thr")
+    repo.commit("Remove the layer's files")
+
+    assert "third -> thr" in repo.layer_list()
+    repo.file_reset("thr")
+    assert repo.file_exists(os.path.join("thr", "o.txt"))
+    assert not repo.file_exists(os.path.join("thr", "a.txt"))

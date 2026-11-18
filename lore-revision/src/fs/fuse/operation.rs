@@ -16,7 +16,6 @@ use crossbeam_epoch as epoch;
 use crossbeam_epoch::Atomic;
 use crossbeam_epoch::Owned;
 use crossbeam_epoch::Shared;
-use crossbeam_queue::SegQueue;
 use crossbeam_utils::atomic::AtomicCell;
 use dashmap::DashMap;
 use lore_base::error::FileNotFound;
@@ -31,13 +30,16 @@ use lore_storage::ContentSource;
 use smallvec::SmallVec;
 
 use crate::errors::NotSupported;
+use crate::fs::filesystem_provider::CaseLookup;
 use crate::fs::filesystem_provider::DirectoryEntry;
 use crate::fs::filesystem_provider::DirectoryListing;
 use crate::fs::filesystem_provider::FileInfo;
 use crate::fs::filesystem_provider::FilesystemDiffContext;
 use crate::fs::filesystem_provider::FsError;
 use crate::fs::filesystem_provider::InstanceOperation;
+use crate::fs::filesystem_provider::ListedEntry;
 use crate::fs::filesystem_provider::StaticDispatchDirectoryListing;
+use crate::fs::fuse::FuseProviderError;
 use crate::fs::fuse::filesystem::CommitReading;
 use crate::fs::fuse::filesystem::FuseFilesystem;
 use crate::fs::fuse::filesystem::LookupCase;
@@ -86,16 +88,22 @@ pub struct FuseOperation {
     revision: tokio::sync::OnceCell<Arc<State>>,
     /// The deletion list as the last write that asked read it.
     deletions_read: ListedDeletions,
-    /// The directories the commit adds or moves, as its walk's parallel tasks hand them over
-    /// ([`Self::hand_directory`]); made by the first, as most operations hand none and the queue
-    /// is two cache lines.
-    handed: std::sync::OnceLock<Box<SegQueue<RelativePath>>>,
+    /// The directories the commit adds or moves, handed over after each walk, in sequence
+    /// ([`Self::hand_directories`]).
+    handed: parking_lot::Mutex<Vec<RelativePath>>,
     /// The committed State's blocks as its serialize wrote them, held until the settle against
     /// that State returns, so the settle reads them from memory.
     serialized: AtomicCell<Option<Box<SerializedBlocks>>>,
     /// The settle the commit owes, from before its revision may become current
     /// ([`Self::owe_settle`]).
     owed: AtomicCell<Option<Box<SettleOwed>>>,
+    /// The time of the files the operation serves from the store again
+    /// ([`Self::restore_time`]).
+    restored_at: tokio::sync::OnceCell<u64>,
+    /// The command's context, which holds the write token that writing the records back takes,
+    /// set once the operation serves a file from the store again
+    /// ([`Self::restore_revision_content`]), for [`Self::finalize`].
+    restored: parking_lot::Mutex<Option<Arc<RepositoryContext>>>,
 }
 
 /// The deletion list as one read parsed it, swapped whole once the list has changed: a lookup
@@ -211,9 +219,11 @@ impl FuseOperation {
             reading: std::sync::OnceLock::new(),
             revision: tokio::sync::OnceCell::new(),
             deletions_read: ListedDeletions::default(),
-            handed: std::sync::OnceLock::new(),
+            handed: parking_lot::Mutex::new(Vec::new()),
             serialized: AtomicCell::new(None),
             owed: AtomicCell::new(None),
+            restored_at: tokio::sync::OnceCell::new(),
+            restored: parking_lot::Mutex::new(None),
         }
     }
 
@@ -221,19 +231,19 @@ impl FuseOperation {
         &self.filesystem
     }
 
-    /// Collects `path`, a directory the commit adds or moves, for its settle.
-    pub(crate) fn hand_directory(&self, path: &RelativePath) {
-        self.handed
-            .get_or_init(|| Box::new(SegQueue::new()))
-            .push(path.clone());
+    /// Collects `paths`, directories the commit adds or moves, for its settle.
+    pub(crate) fn hand_directories(&self, paths: Vec<RelativePath>) {
+        let mut handed = self.handed.lock();
+        if handed.is_empty() {
+            *handed = paths;
+        } else {
+            handed.extend(paths);
+        }
     }
 
     /// The directories handed over so far, taken.
     fn take_handed(&self) -> Vec<RelativePath> {
-        self.handed
-            .get()
-            .map(|handed| std::iter::from_fn(|| handed.pop()).collect())
-            .unwrap_or_default()
+        std::mem::take(&mut *self.handed.lock())
     }
 
     pub(crate) fn keep_serialized_blocks(&self, blocks: SerializedBlocks) {
@@ -258,6 +268,41 @@ impl FuseOperation {
         if let Some(owed) = self.owed.take() {
             owed.release();
         }
+    }
+
+    /// Writes back the records holding the time of the files the operation served from the store
+    /// again ([`RecordedTimes::write_back`](crate::fs::fuse::attr::RecordedTimes::write_back)),
+    /// synced under `--sync-data`. A failure is logged: the files stay served from the store, and a
+    /// remount before the records are written back reports their earlier time. Only the write-back
+    /// is boxed: it is the cold path, and inline it would grow the future of every command's
+    /// operation.
+    pub(crate) async fn finalize(&self) {
+        let Some(repository) = self.restored.lock().take() else {
+            return;
+        };
+        if let Err(error) = Box::pin(self.filesystem.recorded_times().write_back(&repository)).await
+        {
+            lore_warn!(
+                "FUSE writing back the time of files served from the store again failed: {error}"
+            );
+        }
+    }
+
+    /// The time the operation records for the files it serves from the store again, read once, as
+    /// it first serves one, in the staging directory, as a swap reads its time: a write after any
+    /// of the files reports a later time. The read is boxed: it runs once per operation, and inline
+    /// it would grow the future of every file the operation writes.
+    async fn restore_time(&self) -> u64 {
+        *self
+            .restored_at
+            .get_or_init(|| {
+                Box::pin(crate::state::time_before_next_write(
+                    self.filesystem
+                        .local_files()
+                        .map(|local| local.staging_dir()),
+                ))
+            })
+            .await
     }
 
     /// The listing entry `path` names, a symlink included.
@@ -435,42 +480,12 @@ enum FileSource {
 }
 
 /// What the host entry at `host` holds, read through a symbolic link as a path named on its
-/// own is ([`host_file_info`]).
+/// own is.
 async fn host_info(host: &Path) -> std::io::Result<FileInfo> {
     match lore_io::IoDriver::global().metadata(host).await {
-        Ok(metadata) => Ok(host_file_info(&metadata)),
+        Ok(metadata) => Ok(FileInfo::from_metadata(&metadata)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(FileInfo::NotExist),
         Err(error) => Err(error),
-    }
-}
-
-/// [`FileInfo::from_metadata`], a host file's time the later of its modification and its status
-/// change, in milliseconds. A file renamed onto a name, created at it, or given a time carries
-/// that change's time, so it never matches a time recorded for the file the name held before,
-/// whatever its own modification time. Commits and scans record and compare this time; no
-/// served attribute reads it ([`crate::fs::fuse::attr::RecordedTimes`]).
-fn host_file_info(metadata: &std::fs::Metadata) -> FileInfo {
-    use std::os::unix::fs::MetadataExt as _;
-
-    match FileInfo::from_metadata(metadata) {
-        FileInfo::File {
-            executable,
-            size,
-            mtime,
-        } => {
-            let changed = u64::try_from(metadata.ctime())
-                .unwrap_or_default()
-                .saturating_mul(1000)
-                .saturating_add(
-                    u64::try_from(metadata.ctime_nsec()).unwrap_or_default() / 1_000_000,
-                );
-            FileInfo::File {
-                executable,
-                size,
-                mtime: mtime.max(changed),
-            }
-        }
-        info => info,
     }
 }
 
@@ -846,19 +861,22 @@ impl FuseOperation {
     /// forced sync overwrites a local file, where the State holds the mounted revision's own node
     /// there and the revision holds that content: nothing is copied, and `write/` keeps nothing of
     /// it. A node made at the path since, by a create or a rename onto it, stands over a deletion
-    /// the list records, which only its local copy survives at the next mount. Answers whether it
-    /// did.
+    /// the list records, which only its local copy survives at the next mount. Answers the time
+    /// the file reports where it did ([`Self::restore_time`]), set in the records before the file
+    /// is served from the store, so an inode made of it meanwhile reports it, and written back as
+    /// the operation ends.
     async fn restore_revision_content(
         &self,
         changed: &mut Invalidations,
+        repository: &Arc<RepositoryContext>,
         node: &Node,
         path: &RelativePath,
-    ) -> Result<bool, FsError> {
+    ) -> Result<Option<u64>, FsError> {
         let Some(located) = self.located(path).await? else {
-            return Ok(false);
+            return Ok(None);
         };
         if is_dir(&located.entry) {
-            return Ok(false);
+            return Ok(None);
         }
         let served = self.filesystem.served();
         let revision = self
@@ -869,7 +887,7 @@ impl FuseOperation {
             .await
             .forward_any::<FsError>("loading the mounted revision")?;
         if revision.revision() != served.revision() {
-            return Ok(false);
+            return Ok(None);
         }
         let held = match revision
             .find_relative_node_link(
@@ -885,7 +903,7 @@ impl FuseOperation {
                     .await
                     .forward_any::<FsError>("reading the mounted revision")?
             }
-            _ => return Ok(false),
+            _ => return Ok(None),
         };
         if !held.is_file()
             || held.address.hash != node.address.hash
@@ -893,28 +911,57 @@ impl FuseOperation {
             || held.mode != node.mode
             || self.deletion_listed(&located.spelled)
         {
-            return Ok(false);
+            return Ok(None);
         }
         let target = StoredContent {
             address: held.address,
             size: held.size,
             mode: held.mode,
         };
-        let restored = self
+        let Some(mtime) = self
+            .serve_restored(repository, &served, &located, &target)
+            .await
+            .forward_any_with::<FsError, _>(|| format!("restoring '{path}' to the revision"))?
+        else {
+            return Ok(None);
+        };
+        if let Some(ino) = self.filesystem.live_inode(&located.spelled) {
+            changed.inodes.push(ino);
+        }
+        self.restored
+            .lock()
+            .get_or_insert_with(|| repository.clone());
+        Ok(Some(mtime))
+    }
+
+    /// Sets the operation's time ([`Self::restore_time`]) for the file `located` names in the
+    /// records, where a lookup sees it at once, then gives the file `target` over its local content
+    /// ([`FuseFilesystem::overwrite_local_file`]), and answers the time where the file changed. Its
+    /// own future, so [`Self::restore_revision_content`] holds its locals across one await.
+    async fn serve_restored(
+        &self,
+        repository: &RepositoryContext,
+        served: &Served,
+        located: &Located,
+        target: &StoredContent,
+    ) -> Result<Option<u64>, FuseProviderError> {
+        let mtime = self.restore_time().await;
+        self.filesystem
+            .recorded_times()
+            .set(repository, &located.spelled, mtime)
+            .await;
+        let changed = self
             .filesystem
             .overwrite_local_file(
-                &served,
+                served,
                 &located.spelled,
                 located.node,
                 (located.dir, located.entry.name_hash),
-                &target,
+                target,
+                mtime,
             )
-            .await
-            .forward_any_with::<FsError, _>(|| format!("restoring '{path}' to the revision"))?;
-        if restored && let Some(ino) = self.filesystem.live_inode(&located.spelled) {
-            changed.inodes.push(ino);
-        }
-        Ok(restored)
+            .await?;
+        Ok(changed.then_some(mtime))
     }
 
     /// Whether the deletion list holds `path` or a directory above it, which the next mount
@@ -1183,6 +1230,11 @@ impl InstanceOperation for FuseOperation {
         Ok(self.local_info(path).await?.unwrap_or(FileInfo::NotExist))
     }
 
+    /// [`CaseLookup::PerName`]: the served State's index answers for a name.
+    fn case_lookup(&self) -> CaseLookup {
+        CaseLookup::PerName
+    }
+
     async fn holds_name_exactly(&self, path: &RelativePath) -> Option<bool> {
         if path.is_empty() {
             return Some(true);
@@ -1397,6 +1449,23 @@ impl InstanceOperation for FuseOperation {
         written(renamed, ACTION, from)
     }
 
+    /// Both name the same entry of the served tree, which finds a child by any spelling of its
+    /// name: their paths as the State spells them are one.
+    async fn names_one_entry(
+        &self,
+        from: &RelativePath,
+        to: &RelativePath,
+    ) -> Result<Option<bool>, FsError> {
+        let Some(from) = self.entry_at(from).await?.map(|found| found.spelled) else {
+            return Ok(None);
+        };
+        Ok(Some(
+            self.entry_at(to)
+                .await?
+                .is_some_and(|found| found.spelled == from),
+        ))
+    }
+
     async fn remove(&self, path: &RelativePath) -> Result<(), FsError> {
         const ACTION: &str = "removing";
         self.writable(ACTION)?;
@@ -1434,11 +1503,11 @@ impl InstanceOperation for FuseOperation {
         self.writable(ACTION)?;
         let mut changed = self.changes();
         let wrote = Box::pin(async {
-            if self
-                .restore_revision_content(&mut changed.batch, node, path)
+            if let Some(mtime) = self
+                .restore_revision_content(&mut changed.batch, &repository, node, path)
                 .await?
             {
-                return Ok(());
+                return Ok(Some(mtime));
             }
             let (staged, _) = self.stage_stored(repository, node.address, path).await?;
             let executable = node.mode & NodeFileMode::Executable == NodeFileMode::Executable;
@@ -1453,11 +1522,14 @@ impl InstanceOperation for FuseOperation {
                 ACTION,
                 path,
             )
+            .map(|()| None)
         })
         .await;
         changed.send().await;
-        wrote?;
-        InstanceOperation::file_info(self, path).await
+        match wrote? {
+            Some(mtime) => Ok(FileInfo::from_node_and_mtime(node, mtime)),
+            None => InstanceOperation::file_info(self, path).await,
+        }
     }
 
     async fn set_file_to_immutable_store_contents(
@@ -1628,19 +1700,33 @@ pub struct FuseDirectoryListing {
 
 impl FuseDirectoryListing {
     pub(crate) async fn next(&mut self) -> Option<Result<DirectoryEntry, FsError>> {
+        loop {
+            // An ordinary clone's listing skips a symlink too (`crate::fs::os::file_list_item`).
+            match self.next_with_untracked().await? {
+                Ok(ListedEntry::Tracked(entry)) => return Some(Ok(entry)),
+                Ok(ListedEntry::Untracked(_)) => {}
+                Err(err) => return Some(Err(err)),
+            }
+        }
+    }
+
+    /// The next entry as [`next`](Self::next) answers it, a symbolic link included, by its name.
+    pub(crate) async fn next_with_untracked(&mut self) -> Option<Result<ListedEntry, FsError>> {
         while self.index < self.listing.len() {
             let index = self.index;
             self.index += 1;
             let Some(entry) = self.listing.current_entry(index) else {
                 continue;
             };
-            // An ordinary clone's listing skips a symlink too (`crate::fs::os::file_list_item`).
-            if entry.flags & (entry_flags::VIEW_EXCLUDED | entry_flags::SYMLINK) != 0 {
+            if entry.flags & entry_flags::VIEW_EXCLUDED != 0 {
                 continue;
             }
             let Ok(name) = std::str::from_utf8(self.listing.name(index)) else {
                 continue;
             };
+            if entry.flags & entry_flags::SYMLINK != 0 {
+                return Some(Ok(ListedEntry::Untracked(name.to_string())));
+            }
             let info = if entry.flags & entry_flags::LOCAL != 0 && !is_dir(&entry) {
                 let Some(host) = &self.host else {
                     continue;
@@ -1658,11 +1744,11 @@ impl FuseDirectoryListing {
                     .map_or(self.base_time, |mtimes| mtimes[index]);
                 file_info_of(&entry, mtime)
             };
-            return Some(Ok(DirectoryEntry {
+            return Some(Ok(ListedEntry::Tracked(DirectoryEntry {
                 name: name.to_string(),
                 info,
                 name_hash: entry.name_hash,
-            }));
+            })));
         }
         None
     }

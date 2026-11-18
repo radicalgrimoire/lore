@@ -184,6 +184,10 @@ bitflags! {
         /// parent and the name it was listed with, and the from side is listed with its staged
         /// deletes, which a name the to side holds again pairs with.
         const FilesystemTo = 0b100;
+        /// The walk leaves link pins to the link registry: a link it would descend, one the
+        /// caller can read that mounts the same subtree of the same repository on both
+        /// sides, is neither descended nor reported.
+        const LeavesLinkPins = 0b1000;
     }
 }
 
@@ -310,7 +314,8 @@ pub fn diff_subtree(
 }
 
 /// [`diff_subtree`] with `extra` joined to the flags the sides derive.
-fn diff_subtree_flagged(
+#[lore_macro::test_pub]
+pub(crate) fn diff_subtree_flagged(
     from: NodeChangeState,
     to: NodeChangeState,
     path: RelativePath,
@@ -349,6 +354,7 @@ fn diff_subtree_flagged(
                         .holds_tracked_change(&to.mapping.repository, to.mapping.node, to.flags)
                         .await?
                 };
+                let filter_mode = filter_mode.at_staged(false);
                 seeded_subtree(from, to, path, graft, extra, &changes, filter_mode, tracked).await
             })
                 as std::pin::Pin<
@@ -833,6 +839,10 @@ fn diff_subtree_node_walk(
                 to_index += 1;
             }
 
+            for _ in 0..same_node_offset(to_nodes, to_index, from_named_node) {
+                add_change_for_solo_to_node(context, from, to_index).await?;
+                to_index += 1;
+            }
             let paired = to_nodes
                 .children
                 .get(to_index)
@@ -843,7 +853,9 @@ fn diff_subtree_node_walk(
                 from_named_node.node,
                 &paths.from,
                 states.from,
-                filter_mode,
+                filter_mode.at_staged(paired.is_some_and(|to_named_node| {
+                    to_named_node.flags().contains(NodeFlags::Staged)
+                })),
                 // The from side is the tree the to side was built on, so its node is tracked,
                 // and what is staged or marked on its counterpart is the change below it. Where
                 // the to side is a working tree's State, the from side is lore's tree, which
@@ -906,6 +918,26 @@ fn diff_subtree_node_walk(
 
         Ok(())
     }
+}
+
+/// How far past `to_index` the to child that is `from_named_node`'s own node stands among the to
+/// children from there that carry its name, 0 where none does. A to tree holds a name twice where a
+/// node it adds or moves there stands beside the node it replaces, which is the from side's node:
+/// the from node pairs with itself, deleted, and the other is reported on its own, whatever order
+/// the sort left them in.
+fn same_node_offset(
+    to_nodes: &StateChildrenNodes,
+    to_index: usize,
+    from_named_node: &StateNamedNode,
+) -> usize {
+    to_nodes
+        .children
+        .get(to_index..)
+        .unwrap_or_default()
+        .iter()
+        .take_while(|to_named_node| to_named_node.name == from_named_node.name)
+        .position(|to_named_node| to_named_node.node == from_named_node.node)
+        .unwrap_or(0)
 }
 
 /// What every child of one directory is reported against: where the walk stands, what it
@@ -1121,7 +1153,7 @@ async fn add_change_for_solo_to_node(
         to_named_node.node,
         &paths.to,
         states.to,
-        filter_mode,
+        filter_mode.at_staged(to_named_node.flags().contains(NodeFlags::Staged)),
         async |flags: NodeFlags| {
             if working_tree {
                 return Ok(false);
@@ -1480,7 +1512,7 @@ async fn add_change_for_paired_nodes(
                 states.to,
                 &subpath,
                 !to_node.is_file(),
-                filter_mode,
+                filter_mode.at_staged(to_node.is_staged()),
                 || async {
                     if working_tree {
                         return Ok(same_type);
@@ -1582,7 +1614,8 @@ async fn add_change_for_paired_nodes(
                 is_staged_merge_conflict && to_type == LoreNodeType::Directory;
             let settles_from = flags.contains(DiffFlags::SettlesFrom)
                 && (from_node.is_dirty_add() || from_node.is_staged_delete());
-            if !mode_equal || is_rename || conflicted_directory || settles_from {
+            let node_reported = !mode_equal || is_rename || conflicted_directory || settles_from;
+            if node_reported {
                 lore_trace!(
                     "Diff node {subpath} directory mode change from {from_mode} to {to_mode}, {action:?}|modify"
                 );
@@ -1657,15 +1690,19 @@ async fn add_change_for_paired_nodes(
                                  for linked repository {link_repository_id}"
                             );
                         }
-                        emit_change(
-                            from.clone(),
-                            to.clone(),
-                            action,
-                            measured,
-                            changes,
-                            filter_mode,
-                        )
-                        .await?;
+                        if !node_reported {
+                            emit_change(
+                                from.clone(),
+                                to.clone(),
+                                action,
+                                measured,
+                                changes,
+                                filter_mode,
+                            )
+                            .await?;
+                        }
+                    } else if flags.contains(DiffFlags::LeavesLinkPins) {
+                        lore_debug!("Diff node {subpath} pin left to the link registry");
                     } else {
                         lore_debug!("Diff node {subpath} has linked changes, recurse diff");
                         dispatch_subtree_diff(
@@ -1892,23 +1929,20 @@ async fn find_sorted_children(
             }))
         };
 
-        let from_nodes = from_nodes.await;
-        let to_nodes = to_nodes.await;
-
-        (
-            from_nodes
-                .internal("Task failure")
-                .map_err(StateError::from)??,
-            to_nodes
-                .internal("Task failure")
-                .map_err(StateError::from)??,
-            false,
-        )
+        let from_nodes = from_nodes
+            .await
+            .internal("Task failure")
+            .map_err(StateError::from)??;
+        let to_nodes = to_nodes
+            .await
+            .internal("Task failure")
+            .map_err(StateError::from)??;
+        (from_nodes, to_nodes, false)
     })
 }
 
-/// Orders each run of children sharing a name so the live ones precede those staged for
-/// delete, so a name the to side holds pairs with a live node where the from side holds both.
+/// Orders each run of children sharing a name so the live ones precede those marked deleted, so a
+/// name the to side holds pairs with a live node where the from side holds both.
 async fn live_before_deleted(nodes: &mut StateChildrenNodes) -> Result<(), StateError> {
     let mut start = 0;
     while start < nodes.children.len() {
@@ -1925,7 +1959,7 @@ async fn live_before_deleted(nodes: &mut StateChildrenNodes) -> Result<(), State
                     .state
                     .node(nodes.repository.clone(), child.node)
                     .await?;
-                run.push((node.is_staged_delete(), *child));
+                run.push((node.is_deleted(), *child));
             }
             run.sort_by_key(|(deleted, _)| *deleted);
             for (slot, (_, child)) in nodes.children[start..end].iter_mut().zip(run) {

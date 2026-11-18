@@ -145,6 +145,17 @@ pub(crate) async fn obliterate_file(
         .into());
     }
 
+    // TODO(vri): UCS-18010 - Implement obliterate for links
+    if node_link.crosses_link(&repository, &state) {
+        return Err(NotSupported {
+            operation: format!(
+                "obliterating {relative_path} inside a link - obliterate it by address in the linked \
+                 repository"
+            ),
+        }
+        .into());
+    }
+
     let node = state
         .node(repository.clone(), node_link.node)
         .await
@@ -182,10 +193,19 @@ pub(crate) async fn obliterate_file(
         node_link.node,
         NodeFlags::NoFlags,
         stage_stats,
-        None, // TODO(vri): UCS-18010 - Implement obliterate for links
+        None,
     )
     .await
     .forward::<ObliterateError>("Failed to stage deleted path")?;
+    if state.holds_promoted_moves() {
+        Box::pin(crate::file::stage::stage_promoted_moves_of_call(
+            &repository,
+            &state,
+            None,
+        ))
+        .await
+        .forward::<ObliterateError>("Failed to stage the move of a directory the path is in")?;
+    }
 
     let signature = state
         .serialize(repository.clone(), token)

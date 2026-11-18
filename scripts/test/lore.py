@@ -9,10 +9,13 @@ import logging
 import os
 import pathlib
 import random
+import re
 import shutil
 import string
 import subprocess
 import sys
+import tempfile
+import tomllib
 import uuid
 from collections.abc import Iterable
 from pathlib import Path
@@ -198,6 +201,38 @@ def _link_message_args(link_messages: dict[str, str] | None) -> list[str]:
     ]
 
 
+def external_root(global_dir: str | os.PathLike[str]) -> str:
+    """The external root of the global data directory below `global_dir`, the
+    `LORE_GLOBAL_PATH` of a test: the path `external-root` names, or the default
+    location, `external/` in the global data directory, where it names none or is
+    absent."""
+    data = os.path.join(global_dir, "data")
+    try:
+        with open(os.path.join(data, "external-root"), "rb") as setting:
+            path = tomllib.load(setting).get("path", "")
+    except FileNotFoundError:
+        path = ""
+    return path or os.path.join(data, "external")
+
+
+def strip_protocol(url: str) -> str:
+    """Strip protocol scheme (e.g. 'lore://') and trailing slash from a URL."""
+    url = url.removesuffix("/")
+    if "://" in url:
+        url = url.split("://", 1)[1]
+    return url
+
+
+def per_url_store_path(base: str, remote: str) -> str:
+    """Path to the shared store for `remote` under base path `base`, mirroring the
+    Rust layout <base>/<escaped-url>/shared_store. Each remote URL gets its own
+    subdirectory so one base path can back multiple endpoints."""
+    escaped = "".join(
+        "_" if c in '/\\:*?"<>|' or ord(c) < 32 else c for c in strip_protocol(remote)
+    )
+    return os.path.join(base, escaped, "shared_store")
+
+
 class Lore:
     def __init__(
         self,
@@ -226,6 +261,8 @@ class Lore:
         # the rest. Defaults to a list of its own so a directly constructed Lore
         # outside a fixture still works, just without the cleanup.
         self.created_paths = [] if created_paths is None else created_paths
+        # The VFS this repository was made with, `None` for a plain one.
+        self.vfs: str | None = None
         # If the caller picked a specific remote_url, mirror it into the env
         # subprocess overrides — otherwise repository_create inherits the
         # session-level LORE_REMOTE_URL pointing at the autouse server and
@@ -261,13 +298,17 @@ class Lore:
     def dot_path(self) -> str:
         """Return the full path to the repository metadata directory.
 
-        A virtual clone keeps it outside its mount, in the external directory the
-        global data directory holds for its instance, which is where Lore finds it
-        through the mount table."""
+        A virtual instance keeps it outside its mount, in its external directory in the
+        external root. Lore finds a FUSE instance through the mount table; an SWFS
+        instance has no mount table entry, so its instance is the one
+        `lore repository info` names."""
         instance = lore_mount_instance(self.path)
+        if instance is None and self.vfs == "swfs":
+            match = re.search(r"Instance: (\S+)", self.repository_info())
+            instance = match.group(1) if match else None
         if instance is not None:
             global_dir = self.sandboxed_env()["LORE_GLOBAL_PATH"]
-            return os.path.join(global_dir, "data", "external", instance, ".lore")
+            return os.path.join(external_root(global_dir), instance, ".lore")
         return os.path.join(self.path, self.dot_dir())
 
     def ignore_file(self) -> str:
@@ -469,6 +510,31 @@ class Lore:
     def repository_list(self, url: str | None = None, **kwargs: Unpack[GlobalOptions]):
         return self.run(["repository", "list"] + ([url] if url else []), **kwargs)
 
+    def store_caps_path(self) -> Path:
+        """The file holding the GC caps the repository's store collects to: its shared
+        store's `shared_store.toml`, or its own `config.toml`."""
+        config_path = Path(self.dot_path()) / "config.toml"
+        config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+        shared = config.get("shared_store_to_use", {})
+        if not shared.get("use_shared_store"):
+            return config_path
+        if base := shared.get("shared_store_path"):
+            store = per_url_store_path(base, self.remote)
+        else:
+            store = self.shared_store_info().stores[strip_protocol(self.remote)].path
+        return Path(store) / "shared_store.toml"
+
+    def set_store_caps(self, max_size: str, max_capacity: str) -> None:
+        """Rewrite the GC caps the repository's store collects to."""
+        path = self.store_caps_path()
+        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+        for index, line in enumerate(lines):
+            if line.strip().startswith("max_size"):
+                lines[index] = f"max_size = {max_size}\n"
+            elif line.strip().startswith("max_capacity"):
+                lines[index] = f"max_capacity = {max_capacity}\n"
+        path.write_text("".join(lines), encoding="utf-8")
+
     def _own_shared_store(
         self, asked_vfs: str | None, vfs: str | None, repo_path: str
     ) -> str | None:
@@ -506,6 +572,8 @@ class Lore:
             + (["--shared-store-path", shared_store_path] if shared_store_path else []),
             **kwargs,
         )
+        if not kwargs.get("dry_run"):
+            self.vfs = vfs
         self._ensure_test_identity_in_config(kwargs.get("identity"))
         return output
 
@@ -608,6 +676,36 @@ class Lore:
             ["repository", "instance", "move", target_path]
             + (["--dry-run"] if dry_run else []),
             **kwargs,
+        )
+
+    def repository_instance_clone(
+        self,
+        destination: str,
+        dry_run: bool = False,
+        allow_copy: bool = False,
+        **kwargs: Unpack[GlobalOptions],
+    ) -> "Lore":
+        """Clone this instance to `destination`, which a relative path names against the `cwd` the
+        command runs in, and return the clone."""
+        resolved = os.path.join(kwargs.get("cwd") or self.path, str(destination))
+        # Recorded before the clone exists, so a clone that fails partway is removed with the test.
+        self.created_paths.append(resolved)
+        self.run(
+            ["repository", "instance", "clone", str(destination)]
+            + (["--dry-run"] if dry_run else [])
+            + (["--allow-copy"] if allow_copy else []),
+            **kwargs,
+        )
+        return Lore(
+            base_env=self.base_env,
+            remote_path=self.remote_path,
+            remote_url=self.remote,
+            lore_executable_path=self.lore_executable_path,
+            path=resolved,
+            name=os.path.basename(resolved),
+            create_repo=False,
+            created_paths=self.created_paths,
+            environment_vars=self.environment_vars,
         )
 
     def repository_store(self, **kwargs: Unpack[GlobalOptions]):
@@ -1985,6 +2083,24 @@ class Lore:
             str(keep_store_alive_seconds),
         )
 
+    def file_metadata_set_capi(
+        self, library_path: str, paths: list[str], key: str, value: str
+    ) -> int:
+        """Set `key` to `value` on every path in one call through the public C API,
+        returning the FFI code. The CLI sets metadata on one path per call."""
+        # The value goes through a file, as a Windows command line holds at most 32 KiB.
+        with tempfile.TemporaryDirectory() as directory:
+            value_file = Path(directory) / "value"
+            value_file.write_text(value)
+            return self._capi_driver(
+                library_path,
+                "file-metadata-set",
+                self.path,
+                key,
+                str(value_file),
+                *(self._fix_path(path) for path in paths),
+            )
+
     def layer_add(
         self,
         target_path: str,
@@ -2220,6 +2336,8 @@ class Lore:
             created_paths=self.created_paths,
             environment_vars=self.environment_vars,
         )
+        if not kwargs.get("dry_run"):
+            new_repo.vfs = vfs
         new_repo._ensure_test_identity_in_config()
         return new_repo
 
@@ -2622,12 +2740,16 @@ class Lore:
         remote_url: str,
         path: str | None = None,
         make_default: bool = True,
+        max_size: int | None = None,
+        max_capacity: int | None = None,
         **kwargs: Unpack[GlobalOptions],
     ) -> str:
         return self.run(
             ["shared-store", "create", remote_url]
             + (["--path", path] if path else [])
-            + ([] if make_default else ["--make-default", "false"]),
+            + ([] if make_default else ["--make-default", "false"])
+            + (["--max-size", str(max_size)] if max_size else [])
+            + (["--max-capacity", str(max_capacity)] if max_capacity else []),
             **kwargs,
         )
 

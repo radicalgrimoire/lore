@@ -75,7 +75,7 @@ fn resource_id(repository: RepositoryId) -> String {
 pub(super) async fn connect_channel(
     auth_url: &str,
 ) -> Result<tonic::transport::Channel, ProtocolError> {
-    let endpoint_url = grpc_endpoint(auth_url);
+    let endpoint_url = crate::uds::channel_uri(grpc_endpoint(auth_url));
     let mut endpoint = tonic::transport::Endpoint::new(endpoint_url.clone())
         .map_err(|e| ProtocolError::internal(format!("invalid auth endpoint: {e}")))?;
     if endpoint_url.starts_with("https://") {
@@ -89,7 +89,7 @@ pub(super) async fn connect_channel(
     }
     // Connect from a net-runtime task so the channel's driver tasks are
     // bound to the net runtime.
-    lore_base::lore_spawn_net!(async move { endpoint.connect().await })
+    lore_base::lore_spawn_net!(crate::uds::connect_channel(endpoint))
         .await
         .map_err(|e| ProtocolError::internal(format!("auth endpoint connect task: {e}")))?
         .map_err(|e| ProtocolError::internal(format!("failed to connect to auth endpoint: {e}")))

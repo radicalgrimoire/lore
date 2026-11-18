@@ -10,6 +10,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
+use lore_revision::fs::filesystem_provider::CaseLookup;
 use lore_revision::fs::filesystem_provider::DirectoryEntry;
 use lore_revision::fs::filesystem_provider::FileInfo;
 use lore_revision::fs::filesystem_provider::FilesystemDiffIntent;
@@ -24,10 +25,12 @@ use lore_revision::fs::filesystem_provider::create_empty_directory;
 use lore_revision::fs::filesystem_provider::test_util::CommittedCalls;
 use lore_revision::fs::filesystem_provider::test_util::HoldCalls;
 use lore_revision::fs::filesystem_provider::test_util::StoredCalls;
+use lore_revision::fs::filesystem_provider::test_util::TestIdentity;
 use lore_revision::fs::filesystem_provider::test_util::TestOperation;
 use lore_revision::fs::filesystem_provider::with_operation;
 use lore_revision::fs::filesystem_provider::with_operation_if;
 use lore_revision::fs::os::OsFilesystem;
+use lore_revision::infer::ConflictMarkers;
 use lore_revision::lore::RepositoryId;
 use lore_revision::node::NodeID;
 use lore_revision::repository::RepositoryContext;
@@ -46,6 +49,7 @@ pub struct TestFilesystemProvider {
     pub names_folding_count: Arc<AtomicUsize>,
     pub finalize_events: Arc<Mutex<Vec<bool>>>,
     pub hold_calls: HoldCalls,
+    pub warm_count: Arc<AtomicUsize>,
     pub stored_calls: StoredCalls,
     pub committed_calls: CommittedCalls,
     /// The directory file information and content are read from, where given.
@@ -54,6 +58,11 @@ pub struct TestFilesystemProvider {
     pub failing_scans: Arc<Mutex<Vec<String>>>,
     /// Paths whose scan finds the named node stale.
     pub stale_on_scan: Arc<Mutex<Vec<(String, NodeID)>>>,
+    /// Paths each recursive removal was asked for.
+    pub removed: Arc<Mutex<Vec<String>>>,
+    identity: TestIdentity,
+    /// How many directories its operations read.
+    pub directory_reads: Arc<AtomicUsize>,
     begin_fails: bool,
     finalize_fails: bool,
     committed_fails: bool,
@@ -64,11 +73,28 @@ pub struct TestFilesystemProvider {
     holds_paths: bool,
     holds_state: bool,
     hold_refuses: bool,
+    /// What its operations answer for `case_lookup`.
+    case_lookup: CaseLookup,
 }
 
 impl TestFilesystemProvider {
     pub fn new() -> TestFilesystemProvider {
         Self::default()
+    }
+
+    /// This provider, its operations answering whether two paths name one entry as `identity`
+    /// says.
+    pub fn with_identity(self, identity: TestIdentity) -> TestFilesystemProvider {
+        Self { identity, ..self }
+    }
+
+    /// The provider, its operations answering `case_lookup` for how a walk finds a name held in
+    /// another case.
+    pub fn with_case_lookup(self, case_lookup: CaseLookup) -> TestFilesystemProvider {
+        Self {
+            case_lookup,
+            ..self
+        }
     }
 
     /// A provider that fails to begin an operation, as one whose filesystem will not freeze.
@@ -226,10 +252,12 @@ impl FilesystemProvider for TestFilesystemProvider {
                 finalize_fails: self.finalize_fails,
                 write_fails: self.write_fails,
                 file_info_fails: self.file_info_fails,
+                failing_file_infos: Arc::default(),
                 content_source_fails: self.content_source_fails,
                 content_source_missing: self.content_source_missing,
                 holds_paths: self.holds_paths,
                 hold_calls: self.hold_calls.clone(),
+                warm_count: self.warm_count.clone(),
                 stored_calls: self.stored_calls.clone(),
                 committed_calls: self.committed_calls.clone(),
                 committed_fails: self.committed_fails,
@@ -237,6 +265,10 @@ impl FilesystemProvider for TestFilesystemProvider {
                 hold_refuses: self.hold_refuses,
                 failing_scans: self.failing_scans.clone(),
                 stale_on_scan: self.stale_on_scan.clone(),
+                removed: self.removed.clone(),
+                identity: self.identity,
+                case_lookup: self.case_lookup,
+                directory_reads: self.directory_reads.clone(),
             }),
             self.holds_state,
         )))
@@ -814,11 +846,12 @@ async fn content_reported_not_found_is_neither_diffable_nor_conflicted() {
                     .await
                     .expect("a path holding no file is an answer")
             );
-            assert!(
-                !operation
+            assert_eq!(
+                operation
                     .infer_is_conflicted(&path)
                     .await
-                    .expect("a path holding no file is an answer")
+                    .expect("a path holding no file is an answer"),
+                ConflictMarkers::NoFile
             );
         })
         .await;

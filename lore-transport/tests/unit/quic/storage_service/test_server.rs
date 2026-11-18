@@ -27,6 +27,7 @@ use lore_base::types::Partition;
 use lore_transport::auth::AuthEndpoint;
 use lore_transport::connection::SuppliedCredentials;
 use lore_transport::quic::QuicServiceError;
+use lore_transport::quic::client::CongestionAlgorithm;
 use lore_transport::quic::command_header::COMMAND_HEADER_SIZE_V4;
 use lore_transport::quic::command_header::CommandHeader;
 use lore_transport::quic::storage_service::Command;
@@ -382,6 +383,15 @@ impl TestStorageServer {
 
     /// Opens one storage connection.
     pub async fn connect_client(&self) -> Arc<StorageClient> {
+        self.connect_client_running(CongestionAlgorithm::default())
+            .await
+    }
+
+    /// Opens one storage connection, running `congestion_algorithm`.
+    pub async fn connect_client_running(
+        &self,
+        congestion_algorithm: CongestionAlgorithm,
+    ) -> Arc<StorageClient> {
         StorageClient::connect(
             Weak::new(),
             &self.url,
@@ -391,6 +401,7 @@ impl TestStorageServer {
             test_partition(),
             &Arc::new(SuppliedCredentials::default()),
             None,
+            congestion_algorithm,
         )
         .await
         .expect("connect to the test server")
@@ -513,7 +524,7 @@ async fn hold_faulted(
 
 /// The authorization a session start presents, after its action, partition, correlation id and
 /// the authorization's length.
-fn presented_authorization(request: &[u8]) -> String {
+pub(crate) fn presented_authorization(request: &[u8]) -> String {
     let length_at = 18 + usize::from(request[17]);
     let length = usize::from(u16::from_le_bytes([
         request[length_at],

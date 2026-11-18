@@ -1,27 +1,53 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! Probes a test reads and arms inside the library, and fixtures tests build on, built with the
-//! `test-util` feature.
+//! Probes a test reads and arms inside the library, points where it stops a branch write, and
+//! fixtures tests build on, built with the `test-util` feature.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
+use bytes::Bytes;
+use lore_base::error::NoRemote;
+use lore_base::types::Context;
+use lore_storage::ImmutableStore;
+use lore_storage::MutableStore;
+use lore_storage::WriteOptions;
+use lore_transport::ProtocolError;
 use tokio::sync::Notify;
 
-use crate::fs::filesystem_provider::DirectoryEntry;
 use crate::fs::filesystem_provider::FsError;
+use crate::instance;
+use crate::instance::InstanceId;
+use crate::lore::BranchId;
+use crate::lore::Hash;
+use crate::lore::RepositoryId;
+use crate::repository::DOT_LORE;
+use crate::repository::INSTANCE;
 use crate::repository::RemoteState;
 use crate::repository::RepositoryContext;
+use crate::repository::RepositoryContextCreationArgs;
+use crate::repository::RepositoryWriteToken;
+use crate::state::State;
+use crate::state::StateData;
 
 /// A path-less context on fresh in-memory stores whose remote is in `state`, so everything but
 /// the remote is valid.
 pub async fn context_with_state(state: RemoteState) -> Arc<RepositoryContext> {
+    context_built(state, |context| context).await
+}
+
+/// [`context_with_state`] with `build` applied, for a context set up through its builders.
+pub async fn context_built(
+    state: RemoteState,
+    build: impl FnOnce(RepositoryContext) -> RepositoryContext,
+) -> Arc<RepositoryContext> {
     let (immutable, mutable) = crate::repository::create_client_memory_stores()
         .await
         .expect("in-memory stores should be creatable");
-    Arc::new(RepositoryContext::new_with_state(
+    Arc::new(build(RepositoryContext::new_with_state(
         None,
         immutable,
         mutable,
@@ -30,7 +56,90 @@ pub async fn context_with_state(state: RemoteState) -> Arc<RepositoryContext> {
         state,
         Arc::default(),
         None,
-    ))
+    )))
+}
+
+/// Registers a new instance of `repository` in the stores `immutable` and `mutable` at `dir`, with
+/// `branch` and `revision` as its current branch and revision, and writes `<dir>/.lore/instance`
+/// holding its id, so the registration reads as live. Returns the instance's id. The writes run
+/// in the caller's execution context.
+pub async fn register_live_instance(
+    immutable: Arc<dyn ImmutableStore>,
+    mutable: Arc<dyn MutableStore>,
+    repository: RepositoryId,
+    branch: BranchId,
+    revision: Hash,
+    dir: &Path,
+) -> InstanceId {
+    let instance_id = InstanceId::generate();
+    let context = Arc::new(
+        RepositoryContext::new(RepositoryContextCreationArgs {
+            paths: None,
+            immutable_store: immutable,
+            mutable_store: mutable,
+            id: repository,
+            instance_id,
+            remote: Err(ProtocolError::from(NoRemote)),
+            filter: Arc::default(),
+            filesystem_provider: None,
+        })
+        .with_write_token(RepositoryWriteToken::acquire(dir).await),
+    );
+    instance::register_instance(&context, instance_id, &dir.display().to_string())
+        .await
+        .expect("registers the instance");
+    instance::store_current_anchor_branch(&context, branch)
+        .await
+        .expect("stores the current branch");
+    instance::store_current_anchor(&context, revision)
+        .await
+        .expect("stores the current revision");
+    let dot_lore = dir.join(DOT_LORE);
+    lore_io::IoDriver::global()
+        .create_dir_all(&dot_lore)
+        .await
+        .expect("creates the Lore directory");
+    instance_id
+        .write_to_file(dot_lore.join(INSTANCE))
+        .await
+        .expect("writes the instance file");
+    instance_id
+}
+
+/// Writes through `repository` a revision numbered `number` whose self parent is `parent` and whose
+/// metadata hash is `metadata`, and returns its hash.
+pub async fn write_state_revision(
+    repository: &Arc<RepositoryContext>,
+    parent: Hash,
+    number: u64,
+    metadata: Hash,
+) -> Hash {
+    let token = repository
+        .try_write_token()
+        .expect("the context carries a write token");
+    let state = State::new();
+    state.set_parent_self(parent);
+    state.set_revision_number(number);
+    state.set_metadata_hash(metadata);
+    state
+        .serialize(repository.clone(), token)
+        .await
+        .expect("writes the revision state")
+}
+
+/// Writes through `repository` a blob of a revision state's size that is not a revision state:
+/// zeroed, so its header lacks the state magic. Read as a state, it is a revision numbered 0
+/// without parents. Returns its hash.
+pub async fn write_not_a_state(repository: &Arc<RepositoryContext>) -> Hash {
+    crate::immutable::write(
+        repository.clone(),
+        Context::default(),
+        Bytes::from(vec![0u8; size_of::<StateData>()]),
+        WriteOptions::default(),
+    )
+    .await
+    .expect("writes the blob")
+    .hash
 }
 
 /// The tasks one walk spawns: counts those live, for a test to read the peak, holds each one
@@ -91,10 +200,7 @@ impl TaskProbe {
 
     /// `entry`, or the failure [`Self::fail_entry_after`] armed in its place, which it answers
     /// once.
-    pub(crate) fn entry(
-        &self,
-        entry: Result<DirectoryEntry, FsError>,
-    ) -> Result<DirectoryEntry, FsError> {
+    pub(crate) fn entry<T>(&self, entry: Result<T, FsError>) -> Result<T, FsError> {
         let armed = self.fail_after.load(Ordering::Acquire);
         if self.spawned.load(Ordering::Acquire) >= armed
             && self
@@ -162,5 +268,144 @@ pub(crate) struct Live<'a>(&'a TaskProbe);
 impl Drop for Live<'_> {
     fn drop(&mut self) {
         self.0.live.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// A point between two writes or reads of a branch create, restore, archive or protect, where a
+/// task run under [`step_branch_writes`] stops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BranchStep {
+    /// A create has found no metadata to restore and read the mapping of its name, and not yet
+    /// checked its parent.
+    CreateNameRead,
+    /// A create has found no metadata to restore and not yet swapped in the branch's metadata.
+    CreateUnrestored,
+    /// A create has swapped in the branch's metadata and not yet claimed its name.
+    CreateMetadataStored,
+    /// A create has claimed its name and not yet stored the latest revision.
+    CreateNameClaimed,
+    /// A restore has read the branch's metadata and not yet made its checks.
+    RestoreMetadataRead,
+    /// A restore has made its checks and not yet recorded itself in the metadata.
+    RestoreChecked,
+    /// A restore has recorded the name it claims in the metadata and not yet claimed it.
+    RestoreRecorded,
+    /// A restore has claimed its name and not yet made its final swap.
+    RestoreNameClaimed,
+    /// A restore, an archive or a name lookup that caches the remote's metadata has swapped a
+    /// pending restore's record out of the metadata and not yet released the name it named.
+    PendingRestoreSettled,
+    /// An archive has read the branch's metadata and not yet looked up its name.
+    ArchiveMetadataRead,
+    /// An archive has looked up the branch's name and not yet swapped the metadata.
+    ArchiveLookedUp,
+    /// An archive has swapped the metadata and not yet released the name.
+    ArchiveReleasing,
+    /// A protect without a remote has read the branch's metadata and not yet swapped it.
+    ProtectMetadataRead,
+}
+
+/// Where a stepped task reports each step it reaches, and what it waits for to go on.
+#[derive(Clone)]
+struct Stepped {
+    reached: tokio::sync::mpsc::UnboundedSender<BranchStep>,
+    resume: Arc<Notify>,
+}
+
+tokio::task_local! {
+    static STEPPED: Stepped;
+}
+
+/// Runs `future`, stopping at each [`BranchStep`] it reaches: the step is sent on `reached`, and
+/// the task waits for a notification of `resume` before it goes on. Tasks `future` spawns don't
+/// stop.
+pub fn step_branch_writes<F: Future>(
+    reached: tokio::sync::mpsc::UnboundedSender<BranchStep>,
+    resume: Arc<Notify>,
+    future: F,
+) -> impl Future<Output = F::Output> {
+    STEPPED.scope(Stepped { reached, resume }, future)
+}
+
+/// Stops this task at `step`, where it runs under [`step_branch_writes`].
+pub(crate) async fn branch_step(step: BranchStep) {
+    let Ok(stepped) = STEPPED.try_with(Stepped::clone) else {
+        return;
+    };
+    if stepped.reached.send(step).is_ok() {
+        stepped.resume.notified().await;
+    }
+}
+
+/// A pause a test arms: once armed, the next [`pass`](Self::pass) stops, whichever task makes it,
+/// until it is resumed.
+#[derive(Default)]
+pub struct ArmedPause {
+    armed: AtomicBool,
+    reached: Notify,
+    resume: Notify,
+}
+
+impl ArmedPause {
+    /// Stops the next pass.
+    pub fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    /// Waits until the armed pass stops.
+    pub async fn reached(&self) {
+        self.reached.notified().await;
+    }
+
+    /// Lets the stopped pass go on.
+    pub fn resume(&self) {
+        self.resume.notify_one();
+    }
+
+    /// Stops here where the pause is armed.
+    pub async fn pass(&self) {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            self.reached.notify_one();
+            self.resume.notified().await;
+        }
+    }
+}
+
+/// Where a task run under [`hold_unmount_drains`] reports that a FUSE unmount's drain found the
+/// inode table counting no lookups, and what it waits for to go on.
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct DrainHold {
+    reached: tokio::sync::mpsc::UnboundedSender<()>,
+    resume: Arc<Notify>,
+}
+
+tokio::task_local! {
+    #[cfg(target_os = "linux")]
+    static DRAIN_HOLD: DrainHold;
+}
+
+/// Runs `future`, stopping each FUSE unmount's drain it runs wherever the drain finds the inode
+/// table counting no lookups, before it waits for the count to settle: a `()` is sent on
+/// `reached`, and the drain waits for a notification of `resume` before it goes on. Tasks
+/// `future` spawns don't stop.
+#[cfg(target_os = "linux")]
+pub fn hold_unmount_drains<F: Future>(
+    reached: tokio::sync::mpsc::UnboundedSender<()>,
+    resume: Arc<Notify>,
+    future: F,
+) -> impl Future<Output = F::Output> {
+    DRAIN_HOLD.scope(DrainHold { reached, resume }, future)
+}
+
+/// Stops this task where a FUSE unmount's drain has found the inode table counting no lookups,
+/// where it runs under [`hold_unmount_drains`].
+#[cfg(target_os = "linux")]
+pub(crate) async fn unmount_drain_emptied() {
+    let Ok(hold) = DRAIN_HOLD.try_with(DrainHold::clone) else {
+        return;
+    };
+    if hold.reached.send(()).is_ok() {
+        hold.resume.notified().await;
     }
 }

@@ -12,7 +12,6 @@ use lore_error_set::prelude::*;
 use serde::Serialize;
 
 use crate::branch;
-use crate::branch::BranchLatestStatus;
 use crate::branch::merge;
 use crate::branch::merge::MergeType;
 use crate::change::NodeChange;
@@ -350,18 +349,9 @@ async fn sync_store_branch_latest(
     let local_latest = branch::load_latest(repository.clone(), branch)
         .await
         .unwrap_or_default();
-    branch::store_latest(
-        repository.clone(),
-        branch,
-        local_latest,
-        revision,
-        BranchLatestStatus::Convergent,
-    )
-    .await
-    .forward::<SyncError>("Failed to store revision as current branch latest")?;
-
-    branch::store_last_sync(repository, branch, revision).await;
-    Ok(())
+    branch::store_synced_latest(&repository, branch, local_latest, revision)
+        .await
+        .forward::<SyncError>("Failed to store revision as current branch latest")
 }
 
 /// Where the branch being synced stands, for the branch latest decision.
@@ -448,20 +438,16 @@ async fn revision_advances_branch_latest(
 ///
 /// A provider that holds its state in a `State` ([`FilesystemProvider::holds_state`]) holds whole
 /// revisions, keeps its local changes itself and holds no files for a layer to be written into,
-/// so a sync restricted to a dependency set, one resetting local changes, and one carrying layers
-/// are refused there.
+/// so a sync restricted to a dependency set and one carrying layers are refused there. It resets
+/// its local changes itself
+/// ([`HoldOptions::reset_local`](crate::fs::filesystem_provider::HoldOptions::reset_local)).
 pub(crate) async fn sync(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     options: SyncOptions,
 ) -> Result<(), SyncError> {
-    if repository.file_system().holds_state() {
-        if !options.root_files.is_empty() {
-            return Err(hold::refused("restrict a sync to a dependency set").into());
-        }
-        if options.reset {
-            return Err(hold::refused("reset local changes in a sync").into());
-        }
+    if repository.file_system().holds_state() && !options.root_files.is_empty() {
+        return Err(hold::refused("restrict a sync to a dependency set").into());
     }
     let repository_current = repository.clone();
     let (repository, view_file) = match sync_load_view(&options).await? {
@@ -718,8 +704,7 @@ pub(crate) async fn sync(
         .remote()
         .await
         .clone()
-        .map(|remote| remote.remote_url.to_string())
-        .unwrap_or_default();
+        .map_or_default(|remote| remote.remote_url.to_string());
 
     // Named for the branch the instance is on, which the source revision below
     // belongs to.
@@ -1348,12 +1333,16 @@ pub struct SyncVerifyArgs {
     pub operation: Arc<InstanceOperationImpl>,
     pub current: crate::state::NodeMapping,
     pub options: Arc<SyncOptions>,
+    /// Whether the verify gives the files it finds holding the incoming content the changes' own
+    /// executable bits, once every change has passed. False where a realize that verifies again
+    /// follows.
+    pub carries_modes: bool,
 }
 
 pub async fn sync_verify_filesystem(
     _repository: Arc<RepositoryContext>,
     args: Arc<SyncVerifyArgs>,
-) -> Result<Arc<Vec<NodeChange>>, SyncError> {
+) -> Result<crate::fs::realize::VerifiedChanges, SyncError> {
     crate::fs::realize::verify_filesystem_for_changes(args).await
 }
 
@@ -1378,6 +1367,23 @@ pub struct SyncCompleteStats {
 pub struct SyncRealizeStats {
     pub discovery: DiscoveryStats,
     pub complete: SyncCompleteStats,
+    pub kept_renames: KeptRenames,
+}
+
+/// Renames left undone, which leave their source where it stands: ones the file system refused,
+/// and ones that would carry a layer's mount away from where the layer is mounted. Counted, with
+/// the first, for one warning.
+#[derive(Default)]
+pub struct KeptRenames {
+    pub count: AtomicUsize,
+    pub first: std::sync::OnceLock<KeptRename>,
+}
+
+/// A rename [`KeptRenames`] counts: where it is from and to, and why it was left undone.
+pub struct KeptRename {
+    pub from: RelativePath,
+    pub to: RelativePath,
+    pub reason: String,
 }
 
 impl LoreRevisionSyncProgressEventData {
@@ -1406,7 +1412,7 @@ pub async fn realize_changes(
     changes: Arc<Vec<NodeChange>>,
     state_stage: Option<Arc<State>>,
     dry_run: bool,
-    is_merge: bool,
+    merge_current: Option<Arc<State>>,
     stats: Arc<SyncRealizeStats>,
 ) -> Result<(), SyncError> {
     shim_with_operation(repository.file_system(), async |operation| {
@@ -1414,9 +1420,10 @@ pub async fn realize_changes(
             repository,
             operation,
             changes,
+            &[],
             state_stage,
             dry_run,
-            is_merge,
+            merge_current.map(crate::fs::realize::MergeCurrent::new),
             stats,
         )
         .await

@@ -6,10 +6,13 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures::FutureExt;
 use lore_base::types::Address;
+use lore_base::types::Context;
 use lore_base::types::Hash;
+use lore_base::types::ZeroHeapAlloc;
 use lore_revision::change::FileAction;
 use lore_revision::filter::FilterMode;
 use lore_revision::fs::filesystem_provider::InstanceOperationImpl;
+use lore_revision::immutable::WriteToImmutable;
 use lore_revision::instance::InstanceId;
 use lore_revision::link::LinkFlags;
 use lore_revision::lore::*;
@@ -34,6 +37,7 @@ mod pending;
 mod relocate;
 mod reparent;
 mod save;
+mod scoped_diff;
 mod served;
 mod stream;
 mod sweep;
@@ -76,6 +80,7 @@ fn an_action_records_matching_dirty_and_staged_flags() {
 use lore_base::runtime::LORE_CONTEXT;
 use lore_revision::state::push_distinct;
 use lore_revision::state::*;
+use lore_storage::FlushOptions;
 
 use crate::fs::filesystem_provider::setup_test_execution;
 
@@ -268,7 +273,7 @@ where
 }
 
 /// Runs `body` against a fresh State over a [`null_repository`], as [`with_repository`] does.
-async fn with_state<F, Fut>(body: F)
+pub(crate) async fn with_state<F, Fut>(body: F)
 where
     F: FnOnce(Arc<RepositoryContext>, Arc<State>) -> Fut,
     Fut: std::future::Future<Output = ()>,
@@ -277,7 +282,7 @@ where
 }
 
 /// A directory record named `name`.
-fn directory(name: &str) -> Node {
+pub(crate) fn directory(name: &str) -> Node {
     Node {
         name_hash: hash::hash_string(name),
         ..Default::default()
@@ -285,7 +290,7 @@ fn directory(name: &str) -> Node {
 }
 
 /// A file record named `name`.
-fn file(name: &str) -> Node {
+pub(crate) fn file(name: &str) -> Node {
     Node {
         flags: NodeFlags::File.bits(),
         name_hash: hash::hash_string(name),
@@ -294,7 +299,7 @@ fn file(name: &str) -> Node {
 }
 
 /// Adds `node` under `parent` as `name`.
-async fn add(
+pub(crate) async fn add(
     state: &State,
     repository: &Arc<RepositoryContext>,
     parent: NodeID,
@@ -440,11 +445,15 @@ async fn a_block_added_after_a_serialize_reads_the_serialized_file_metadata_list
     );
 }
 
-/// A store that holds every get of the hashes it is told to hold until released, and counts
-/// every get.
-struct HoldingStore {
+/// A store that holds every get of the hashes it is told to hold until released, answers every get
+/// of the hashes it is told to refuse as missing, and the next gets of those it is told to fail
+/// with the error it is given, and counts every get.
+pub(crate) struct HoldingStore {
     inner: Arc<dyn lore_storage::ImmutableStore>,
     held: std::sync::Mutex<Vec<Hash>>,
+    refused: std::sync::Mutex<Vec<Hash>>,
+    /// Each hash whose next gets fail, how many more, and the error they answer.
+    failing: std::sync::Mutex<Vec<(Hash, usize, lore_storage::StoreError)>>,
     released: tokio::sync::Notify,
     gets: std::sync::atomic::AtomicUsize,
 }
@@ -453,12 +462,24 @@ struct HoldingStore {
 async fn holding_repository(
     backing: &Arc<RepositoryContext>,
 ) -> (Arc<HoldingStore>, Arc<RepositoryContext>) {
-    let store = Arc::new(HoldingStore {
-        inner: backing.immutable_store(),
-        held: std::sync::Mutex::new(Vec::new()),
-        released: tokio::sync::Notify::new(),
-        gets: std::sync::atomic::AtomicUsize::new(0),
-    });
+    let (store, repository) = holding_context(backing).await;
+    (store, Arc::new(repository))
+}
+
+/// [`holding_repository`], its local reads telling a failed read apart from a miss
+/// ([`RepositoryContext::strict_local_reads`]).
+async fn strict_holding_repository(
+    backing: &Arc<RepositoryContext>,
+) -> (Arc<HoldingStore>, Arc<RepositoryContext>) {
+    let (store, repository) = holding_context(backing).await;
+    (store, Arc::new(repository.strict_local_reads()))
+}
+
+/// A store over `backing`'s holding nothing yet, and a context reading through it.
+async fn holding_context(
+    backing: &Arc<RepositoryContext>,
+) -> (Arc<HoldingStore>, RepositoryContext) {
+    let store = HoldingStore::over(backing.immutable_store());
     let mutable = lore_storage::local::mutable_store::create(
         None::<&str>,
         lore_storage::MutableStoreSettings::default(),
@@ -466,11 +487,48 @@ async fn holding_repository(
     )
     .await
     .expect("in-memory mutable store");
-    let repository = Arc::new(RepositoryContext::new_null_context(store.clone(), mutable));
+    let repository = RepositoryContext::new_null_context(store.clone(), mutable);
     (store, repository)
 }
 
 impl HoldingStore {
+    /// A store over `inner`, holding and refusing nothing yet.
+    pub(crate) fn over(inner: Arc<dyn lore_storage::ImmutableStore>) -> Arc<Self> {
+        Arc::new(HoldingStore {
+            inner,
+            held: std::sync::Mutex::new(Vec::new()),
+            refused: std::sync::Mutex::new(Vec::new()),
+            failing: std::sync::Mutex::new(Vec::new()),
+            released: tokio::sync::Notify::new(),
+            gets: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// Answers every later get of `hash` as missing.
+    pub(crate) fn refuse(&self, hash: Hash) {
+        self.refused.lock().expect("refused hashes").push(hash);
+    }
+
+    /// Answers the next `count` gets of `hash` with `error`, and those after them as the store it
+    /// wraps does.
+    fn fail_next(&self, hash: Hash, count: usize, error: lore_storage::StoreError) {
+        (self.failing.lock().expect("failing hashes")).push((hash, count, error));
+    }
+
+    /// The error a get of `hash` answers in place of the store it wraps, spending a failure of it
+    /// where it is told to fail: missing where it is refused.
+    fn failure(&self, hash: &Hash) -> Option<lore_storage::StoreError> {
+        if self.refused.lock().expect("refused hashes").contains(hash) {
+            return Some(lore_storage::StoreError::from(lore_base::error::NotFound));
+        }
+        let mut failing = self.failing.lock().expect("failing hashes");
+        let (_, left, error) = failing
+            .iter_mut()
+            .find(|(failing, left, _)| failing == hash && *left > 0)?;
+        *left -= 1;
+        Some(error.clone())
+    }
+
     fn gets(&self) -> usize {
         self.gets.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -510,6 +568,9 @@ impl lore_storage::ImmutableStore for HoldingStore {
         address: Address,
     ) -> Result<lore_storage::StoreGetData, lore_storage::StoreError> {
         self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(error) = self.failure(&address.hash) {
+            return Err(error);
+        }
         self.wait_while_held(&address.hash).await;
         self.inner.clone().get(partition, address).await
     }
@@ -593,8 +654,8 @@ impl lore_storage::ImmutableStore for HoldingStore {
         self.inner.max_query_batch()
     }
 
-    async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), lore_storage::StoreError> {
-        self.inner.clone().flush(sync_data).await
+    async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), lore_storage::StoreError> {
+        self.inner.clone().flush(options).await
     }
 
     async fn verify(self: Arc<Self>, heal: bool) -> Result<(), lore_storage::StoreError> {
@@ -657,6 +718,153 @@ async fn loading_a_node_block_leaves_no_task_holding_the_repository() {
     assert_eq!(
         holders, 1,
         "a task the block load started holds the repository"
+    );
+}
+
+/// A node block read the store fails, though it answers the reads after, fails with the store's
+/// answer: the block is in the current format, so no older format's read answers in its place.
+#[tokio::test]
+async fn a_node_block_read_the_store_fails_fails_with_the_stores_answer() {
+    let backing = null_repository().await;
+    let address = NodeBlockData::new_from_heap_zeroed()
+        .write_to_immutable(
+            backing.clone(),
+            Context::default(),
+            lore_storage::options::WriteOptions::default(),
+        )
+        .await
+        .expect("the block writes");
+    let (store, repository) = holding_repository(&backing).await;
+    let missing = lore_storage::StoreError::from(lore_base::error::NotFound);
+    store.fail_next(address.hash, 1, missing);
+
+    let state = State::new();
+    let failed = NodeBlock::deserialize(repository.clone(), &state, address)
+        .await
+        .map(|_| ())
+        .expect_err("the store fails the read");
+    assert!(
+        failed.is_address_not_found(),
+        "the store's answer: {failed}"
+    );
+    NodeBlock::deserialize(repository, &state, address)
+        .await
+        .expect("the block reads once the store answers");
+}
+
+/// A node block read the store fails as internal, through reads that report a failed local read,
+/// fails with the store's error, though the store answers the reads after: the read in the smaller
+/// format refuses the content as larger, so the block is of neither older format.
+#[tokio::test]
+async fn a_node_block_read_the_store_fails_as_internal_fails_with_the_stores_error() {
+    let backing = null_repository().await;
+    let address = NodeBlockData::new_from_heap_zeroed()
+        .write_to_immutable(
+            backing.clone(),
+            Context::default(),
+            lore_storage::options::WriteOptions::default(),
+        )
+        .await
+        .expect("the block writes");
+    let (store, repository) = strict_holding_repository(&backing).await;
+    let failure = lore_storage::StoreError::internal("a read the test fails");
+    store.fail_next(address.hash, 2, failure);
+    let gets = store.gets();
+
+    let state = State::new();
+    let failed = NodeBlock::deserialize(repository.clone(), &state, address)
+        .await
+        .map(|_| ())
+        .expect_err("the store fails the read");
+    assert!(failed.is_internal(), "the store's error: {failed}");
+    assert_eq!(
+        store.gets() - gets,
+        3,
+        "the strict read probes the store twice, then the smaller format's read reaches the block"
+    );
+    NodeBlock::deserialize(repository, &state, address)
+        .await
+        .expect("the block reads once the store answers");
+}
+
+/// A collection of the name tables of node blocks takes a V2-format block's, read in its own
+/// format.
+#[tokio::test]
+async fn a_name_table_collection_takes_a_v2_blocks_name_table() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let repository = null_repository().await;
+            let mut block = NodeBlockDataV2::new_from_heap_zeroed();
+            block.name_table = Hash::from([7u8; 32]);
+            let address = block
+                .write_to_immutable(
+                    repository.clone(),
+                    Context::default(),
+                    lore_storage::options::WriteOptions::default(),
+                )
+                .await
+                .expect("the block writes");
+
+            let collected = collect_name_fragments(repository, vec![address])
+                .await
+                .expect("the collection reads the block");
+            assert_eq!(collected, [Address::zero_context_hash(block.name_table)]);
+        })
+        .await;
+}
+
+/// A collection of the name tables of node blocks whose block read the store fails, through reads
+/// that report a failed local read, fails with the store's error, though the store answers the
+/// reads after.
+#[tokio::test]
+async fn a_name_table_collection_the_store_fails_fails_with_the_stores_error() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let backing = null_repository().await;
+            let address = NodeBlockData::new_from_heap_zeroed()
+                .write_to_immutable(
+                    backing.clone(),
+                    Context::default(),
+                    lore_storage::options::WriteOptions::default(),
+                )
+                .await
+                .expect("the block writes");
+            let (store, repository) = strict_holding_repository(&backing).await;
+            let failure = lore_storage::StoreError::from(lore_base::error::Disconnected);
+            store.fail_next(address.hash, 2, failure);
+
+            let failed = collect_name_fragments(repository.clone(), vec![address])
+                .await
+                .expect_err("the store fails the read");
+            assert!(failed.is_disconnected(), "the store's error: {failed}");
+            collect_name_fragments(repository, vec![address])
+                .await
+                .expect("the block reads once the store answers");
+        })
+        .await;
+}
+
+/// Content a byte short of a node block, the size of no block format, fails as the read in the
+/// current format fails it, not as the read in the smaller format refuses it.
+#[tokio::test]
+async fn content_of_no_node_block_format_fails_as_the_current_format_reads_it() {
+    let repository = null_repository().await;
+    let address = lore_revision::immutable::write(
+        repository.clone(),
+        Context::default(),
+        Bytes::from(vec![0u8; size_of::<NodeBlockData>() - 1]),
+        lore_storage::options::WriteOptions::default(),
+    )
+    .await
+    .expect("the content writes");
+
+    let failed = NodeBlock::deserialize(repository, &State::new(), address)
+        .await
+        .map(|_| ())
+        .expect_err("no block format reads it");
+    assert!(
+        failed.is_internal(),
+        "the current format's failure: {failed}"
     );
 }
 
@@ -1049,6 +1257,64 @@ async fn a_find_through_blocks_in_memory_counts_its_steps() {
     );
 }
 
+/// `find`'s answer, with the allocations it makes on this thread.
+async fn counting_allocations<T>(find: impl std::future::Future<Output = T>) -> (T, u64) {
+    struct StopCounting;
+    impl Drop for StopCounting {
+        fn drop(&mut self) {
+            lore_base::allocator::set_allocation_counting(false);
+        }
+    }
+    lore_base::allocator::set_allocation_counting(true);
+    let _stop = StopCounting;
+    let before = lore_base::allocator::thread_allocation_count();
+    let answer = find.await;
+    (
+        answer,
+        lore_base::allocator::thread_allocation_count() - before,
+    )
+}
+
+/// [`State::find_live_subnode_if_present`] answers `None`, allocating nothing, where
+/// [`State::find_live_subnode`] answers `NodeNotFound`: a name the directory does not hold, and a
+/// name below a file. It answers a name the directory holds as that does.
+#[tokio::test]
+async fn a_live_find_answers_an_absent_name_without_allocating() {
+    with_state(|repository, state| async move {
+        let dir = add(&state, &repository, ROOT_NODE, directory("dir"), "dir").await;
+        let f = add(&state, &repository, dir, file("f"), "f").await;
+        for (parent, name) in [(dir, "missing"), (f, "x")] {
+            let name_hash = hash::hash_string(name);
+            assert!(
+                state
+                    .find_live_subnode(repository.clone(), parent, name_hash)
+                    .await
+                    .is_err_and(|error| error.is_node_not_found()),
+                "{name}: the find answers NodeNotFound"
+            );
+            let (found, allocations) = counting_allocations(state.find_live_subnode_if_present(
+                repository.clone(),
+                parent,
+                name_hash,
+            ))
+            .await;
+            assert_eq!(
+                (found.expect("the find"), allocations),
+                (None, 0),
+                "{name}: (answer, allocations)"
+            );
+        }
+        assert_eq!(
+            state
+                .find_live_subnode_if_present(repository.clone(), dir, hash::hash_string("f"))
+                .await
+                .expect("the find"),
+            Some((f, false))
+        );
+    })
+    .await;
+}
+
 /// Serializing a State that takes new nodes from fresh blocks panics in a debug build.
 #[cfg(debug_assertions)]
 #[tokio::test]
@@ -1199,6 +1465,59 @@ async fn what_one_comparison_established_answers_the_next() {
         .expect("an established comparison reads nothing"),
         NodeComparison::Differs
     ));
+}
+
+/// A file written right after [`time_before_next_write`] carries a later time, so a time recorded
+/// for content served from elsewhere never matches the file a later write puts at the path.
+/// Each round can write within the millisecond the time was taken in. The probe directory is
+/// in no working tree and holds nothing afterward.
+#[tokio::test]
+async fn a_file_written_after_the_time_before_the_next_write_carries_a_later_time() {
+    let dir = lore_base::test_util::TempDir::new("lore-state-test-");
+    let probe = dir.child("probe");
+    let driver = lore_io::IoDriver::global();
+    driver
+        .create_dir_all(&probe)
+        .await
+        .expect("create the probe directory");
+    let file = dir.path().join("written.bin");
+    for round in 0..64u8 {
+        let before = time_before_next_write(Some(&probe)).await;
+        driver
+            .write_file_bytes(&file, Bytes::copy_from_slice(&[round]), false)
+            .await
+            .expect("write the file");
+        let written = lore_revision::util::fs::modified_millis(
+            driver.stat(&file).await.expect("stat the file").modified,
+        );
+        assert!(
+            written > before,
+            "round {round}: written at {written}, recorded {before}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_dir(&probe)
+            .expect("list the probe directory")
+            .count(),
+        0,
+        "the probe is removed"
+    );
+}
+
+/// A directory that cannot be stamped, or none, gives the process clock.
+#[tokio::test]
+async fn the_time_before_the_next_write_is_the_process_clock_without_a_probe() {
+    let dir = lore_base::test_util::TempDir::new("lore-state-test-");
+    let missing = dir.child("missing");
+    for probe in [None, Some(missing.as_path())] {
+        let before = lore_revision::util::fs::modified_millis(None);
+        let time = time_before_next_write(probe).await;
+        let after = lore_revision::util::fs::modified_millis(None);
+        assert!(
+            (before..=after).contains(&time),
+            "{probe:?}: {time} not in {before}..={after}"
+        );
+    }
 }
 
 /// A file removed under a run of comparisons reads as unreadable, not as differing.
@@ -1453,6 +1772,45 @@ async fn reading_the_link_list_leaves_it_editable() {
         Hash::from([2u8; 32]),
         "the untouched link must keep its signature"
     );
+}
+
+/// Replacing the row of a link the registry doesn't hold fails as not found, and leaves the
+/// registry as it was.
+#[tokio::test]
+async fn replacing_an_unregistered_link_row_is_not_found() {
+    let repository = null_repository().await;
+    let state = State::new();
+    state
+        .link_add(
+            repository.clone(),
+            link_id(1),
+            BranchId::default(),
+            Hash::from([1u8; 32]),
+            2,
+            LinkFlags::NoFlags,
+        )
+        .await
+        .expect("adding the link");
+
+    let unregistered = LinkReference {
+        repository: link_id(1),
+        local_node: 3,
+        flags: LinkFlags::DisableAutoFollow.bits(),
+        ..Default::default()
+    };
+    assert!(
+        state
+            .link_replace(repository.clone(), unregistered)
+            .await
+            .expect_err("a link the registry doesn't hold")
+            .is_link_not_found()
+    );
+    let links = state
+        .link_list(repository)
+        .await
+        .expect("reading the registry");
+    assert_eq!(links.len(), 1);
+    assert_eq!(links[0].flags, LinkFlags::NoFlags.bits());
 }
 
 /// A node carrying `flags`, named for the name table by its hash.
@@ -3535,4 +3893,210 @@ async fn walk_children_restarts_past_a_child_moved_away() {
         .expect("the walk must restart, not fail");
     assert_eq!(visited, vec![a]);
     assert!(walked.may_repeat, "a restarted walk may repeat");
+}
+
+#[tokio::test]
+async fn a_node_link_crosses_a_link_where_its_repository_or_revision_differs() {
+    with_state(|repository, state| async move {
+        state.set_revision(Hash::from([1; 32]));
+        let link = |node, repository, revision: u8| NodeLink {
+            node,
+            repository,
+            revision: Hash::from([revision; 32]),
+        };
+        let own = repository.id;
+        let other = RepositoryId::from([9; 16]);
+
+        assert!(!link(1, own, 1).crosses_link(&repository, &state));
+        assert!(!link(ROOT_NODE, own, 1).crosses_link(&repository, &state));
+        assert!(link(1, other, 1).crosses_link(&repository, &state));
+        assert!(link(1, own, 2).crosses_link(&repository, &state));
+        assert!(link(ROOT_NODE, other, 1).crosses_link(&repository, &state));
+        assert!(!NodeLink::invalid().crosses_link(&repository, &state));
+    })
+    .await;
+}
+
+/// A recovery that asks the remote whether it holds an address as a list writes the fragment the
+/// remote describes to the local store as an entry without its payload, marked durable, so a later
+/// write of the list uploads nothing.
+#[tokio::test]
+async fn a_remote_list_check_writes_the_fragment_as_an_entry_without_its_payload() {
+    use lore_base::error::Disconnected;
+    use lore_revision::repository::RemoteState;
+    use lore_revision::test_util::context_with_state;
+    use lore_revision::util::request_tracker::StoreRequestTracker;
+    use lore_storage::Fragment;
+    use lore_storage::FragmentFlags;
+    use lore_storage::FragmentReference;
+    use lore_storage::store_types::StoreMatch;
+    use lore_transport::ProtocolError;
+
+    use crate::immutable::session_tests::under_execution_context;
+
+    let repository =
+        context_with_state(RemoteState::Failed(ProtocolError::from(Disconnected))).await;
+    let size_payload = 2 * size_of::<FragmentReference>();
+    let payload = Bytes::from(vec![0x5au8; size_payload]);
+    let address = Address {
+        hash: hash::hash_slice(&payload),
+        context: Context::from([0x5au8; 16]),
+    };
+    let fragment = Fragment {
+        flags: FragmentFlags::PayloadFragmented.bits(),
+        size_payload: size_payload as u32,
+        size_content: 2 * 4096,
+    };
+    lore_storage::test_util::serve_remote(address, fragment, payload);
+
+    let tracker = StoreRequestTracker::default();
+    let lists = under_execution_context(|| {
+        lore_revision::state::remote_lists_fragments(&repository, address, &tracker)
+    })
+    .await;
+    let held = repository
+        .immutable_store()
+        .get_metadata(repository.id, address)
+        .await
+        .expect("the local metadata");
+
+    assert!(lists, "the remote lists the address");
+    assert_eq!(
+        (
+            held.match_made,
+            held.fragment.flags & FragmentFlags::PayloadStored.bits()
+        ),
+        (
+            StoreMatch::MatchFull,
+            FragmentFlags::PayloadStoredDurable.bits()
+        )
+    );
+}
+
+/// A link whose revision cannot be opened answers for nothing in its mount, so a mount holding a
+/// file, or a file standing in its place, holds what cannot be told from local work, and an
+/// absent or empty one holds nothing.
+#[tokio::test]
+async fn a_mount_whose_linked_revision_cannot_be_opened_holds_unknown_work() {
+    let dir = lore_base::test_util::TempDir::new("lore-state-test-");
+    let repository = working_tree_repository(dir.path()).await;
+    let mount = RelativePathBuf::new().push_and_freeze("vendor");
+    let mount_work = async || {
+        let operation = working_operation(&repository).await;
+        LORE_CONTEXT
+            .scope(
+                setup_test_execution(),
+                link_mount_work(&operation, None, &mount, false, |_| false),
+            )
+            .await
+            .expect("an unopened link still answers for its mount")
+    };
+
+    assert_eq!(
+        mount_work().await.unknown,
+        None,
+        "an absent mount holds nothing"
+    );
+
+    let file = write_working_file(&repository, "vendor", b"local").await;
+    assert_eq!(
+        mount_work()
+            .await
+            .unknown
+            .as_ref()
+            .map(RelativePath::as_str),
+        Some("vendor"),
+        "a file in place of the mount holds unknown work"
+    );
+    lore_io::IoDriver::global()
+        .remove_file(
+            file.to_absolute_path(repository.require_path().expect("working tree"))
+                .expect("a path below the root"),
+        )
+        .await
+        .expect("remove working file");
+
+    std::fs::create_dir_all(dir.path().join("vendor")).expect("create the mount");
+    assert_eq!(
+        mount_work().await.unknown,
+        None,
+        "an empty mount holds nothing"
+    );
+    write_working_file(&repository, "vendor/linked.txt", b"linked").await;
+    assert_eq!(
+        mount_work()
+            .await
+            .unknown
+            .as_ref()
+            .map(RelativePath::as_str),
+        Some("vendor"),
+        "a mount holding a file holds unknown work"
+    );
+}
+
+/// The files a refusal names are the first in path order, however the walk meets them, and a
+/// caller keeping every modified file has them all in that order.
+#[tokio::test]
+async fn a_mount_names_its_modified_files_in_path_order() {
+    let dir = lore_base::test_util::TempDir::new("lore-state-test-");
+    let repository = working_tree_repository(dir.path()).await;
+    let mount = RelativePathBuf::new().push_and_freeze("vendor");
+    let names = ["e.txt", "b.txt", "d.txt", "a.txt", "c.txt"];
+    let linked = State::new();
+    let vendor = add(
+        &linked,
+        &repository,
+        ROOT_NODE,
+        directory("vendor"),
+        "vendor",
+    )
+    .await;
+    std::fs::create_dir_all(dir.path().join("vendor")).expect("create the mount");
+    for name in names {
+        let node = Node {
+            flags: NodeFlags::File.bits(),
+            name_hash: hash::hash_string(name),
+            ..content_node(b"linked")
+        };
+        add(&linked, &repository, vendor, node, name).await;
+        write_working_file(&repository, &format!("vendor/{name}"), b"edited locally").await;
+    }
+    let mount_work = async |names_all| {
+        let operation = working_operation(&repository).await;
+        let work = LORE_CONTEXT
+            .scope(
+                setup_test_execution(),
+                link_mount_work(
+                    &operation,
+                    Some((vendor, (repository.clone(), linked.clone()))),
+                    &mount,
+                    names_all,
+                    |_| false,
+                ),
+            )
+            .await
+            .expect("the mount compares with its link");
+        let named: Vec<String> = work
+            .modified
+            .iter()
+            .map(|path| path.as_str().to_string())
+            .collect();
+        (named, work.modified_count)
+    };
+
+    assert_eq!(
+        mount_work(false).await,
+        (
+            vec![
+                "vendor/a.txt".to_string(),
+                "vendor/b.txt".to_string(),
+                "vendor/c.txt".to_string(),
+            ],
+            names.len()
+        ),
+        "a refusal holds only the first files by path"
+    );
+    let mut all: Vec<String> = names.iter().map(|name| format!("vendor/{name}")).collect();
+    all.sort();
+    assert_eq!(mount_work(true).await, (all, names.len()));
 }
